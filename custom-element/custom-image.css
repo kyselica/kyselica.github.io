@@ -1,0 +1,124 @@
+#images {
+    background-color: rgba(0, 0, 0, 0);
+    position: absolute;
+    display: flex;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    align-items: center; /* This centers the children vertically */
+    justify-content: center; /* This centers the children horizontally */
+    height: 100vh;
+    width: 100%;
+    user-select: none;
+}
+
+/*
+.imageHolder {
+    position: relative;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 50%;
+    width: 100%;
+    transition: transform 0.3s ease-in-out;
+}
+
+.insideImage {
+    filter: grayscale(1);
+    width: 75%;
+    height: 75%;
+    transition: filter 0.5s ease-in-out, width 0.5s cubic-bezier(.55,.53,.12,.67);
+}*/
+
+
+.imageHolder {
+    position: relative; /* Change this from absolute to relative */
+    display: flex;
+    justify-content: center;
+    align-items: center; /* This will center the .insideImage vertically inside .imageHolder */
+    height: 50%;
+    width: 100%;
+    aspect-ratio: 1;
+    transition: transform 0.3s ease-in-out; /* You may adjust the transform transition here */
+}
+.insideImageDiv {
+    /* Convert image to sepia tones first */
+    display: flex;
+    filter: grayscale(1);
+    width: 75%; /* 100% of .imageHolder */
+    height: 75%; /* 100% of .imageHolder */
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+    position: relative; /* This helps contain the absolute img within outside */
+    transition: filter 0.5s ease-in-out, width 0.3s linear, height 0.3s linear;
+    border-radius: 20px;
+}
+
+.insideImage {
+    position: relative;
+    width: 133%; /* Width relative to #outside */
+    height: 133%; /* Height relative to #outside */
+    transition: width 0.3s linear, height 0.3s linear, margin-left 0.3s ease-in-out, margin-right 0.3s ease-in-out;
+}
+
+.insideImageDiv:hover {
+    width: 100%;
+    height: 100%;
+    filter: grayscale(0);
+}
+
+.insideImage:hover {
+    width: 100%;
+    height: 100%;
+}
+
+custom-image {
+    align-items: center;
+    justify-content: center;
+    width: 25%;
+    margin-left: 2.5%;
+    margin-right: 2.5%;
+    transition: margin-left 0.3s ease-in-out, margin-right 0.3s ease-in-out, transform 0.5s ease-in-out;
+}
+
+/* Moves the text into view on image hover*/
+custom-image:has(img:hover) > .textHolderType1 > .characterType1 > .characterType1Text {
+    transform: translateX(0%);
+}
+
+.textHolderType1 {
+    align-items: center;
+    justify-content: center;
+    display: flex;
+    font-size: 2rem;
+    font-family: 'Aboreto', serif;
+    color: rgb(250,250,250);
+
+}
+
+.textHolderType1 > .characterType1 {
+    display: inline-block;
+    overflow: hidden;
+}
+
+.textHolderType1 > .characterType1 > .characterType1Text {
+    transform: translateX(-100%);
+    transition: transform 0.5s ease;
+}
+
+
+
+.backgroundOpacity {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: radial-gradient(circle at center bottom, rgb(30, 30, 30), rgb(30, 30, 30));
+    opacity: 0;
+    transition: opacity 0.3s ease-in-out;
+    pointer-events: none; /* Make sure clicks pass through */
+    z-index: -1;
+}

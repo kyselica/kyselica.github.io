@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Erik Kyselica</title>
+    <link rel="stylesheet" href="custom-element/custom-image.css"> <!-- Link to your CSS file -->
+    <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="IndexStyles.css">
+    <link rel="stylesheet" href="scrollingPage/scrollingPage.css">
+    <link href='https://fonts.googleapis.com/css?family=Aboreto|Montserrat' rel='stylesheet'>
+    <script src="custom-element/custom-elements.js"></script>
+    <script src="scrollingPage/scrollingPageFunctions.js"></script>
+</head>
+<body>
+<div id="content">
+    <div id="home" class="section">
+        <div id="rightTextDiv">
+            <p class="name">Erik</p>
+            <p class="name lastName">Kyselica</p>
+            <div id="emailDiv">
+                <p id="email">erik@kyseli.ca</p>
+            </div>
+        </div>
+        <div id="homeMain">
+            <div id="aboutDiv">
+                <div id="aboutHiBox">
+                    <p id="aboutHi">Hi!</p>
+                </div>
+                <div id="aboutParagraphs">
+                    <p class = "aboutParagraph">My name is Erik Kyselica and I am studying Computer Science and Engineering at The Ohio State University.</p>
+                    <p class = "aboutParagraph">Some of my interests are jumping rope with my friends, playing chess, and coding!</p>
+                    <p class = "aboutParagraph">I love taking on challenging projects that require me to learn new skills, like this website! I hope you enjoy!</p>
+                    <p id = "aboutGoBack" class = "aboutParagraph", onclick="leaveAbout();">Go back</p>
+                </div>
+            </div>
+            <div id="images">
+                <custom-image id="homeIm1" class="homeImage" img-path="homeImages/Accomplishments.jpg" background-color="rgb(30,50,30)" text-color="rgb(250,250,250)" hover-text="accomplishments"></custom-image>
+                <custom-image id="homeIm2" class="homeImage" img-path="homeImages/About.JPG" background-color="rgb(50,30,30)" text-color="rgb(250,250,250)" hover-text="about"></custom-image>
+                <custom-image id="homeIm3" class="homeImage" img-path="homeImages/Apps.png" background-color="rgb(30,30,50)" text-color="rgb(250,250,250)" hover-text="apps"></custom-image>
+            </div>
+        </div>
+    </div>
+    <div id="accomplishments" class="section scrollingPage">
+        <div id="accsidebar" class="sidebar">
+            <div id="acctitleText" class="titleText">
+                <p id="acctitleTextToConvert" class="titleTextToConvert">ACCOMPLISHMENTS</p>
+            </div>
+            <div id="accpageIndicator" class="pageIndicator">
+            </div>
+        </div>
+        <div id="accpageHolder" class="pageHolder">
+
+        </div>
+    </div>
+    <div id="apps" class="section scrollingPage">
+        <div id="appsidebar" class="sidebar">
+            <div id="apptitleText" class="titleText">
+                <p id="apptitleTextToConvert" class="titleTextToConvert">APPS</p>
+            </div>
+            <div id="apppageIndicator" class="pageIndicator">
+            </div>
+        </div>
+        <div id="apppageHolder" class="pageHolder">
+
+        </div>
+    </div>
+</div>
+<script src="Accomplishments/Accomplishments.js"></script>
+<script src="Apps/Apps.js"></script>
+</body>
