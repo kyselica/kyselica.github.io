@@ -1,15 +1,20 @@
 
-let appPages = [new Page("NextJump",
-    "Lead App Developer",
-    "NextJump is a cutting-edge iOS app written in Swift that leverages Machine Learning to accurately count jump rope jumps in real-time through the device's camera. This project encompasses a variety of complex and innovative elements, including the integration of TensorFlow predictions with multi-threading techniques, designing and implementing an intuitive and engaging UI/UX, and establishing live analytics. Additionally, it features the setup of in-app purchases, advanced video processing capabilities, adherence to object-oriented design principles, and efficient data management through saving and loading from device storage.",
-    "Apps/Images/nextJump.png",""),
+let appPages = [
+    new Page("NextJump",
+        "App Developer",
+        "NextJump is a Swift app that uses ML to accurately count jump rope jumps in real-time through the device's camera.",
+        "Apps/Images/nextJump.png",""),
+    new Page("Capstone",
+        "Interactive Heart Rythm Library",
+        "This project is an interactive heart rhythm library that allows users to view and analyze heart rhythms, accompanied by an animated heart model.",
+        "Apps/Images/capstone.png","https://andrewfrueh.github.io/CON-XR_Interactive_Heart_Web/"),
     new Page("Plethos",
         "Solo Developer",
-        "Plethos, a sliding puzzle game developed in Unity using C#, showcases a grid-based design with 190 distinct and engaging puzzles, complemented by new, randomly generated challenges daily. The completion of this project over a four-month period significantly enhanced my proficiency in UI and gameplay design, the crafting of reusable and efficient code, as well as marketing strategies and best practices in Unity and C#.",
+        "Plethos, a sliding puzzle game developed in Unity using C#, showcases a grid-based design with 190 distinct and engaging puzzles.",
         "Apps/Images/plethos.png",""),
     new Page("Simple Matter of Light",
         "Solo Developer",
-        "A Simple Matter of Light was my first game, written in Unity (C#) over 3 months. It is grid-based puzzle game where the user must light up the grid with a limited number of light bulbs. This puzzle game features 420 levels. Through this project I learned how to use the Unity software and became comfortable writing code in C#.  I also created the music for this game!",
+        "A Simple Matter of Light is a grid-based puzzle game where the user must light up the grid with a limited number of light bulbs. This puzzle game features 420 levels.",
         "Apps/Images/asmol.png","")
 ];
 
@@ -43,6 +48,7 @@ window.addEventListener('wheel', function(event) {
         hidePageAnimation(titleChars, apppageIndicator, activePage)
         switchPages(false, 'apps', 'home');
         PAGE = 0;
+        pageIndex = 0;
     }
     // Dont listen if at end of list
     if ((!su && pageIndex === appPages.length - 1) || (su && pageIndex === 0)) {return}
@@ -54,29 +60,27 @@ window.addEventListener('wheel', function(event) {
     dots[pageIndex].className = "app dot active";
 
     let currentPage = document.getElementsByClassName("page app active")[0];
-    currentPage.style.transition = "opacity 0.5s ease-in-out, transform 0.7s ease-in-out";
-    // Fade out current page
+    currentPage.style.transition = "opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1), transform 0.6s cubic-bezier(0.4, 0, 0.2, 1)";
     if (currentPage) {
         currentPage.style.opacity = "0";
-        currentPage.style.transform = `translateY(${su ? "" : "-"}100%)`;
+        currentPage.style.transform = `translate3d(0, ${su ? "100%" : "-100%"}, 0)`;
         currentPage.className = 'page app';
         setTimeout(function() {deletePage(currentPage, pageHolderapp);}, 500);
     }
-    // Create another page
-    let nextPage = createPage(pageHolderapp, appPages[pageIndex]);
+    let nextPage = createPage(pageHolderapp, appPages[pageIndex], 'app');
     nextPage.className = 'page app active';
     nextPage.style.opacity = "0";
-    nextPage.style.transform = `translateY(${su ? "-" : ""}100%)`;
-    nextPage.style.transitionDelay = '0.2s';
-    nextPage.style.transition = "opacity 0.5s ease-in-out, transform 0.7s ease-in-out";
+    nextPage.style.transform = `translate3d(0, ${su ? "-100%" : "100%"}, 0)`;
+    nextPage.style.transitionDelay = '0.15s';
+    nextPage.style.transition = "opacity 0.5s cubic-bezier(0.4, 0, 0.2, 1), transform 0.6s cubic-bezier(0.4, 0, 0.2, 1)";
     pageHolderapp.appendChild(nextPage);
     _ = nextPage.offsetHeight;
     nextPage.style.opacity = "1";
-    nextPage.style.transform = "translateY(0%)";
+    nextPage.style.transform = "translate3d(0, 0, 0)";
 });
 
 // Create the first page
-let firstPageapp = createPage(pageHolderapp, appPages[0]);
+let firstPageapp = createPage(pageHolderapp, appPages[0], 'app');
 firstPageapp.className = "page app active";
 firstPageapp.style.opacity = "0";
 firstPageapp.style.transition = "opacity 0.5s ease-in-out";

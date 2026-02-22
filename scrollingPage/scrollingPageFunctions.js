@@ -52,7 +52,7 @@ function animateInAbout() {
         hi.style.transform = "translateY(100%)";
         hi.style.opacity = "1";
         Array.from(about).forEach((value, index) => {
-            value.style.transitionDelay = `${index * 1.5}s`;
+            value.style.transitionDelay = `${index * .05}s`;
             value.style.opacity = "1";
         })
     }, 2500); // 500 milliseconds = 0.5 seconds
@@ -63,21 +63,21 @@ let PAGE = 0;
 let scrollCounter = 0;
 function switchPages(Slidedown = true, from, to) {
     let p1 = document.getElementById(from);
-    p1.style.transform = `translateY(${Slidedown ? "-" : ""}100%)`
+    p1.style.transform = `translate3d(0, ${Slidedown ? "-100%" : "100%"}, 0)`;
     let p2 = document.getElementById(to);
-    p2.style.transform = 'translateY(0%)'
+    p2.style.transform = 'translate3d(0, 0, 0)';
 }
 
 function startPageAnimation(titleChars, pageIndicator, activePage, titleDelay) {
     // Play title slide in
     Array.from(titleChars).forEach((char, index) => {
-        char.style.transition = "transition: opacity 0.5s ease-in-out, transform 0.5s ease-in-out";
+        char.style.transition = "opacity 0.5s ease-in-out, transform 0.5s cubic-bezier(0.4, 0, 0.2, 1)";
         char.style.opacity = "0";
-        char.style.transform = "translateX(-100%)";
-        char.style.transitionDelay = `${index * .05 + titleDelay}s`
+        char.style.transform = "translate3d(-100%, 0, 0)";
+        char.style.transitionDelay = `${index * .05 + titleDelay}s`;
         let _ = char.offsetHeight;
         char.style.opacity = "1";
-        char.style.transform = "translateX(0%)";
+        char.style.transform = "translate3d(0, 0, 0)";
     });
     // Fade in the pageIndicator and the first page
     pageIndicator.style.opacity = "0";
@@ -93,11 +93,10 @@ function startPageAnimation(titleChars, pageIndicator, activePage, titleDelay) {
     activePage.style.opacity = "1";
 }
 function hidePageAnimation(titleChars, pageIndicator, activePage) {
-    // Play title slide in
     Array.from(titleChars).forEach((char, index) => {
         char.style.opacity = "0";
-        char.style.transform = "translateX(-100%)";
-        char.style.transitionDelay = `${(titleChars.length - index) * .05}s`
+        char.style.transform = "translate3d(-100%, 0, 0)";
+        char.style.transitionDelay = `${(titleChars.length - index) * .05}s`;
     });
     // Fade in the pageIndicator and the first page
     pageIndicator.style.opacity = "0";
@@ -124,9 +123,9 @@ function addPageIndicatorDots(pageIndicator, numDots, pageIdentifier) {
     }
 }
 
-function createPage(pageHolder, pageObject) {
+function createPage(pageHolder, pageObject, pageType = 'acc') {
     let page = document.createElement('div');
-    page.className = 'page acc';
+    page.className = `page ${pageType}`;
     pageHolder.appendChild(page);
 
     let spacer = document.createElement('div');
@@ -135,7 +134,9 @@ function createPage(pageHolder, pageObject) {
 
     let textFlexHolder = document.createElement('div');
     textFlexHolder.className = "pageTextFlex"
-    textFlexHolder.style.width = `${window.innerWidth * .5}px`;
+    // Responsive width: cap at 50% of viewport, min 280px for readability
+    let textWidth = Math.min(window.innerWidth * 0.5, Math.max(280, window.innerWidth - 100));
+    textFlexHolder.style.width = `${textWidth}px`;
     page.appendChild(textFlexHolder);
 
     let textHolder = document.createElement('div');
@@ -150,6 +151,9 @@ function createPage(pageHolder, pageObject) {
     let subtitle = document.createElement('p');
     subtitle.className = 'pageSubtitle';
     subtitle.innerText = pageObject.subtitle;
+    if (pageObject.link !== "") {
+        subtitle.innerHTML = `${pageObject.subtitle}<a href="${pageObject.link}" target="_blank" class="pageSubtitleLink"><img src="Images/external-link.png" alt="External Link" class="pageSubtitleLinkImg"></a>`;
+    }
     textHolder.appendChild(subtitle);
 
     let desc = document.createElement('p');
@@ -180,4 +184,42 @@ function createPage(pageHolder, pageObject) {
 
 function deletePage(page, pageHolder) {
     pageHolder.removeChild(page);
+}
+
+/**
+ * Add touch/swipe support for mobile - dispatches synthetic wheel events
+ * so existing scroll logic is reused (debounce, transition checks, etc.)
+ */
+function initTouchSwipeSupport() {
+    let touchStartY = 0;
+    const minSwipeDistance = 60;
+
+    document.addEventListener('touchstart', function(e) {
+        if (e.touches.length === 1) {
+            touchStartY = e.touches[0].clientY;
+        }
+    }, { passive: true });
+
+    document.addEventListener('touchend', function(e) {
+        if (e.changedTouches.length !== 1 || (PAGE !== 1 && PAGE !== 2)) return;
+
+        const touchEndY = e.changedTouches[0].clientY;
+        const deltaY = touchStartY - touchEndY;
+
+        if (Math.abs(deltaY) < minSwipeDistance) return;
+
+        // Dispatch synthetic wheel event - reuses all existing scroll logic
+        const wheelEvent = new WheelEvent('wheel', {
+            deltaY: deltaY > 0 ? 100 : -100,
+            bubbles: true
+        });
+        window.dispatchEvent(wheelEvent);
+    }, { passive: true });
+}
+
+// Initialize touch support when DOM is ready
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initTouchSwipeSupport);
+} else {
+    initTouchSwipeSupport();
 }

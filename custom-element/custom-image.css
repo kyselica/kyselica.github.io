@@ -51,7 +51,7 @@
     align-items: center;
     overflow: hidden;
     position: relative; /* This helps contain the absolute img within outside */
-    transition: filter 0.5s ease-in-out, width 0.3s linear, height 0.3s linear;
+    transition: filter 0.5s ease-in-out, width 0.3s ease-in-out, height 0.3s ease-in-out;
     border-radius: 20px;
 }
 
@@ -59,18 +59,29 @@
     position: relative;
     width: 133%; /* Width relative to #outside */
     height: 133%; /* Height relative to #outside */
-    transition: width 0.3s linear, height 0.3s linear, margin-left 0.3s ease-in-out, margin-right 0.3s ease-in-out;
+    object-fit: contain;
+    transition: width 0.3s linear, height 0.3s ease-in-out, margin-left 0.3s ease-in-out, margin-right 0.3s ease-in-out;
 }
 
-.insideImageDiv:hover {
-    width: 100%;
-    height: 100%;
-    filter: grayscale(0);
+/* Only apply hover effects on devices that support hover (avoids layout issues on touch) */
+@media (hover: hover) {
+    .insideImageDiv:hover {
+        width: 100%;
+        height: 100%;
+        filter: grayscale(0);
+    }
+
+    .insideImage:hover {
+        width: 100%;
+        height: 100%;
+    }
 }
 
-.insideImage:hover {
-    width: 100%;
-    height: 100%;
+/* Touch devices: show full color on tap for feedback */
+@media (hover: none) {
+    .insideImageDiv:active {
+        filter: grayscale(0);
+    }
 }
 
 custom-image {
@@ -82,9 +93,70 @@ custom-image {
     transition: margin-left 0.3s ease-in-out, margin-right 0.3s ease-in-out, transform 0.5s ease-in-out;
 }
 
-/* Moves the text into view on image hover*/
-custom-image:has(img:hover) > .textHolderType1 > .characterType1 > .characterType1Text {
-    transform: translateX(0%);
+@media (max-width: 768px) {
+    #images {
+        flex-direction: column;
+        gap: 20px;
+        padding: 20px 20px 20px 20px;
+        box-sizing: border-box;
+    }
+
+    custom-image {
+        width: 85%;
+        max-width: 320px;
+        margin-left: 0;
+        margin-right: 0;
+        display: flex;
+        flex-direction: row;
+        align-items: center;
+    }
+
+    .textHolderType1 {
+        flex-direction: column;
+        font-size: 0.55rem;
+        margin-right: 8px;
+        flex-shrink: 0;
+        gap: 0;
+    }
+
+    .textHolderType1 > .characterType1 {
+        overflow: visible;
+        line-height: 1;
+    }
+
+    .textHolderType1 > .characterType1 > .characterType1Text {
+        transform: translateX(0%) !important;
+        margin: 0;
+        padding: 0;
+        line-height: 1;
+    }
+
+    .imageHolder {
+        aspect-ratio: 1 / 1;
+        height: auto;
+        width: 60%;
+        flex-shrink: 0;
+    }
+
+    .insideImageDiv {
+        width: 100%;
+        height: 100%;
+        aspect-ratio: 1 / 1;
+        border-radius: 20px;
+    }
+
+    .insideImage {
+        width: 100%;
+        height: 100%;
+        object-fit: cover;
+    }
+}
+
+/* Moves the text into view on image hover */
+@media (hover: hover) {
+    custom-image:has(img:hover) > .textHolderType1 > .characterType1 > .characterType1Text {
+        transform: translateX(0%);
+    }
 }
 
 .textHolderType1 {
@@ -103,11 +175,9 @@ custom-image:has(img:hover) > .textHolderType1 > .characterType1 > .characterTyp
 }
 
 .textHolderType1 > .characterType1 > .characterType1Text {
-    transform: translateX(-100%);
+    transform: translateX(-105%);
     transition: transform 0.5s ease;
 }
-
-
 
 .backgroundOpacity {
     content: '';
