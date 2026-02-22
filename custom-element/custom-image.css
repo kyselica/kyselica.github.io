@@ -8,6 +8,7 @@
     align-items: center; /* This centers the children vertically */
     justify-content: center; /* This centers the children horizontally */
     height: 100vh;
+    height: 100dvh;
     width: 100%;
     user-select: none;
 }
