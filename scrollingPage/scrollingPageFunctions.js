@@ -15,11 +15,24 @@ class Page {
 
 function leaveAbout() {
     PAGE = 0;
+
+    // Cancel any in-flight about animation timers
+    aboutTimers.forEach(id => clearTimeout(id));
+    aboutTimers = [];
+
+    let hi = document.getElementById("aboutHi");
     let about = document.getElementsByClassName("aboutParagraph");
     let email = document.getElementById("email");
 
     document.getElementById("images").style.pointerEvents = "all";
     email.style.transform = "TranslateY(-100%)";
+
+    // Force-reset "Hi!" to its hidden state
+    hi.style.visibility = "hidden";
+    hi.style.transform = "translateY(100%)";
+    hi.style.opacity = "1";
+    hi.style.transitionDelay = "0s";
+
     Array.from(about).forEach((value, index) => {
         value.style.transitionDelay = `0s`;
         value.style.opacity = "0";
@@ -28,8 +41,9 @@ function leaveAbout() {
     // Show the home images again
     setTimeout(function() {
         Array.from(document.getElementsByClassName("homeImage")).forEach( value => value.style.transform = "scale(1 ,1)");
-    }, 1000); // 500 milliseconds = 0.5 seconds
+    }, 1000);
 }
+let aboutTimers = [];
 function animateInAbout() {
     let hi = document.getElementById("aboutHi");
     let about = document.getElementsByClassName("aboutParagraph");
@@ -41,11 +55,11 @@ function animateInAbout() {
     hi.style.transitionDelay= "0.5s";
     hi.style.transform = "translateY(0%)";
 
-    setTimeout(function() {
+    aboutTimers.push(setTimeout(function() {
         hi.style.opacity = "0";
-    }, 1000); // 500 milliseconds = 0.5 seconds
+    }, 1000));
 
-    setTimeout(function() {
+    aboutTimers.push(setTimeout(function() {
         // Reset hi
         email.style.transform = "TranslateY(0%)";
         hi.style.visibility = "hidden";
@@ -55,7 +69,7 @@ function animateInAbout() {
             value.style.transitionDelay = `${index * .05}s`;
             value.style.opacity = "1";
         })
-    }, 2500); // 500 milliseconds = 0.5 seconds
+    }, 2500));
 }
 
 let pageIndex = 0;
@@ -223,3 +237,33 @@ if (document.readyState === 'loading') {
 } else {
     initTouchSwipeSupport();
 }
+
+// --- History / back-button support ---
+
+function navigateToHome() {
+    if (PAGE === 1) {
+        let titleChars = document.getElementsByClassName("acc titleTextCharacter");
+        let activePage = document.getElementsByClassName("page acc active")[0];
+        hidePageAnimation(titleChars, document.getElementById("accpageIndicator"), activePage);
+        switchPages(false, 'accomplishments', 'home');
+    } else if (PAGE === 2) {
+        let titleChars = document.getElementsByClassName("app titleTextCharacter");
+        let activePage = document.getElementsByClassName("page app active")[0];
+        hidePageAnimation(titleChars, document.getElementById("apppageIndicator"), activePage);
+        switchPages(false, 'apps', 'home');
+    } else if (PAGE === 3) {
+        leaveAbout();
+        return; // leaveAbout sets PAGE = 0
+    }
+    PAGE = 0;
+    pageIndex = 0;
+}
+
+window.addEventListener('popstate', function(event) {
+    let target = (event.state && event.state.section) || 'home';
+    if (target === 'home' && PAGE !== 0) {
+        navigateToHome();
+    }
+    // If the user presses forward, we don't re-animate into sections
+    // (they can click the image again). This keeps things simple.
+});

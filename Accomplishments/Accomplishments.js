@@ -45,6 +45,7 @@ window.addEventListener('wheel', function(event) {
         switchPages(false, 'accomplishments', 'home');
         PAGE = 0;
         pageIndex = 0;
+        history.back();
     }
     // Dont listen if at end of list
     if ((!su && pageIndex === accPages.length - 1) || (su && pageIndex === 0)) {return}

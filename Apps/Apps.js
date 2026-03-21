@@ -49,6 +49,7 @@ window.addEventListener('wheel', function(event) {
         switchPages(false, 'apps', 'home');
         PAGE = 0;
         pageIndex = 0;
+        history.back();
     }
     // Dont listen if at end of list
     if ((!su && pageIndex === appPages.length - 1) || (su && pageIndex === 0)) {return}
