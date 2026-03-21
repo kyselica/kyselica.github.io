@@ -11,6 +11,15 @@
     <link href='https://fonts.googleapis.com/css?family=Aboreto|Montserrat' rel='stylesheet'>
     <script src="custom-element/custom-elements.js"></script>
     <script src="scrollingPage/scrollingPageFunctions.js"></script>
+    <script>
+        // Fix mobile viewport height (iOS Chrome ignores -webkit-fill-available)
+        function setAppHeight() {
+            document.documentElement.style.setProperty('--app-height', window.innerHeight + 'px');
+        }
+        window.addEventListener('resize', setAppHeight);
+        window.addEventListener('orientationchange', setAppHeight);
+        setAppHeight();
+    </script>
 </head>
 <body>
 <div id="content">
@@ -33,7 +42,7 @@
                     <p class = "aboutParagraph">I love taking on projects that require me to learn new skills, this website is one of those. I hope you enjoy!</p>
                     <p class = "aboutParagraph">If you'd like to get in contact, feel free to email me.</p>
                     <p class = "aboutParagraph"><a href="ErikKyselicaResume.pdf" target="_blank" class="aboutLink">Resume</a></p>
-                    <p id = "aboutGoBack" class = "aboutParagraph", onclick="leaveAbout();">Go back</p>
+                    <p id = "aboutGoBack" class = "aboutParagraph", onclick="leaveAbout(); history.back();">Go back</p>
                 </div>
             </div>
             <div id="images">

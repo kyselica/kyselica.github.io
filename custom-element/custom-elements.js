@@ -80,6 +80,7 @@ class selectionImage extends HTMLElement {
             if (hoverText === "awards") {
                 PAGE = 1;
                 pageIndex = 0;
+                history.pushState({section: 'accomplishments'}, '', '#accomplishments');
                 switchPages(true, 'home', 'accomplishments');
                 let dots = document.getElementsByClassName("acc dot");
                 for (let i = 0; i < dots.length; i++) dots[i].className = "acc dot" + (i === 0 ? " active" : "");
@@ -90,6 +91,7 @@ class selectionImage extends HTMLElement {
             } else if (hoverText === "projects") {
                 PAGE = 2;
                 pageIndex = 0;
+                history.pushState({section: 'apps'}, '', '#apps');
                 switchPages(true, 'home', 'apps');
                 let dots = document.getElementsByClassName("app dot");
                 for (let i = 0; i < dots.length; i++) dots[i].className = "app dot" + (i === 0 ? " active" : "");
@@ -98,7 +100,8 @@ class selectionImage extends HTMLElement {
                 let activePage = document.getElementsByClassName("page app active")[0];
                 startPageAnimation(titleChars, pageIndicator, activePage, .5);
             } else if (hoverText === "about") {
-                PAGE = 3
+                PAGE = 3;
+                history.pushState({section: 'about'}, '', '#about');
                 // Shrink all of the home images
                 Array.from(document.getElementsByClassName("homeImage")).forEach( value => value.style.transform = "scale(0 ,0)");
                 animateInAbout();
