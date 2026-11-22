@@ -1,0 +1,104 @@
+/* Live buses (js/layers/buses.js): card bodies and the status dot. Uses the UI's variables, with fallbacks. */
+
+.bus-card { font: 400 13.5px/1.45 var(--sans, "Inter", system-ui, sans-serif); color: var(--text, #3a352e); }
+.bus-card button { font: inherit; color: inherit; cursor: pointer; }
+
+/* a route chip: the route's own colour */
+.bus-chip {
+  display: inline-grid; place-items: center; min-width: 26px; height: 19px; padding: 0 6px; box-sizing: border-box; flex: none;
+  border: 0; border-radius: 5px; background: var(--c, #6d6e71); color: var(--i, #fff);
+  font: 700 10.5px/1 var(--sans, system-ui, sans-serif); letter-spacing: .04em; font-variant-numeric: tabular-nums;
+  box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .18);
+}
+button.bus-chip:hover { filter: brightness(1.12); }
+.bus-card .bus-chip { color: var(--i, #fff); }
+
+.bus-none { margin: 10px 0 4px; color: var(--mute, #7a7064); font-size: 13px; }
+.bus-foot { margin: 8px 0 0; font-size: 11.5px; color: var(--mute, #7a7064); }
+.bus-late {
+  display: inline-block; padding: 1px 6px; border-radius: 999px; background: rgba(214, 134, 40, .16); color: #a45d0c;
+  font: 600 10.5px/1.5 var(--sans, system-ui, sans-serif); font-style: normal; letter-spacing: .02em; vertical-align: 1px;
+}
+body[data-ui="dark"] .bus-late { background: rgba(240, 170, 80, .16); color: #f0b45a; }
+
+/* ---------------------------------------------------------------- stop: who serves it, and a departures board */
+.bus-served { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 2px 0 10px; font-size: 12px; color: var(--mute, #7a7064); }
+.bus-served > span { margin-right: 3px; }
+.bus-board {
+  border-radius: 10px; overflow: hidden; background: #24211d; color: #f3e9d2;
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .05), 0 6px 14px -10px rgba(40, 25, 10, .6);
+}
+.bus-board-head {
+  display: flex; justify-content: space-between; padding: 7px 11px 6px; border-bottom: 1px solid rgba(255, 255, 255, .07);
+  font: 600 10px/1 var(--sans, system-ui, sans-serif); letter-spacing: .12em; text-transform: uppercase; color: #a99c84;
+}
+.bus-board-head span:last-child { color: #e5b04a; }
+.bus-board-head span:last-child::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 5px; border-radius: 50%; background: #e5b04a; vertical-align: 1px; animation: bus-blink 2.4s ease-in-out infinite; }
+.bus-board-head span.off { color: #8f8574; }
+.bus-board-head span.off::before { background: #8f8574; animation: none; }
+.bus-board ol { list-style: none; margin: 0; padding: 3px 0; }
+.bus-dep {
+  width: 100%; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 6px 11px;
+  border: 0; background: none; text-align: left; color: inherit;
+}
+.bus-dep:hover { background: rgba(255, 255, 255, .06); }
+.bus-dest { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: #f3e9d2; }
+.bus-dest .bus-late { background: rgba(240, 170, 80, .18); color: #f0b45a; margin-left: 4px; }
+.bus-eta { display: flex; align-items: baseline; gap: 1px; font: 600 16px/1 var(--sans, system-ui, sans-serif); color: #ffc65a; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bus-eta b { font-weight: 650; }
+.bus-eta small { margin-left: 2px; font-size: 10.5px; font-weight: 500; color: #c9a965; }
+.bus-eta i { font-style: normal; color: #c9a965; font-size: 13px; margin-right: 1px; }
+.bus-eta .bus-due { color: #9fe08a; letter-spacing: .03em; font-size: 13.5px; text-transform: uppercase; }
+.bus-board .bus-none { margin: 0; padding: 12px 11px 13px; color: #b8ab92; font-size: 13px; }
+
+/* ---------------------------------------------------------------- bus */
+.bus-hero { display: flex; align-items: center; gap: 8px; margin: 2px 0 6px; }
+.bus-to { min-width: 0; color: var(--text, #3a352e); }
+.bus-to b { color: var(--ink, #2a2622); font-weight: 600; }
+.bus-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; font-size: 12px; color: var(--mute, #7a7064); font-variant-numeric: tabular-nums; }
+.bus-facts > span:first-child { color: var(--ink, #2a2622); font-weight: 600; }
+.bus-sec { margin: 12px 0 3px; font: 600 10.5px/1 var(--sans, system-ui, sans-serif); letter-spacing: .09em; text-transform: uppercase; color: var(--mute, #7a7064); }
+.bus-next { list-style: none; margin: 0 -7px; padding: 0; }
+.bus-next button, .bus-strip button {
+  width: 100%; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 9px; padding: 5px 7px;
+  border: 0; border-radius: 8px; background: none; text-align: left;
+}
+.bus-next button:hover, .bus-strip button:hover { background: var(--hover, rgba(58, 45, 30, .065)); }
+.bus-next i { width: 8px; height: 8px; border-radius: 50%; box-sizing: border-box; border: 2px solid var(--c, #6d6e71); background: var(--card, #fbf8f1); }
+.bus-next li:first-child i { background: var(--c, #6d6e71); }
+.bus-next span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink, #2a2622); }
+.bus-next b { font-weight: 600; font-size: 12.5px; color: var(--text, #3a352e); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bus-actions { display: flex; gap: 6px; margin-top: 12px; }
+.bus-btn {
+  flex: 1; height: 32px; border: 1px solid var(--line, #e3dac2); border-radius: 9px; background: var(--card, #fbf8f1);
+  font-weight: 600 !important; font-size: 12.5px !important; color: var(--ink, #2a2622) !important; transition: background .15s, border-color .15s;
+}
+.bus-btn:hover { background: var(--hover, rgba(58, 45, 30, .065)); }
+.bus-btn.on { background: var(--scarlet, #b3202a); border-color: var(--scarlet, #b3202a); color: #fff !important; }
+.bus-btn.on::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #fff; vertical-align: 1px; animation: bus-blink 1.6s ease-in-out infinite; }
+
+/* ---------------------------------------------------------------- route: a strip map of its stops */
+.bus-route-top { display: flex; align-items: center; gap: 8px; margin: 2px 0 8px; font-size: 13px; color: var(--text, #3a352e); }
+.bus-strip { list-style: none; margin: 0 -7px; padding: 0; position: relative; }
+.bus-strip::before { content: ""; position: absolute; left: 13px; top: 14px; bottom: 14px; width: 4px; border-radius: 2px; background: var(--c, #6d6e71); opacity: .85; }
+.bus-strip i { position: relative; width: 10px; height: 10px; margin-left: 3px; border-radius: 50%; box-sizing: border-box; border: 2.5px solid var(--c, #6d6e71); background: var(--card, #fbf8f1); }
+.bus-strip span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink, #2a2622); }
+.bus-here {
+  padding: 1px 7px; border-radius: 999px; background: var(--c, #6d6e71); color: #fff; font: 600 10.5px/1.6 var(--sans, system-ui, sans-serif);
+  font-style: normal; white-space: nowrap;
+}
+
+body[data-ui="dark"] .bus-next i, body[data-ui="dark"] .bus-strip i { border-color: var(--cd, var(--c)); }
+body[data-ui="dark"] .bus-next li:first-child i { background: var(--cd, var(--c)); }
+body[data-ui="dark"] .bus-strip::before, body[data-ui="dark"] .bus-here { background: var(--cd, var(--c)); }
+
+/* ---------------------------------------------------------------- status line dot */
+.bus-live { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--mute, #7a7064); opacity: .6; vertical-align: 0; flex: none; }
+.bus-live.on { background: #3f9b4b; opacity: 1; box-shadow: 0 0 0 0 rgba(63, 155, 75, .5); animation: bus-pulse 2.2s ease-out infinite; }
+.bus-live.off { background: #c0702a; opacity: 1; }
+
+@keyframes bus-pulse { 0% { box-shadow: 0 0 0 0 rgba(63, 155, 75, .55); } 70%, 100% { box-shadow: 0 0 0 6px rgba(63, 155, 75, 0); } }
+@keyframes bus-blink { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) {
+  .bus-live.on, .bus-board-head span:last-child::before, .bus-btn.on::before { animation: none; }
+}

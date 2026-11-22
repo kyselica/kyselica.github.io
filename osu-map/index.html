@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Small OSU: a live, illustrated map of Ohio State's campus</title>
+<meta name="description" content="An illustrated, isometric map of the Ohio State campus you can drag and zoom through, with live CABS buses, simulated traffic and the real sky. Unofficial.">
+<meta name="theme-color" content="#f3eee2">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 5 29 11.5 16 18 3 11.5z' fill='%23dfe3bf' stroke='%232a2622' stroke-width='1.4' stroke-linejoin='round'/%3E%3Cpath d='M3 11.5 16 18v7.5L3 19z' fill='%23b3202a'/%3E%3Cpath d='M16 18 29 11.5V19l-13 6.5z' fill='%23861820'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..600&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<script>
+  // The panel theme before anything paints (ui.js keeps it in sync afterwards), so a dark-theme reader never sees a flash.
+  try { document.body.dataset.ui = localStorage.getItem("smallosu.ui") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); } catch (e) { document.body.dataset.ui = "light"; }
+</script>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 20 20"><circle cx="8.6" cy="8.6" r="5.6"/><path d="M12.8 12.8 17 17"/></symbol>
+    <symbol id="i-bus" viewBox="0 0 20 20"><rect x="3.5" y="2.8" width="13" height="12" rx="2.6"/><path d="M3.5 9.4h13M6.2 17.2v-2.4M13.8 17.2v-2.4M6.4 12.1h.01M13.6 12.1h.01"/></symbol>
+    <symbol id="i-layers" viewBox="0 0 20 20"><path d="M10 3.2 17.4 7 10 10.8 2.6 7z"/><path d="M2.6 10.4 10 14.2l7.4-3.8M2.6 13.8 10 17.6l7.4-3.8"/></symbol>
+    <symbol id="i-share" viewBox="0 0 20 20"><path d="M10 12.6V3.2M6.6 6.4 10 3l3.4 3.4M6.8 9.4H5.2a1.4 1.4 0 0 0-1.4 1.4v5.4A1.4 1.4 0 0 0 5.2 17.6h9.6a1.4 1.4 0 0 0 1.4-1.4v-5.4a1.4 1.4 0 0 0-1.4-1.4h-1.6"/></symbol>
+    <symbol id="i-about" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.4"/><path d="M10 9.2v4.6M10 6.4h.01"/></symbol>
+    <symbol id="i-sun" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3.4"/><path d="M10 2.6v1.6M10 15.8v1.6M2.6 10h1.6M15.8 10h1.6M4.8 4.8l1.1 1.1M14.1 14.1l1.1 1.1M4.8 15.2l1.1-1.1M14.1 5.9l1.1-1.1"/></symbol>
+    <symbol id="i-moon" viewBox="0 0 20 20"><path d="M15.8 12.6A6.6 6.6 0 0 1 7.4 4.2a6.6 6.6 0 1 0 8.4 8.4z"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 20 20"><path d="M10 4.5v11M4.5 10h11"/></symbol>
+    <symbol id="i-minus" viewBox="0 0 20 20"><path d="M4.5 10h11"/></symbol>
+    <symbol id="i-rot-l" viewBox="0 0 20 20"><path d="M4.4 8.2A6 6 0 1 1 5.6 14"/><path d="M3.8 3.8v4.8h4.8"/></symbol>
+    <symbol id="i-rot-r" viewBox="0 0 20 20"><path d="M15.6 8.2A6 6 0 1 0 14.4 14"/><path d="M16.2 3.8v4.8h-4.8"/></symbol>
+    <symbol id="i-fs" viewBox="0 0 20 20"><path d="M3.5 7.5v-4h4M12.5 3.5h4v4M16.5 12.5v4h-4M7.5 16.5h-4v-4"/></symbol>
+    <symbol id="i-fs-exit" viewBox="0 0 20 20"><path d="M7.5 3.5v4h-4M16.5 7.5h-4v-4M12.5 16.5v-4h4M3.5 12.5h4v4"/></symbol>
+    <symbol id="i-close" viewBox="0 0 20 20"><path d="M5.5 5.5l9 9M14.5 5.5l-9 9"/></symbol>
+    <symbol id="i-building" viewBox="0 0 20 20"><path d="M10 2.8 16.4 6.2v7.6L10 17.2 3.6 13.8V6.2z"/><path d="M3.6 6.2 10 9.6l6.4-3.4M10 9.6v7.6"/></symbol>
+    <symbol id="i-street" viewBox="0 0 20 20"><path d="M6.5 3 3.5 17M13.5 3l3 14M10 3.5v2.2M10 8.9v2.2M10 14.3v2.2"/></symbol>
+    <symbol id="i-place" viewBox="0 0 20 20"><path d="M10 17.4s-5.2-5-5.2-8.6a5.2 5.2 0 0 1 10.4 0c0 3.6-5.2 8.6-5.2 8.6z"/><circle cx="10" cy="8.8" r="1.8"/></symbol>
+    <symbol id="i-park" viewBox="0 0 20 20"><path d="M10 17.5v-5M10 12.5c-3.4 0-5.4-1.9-5.4-4.4C4.6 5.1 7 3 10 3s5.4 2.1 5.4 5.1c0 2.5-2 4.4-5.4 4.4z"/><path d="M6.5 17.5h7"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 20 20"><path d="M10 9.8v7.6M7.4 17.4h5.2"/><rect x="5.4" y="2.6" width="9.2" height="7.2" rx="2"/><path d="M8 6.2h4"/></symbol>
+    <symbol id="i-walk" viewBox="0 0 20 20"><circle cx="11" cy="3.6" r="1.5"/><path d="M8.2 17.2l2.1-5.2 2.4 2.4v2.8M10.3 12l.8-4.6-2.9 1.4-1 2.7M11.1 7.4l1.6 2.5 2.3.6"/></symbol>
+    <symbol id="i-link" viewBox="0 0 20 20"><path d="M8.6 11.4a3.2 3.2 0 0 0 4.5 0l2.6-2.6a3.2 3.2 0 0 0-4.5-4.5l-1 1M11.4 8.6a3.2 3.2 0 0 0-4.5 0l-2.6 2.6a3.2 3.2 0 0 0 4.5 4.5l1-1"/></symbol>
+    <symbol id="i-mark" viewBox="0 0 32 32"><path style="fill:var(--mk-top,#dfe3bf);stroke:var(--mk-edge,#2a2622)" stroke-width="1.3" stroke-linejoin="round" d="M16 5 29 11.5 16 18 3 11.5z"/><path style="fill:var(--mk-l,#b3202a)" d="M3 11.5 16 18v7.5L3 19z"/><path style="fill:var(--mk-r,#861820)" d="M16 18 29 11.5V19l-13 6.5z"/><path style="fill:var(--mk-oval,#a9c77f)" d="M16 9.4c3.1 0 5.4 1 5.4 2.1s-2.3 2.2-5.4 2.2-5.4-1-5.4-2.2 2.3-2.1 5.4-2.1z"/></symbol>
+  </defs>
+</svg>
+
+<canvas id="map" aria-label="Illustrated map of the Ohio State campus. Drag to move, scroll or pinch to zoom, Q and E to turn."></canvas>
+
+<header class="bar" id="bar">
+  <a class="brand" href="./" aria-label="Small OSU: back to the Oval" title="Back to the Oval">
+    <svg class="brand-mark" aria-hidden="true"><use href="#i-mark"/></svg>
+    <span class="brand-name">Small OSU</span>
+  </a>
+  <nav class="tools" aria-label="Map tools">
+    <div class="tool tool-search">
+      <div class="search" role="search">
+        <svg class="ico search-ico" aria-hidden="true"><use href="#i-search"/></svg>
+        <input id="search-q" type="text" inputmode="search" enterkeyhint="go" placeholder="Search buildings, streets, stops…" autocomplete="off" autocapitalize="off" spellcheck="false" role="combobox" aria-expanded="false" aria-controls="search-results" aria-autocomplete="list" aria-label="Search the map">
+        <kbd class="search-kbd" aria-hidden="true">/</kbd>
+        <button class="search-cancel" type="button">Cancel</button>
+      </div>
+      <button class="tool-btn search-open" type="button" id="btn-search" aria-label="Search" title="Search (/)"><svg class="ico" aria-hidden="true"><use href="#i-search"/></svg><span class="tool-label">Search</span></button>
+      <div class="panel search-panel" id="search-panel" hidden>
+        <ul id="search-results" class="results" role="listbox" aria-label="Search results"></ul>
+      </div>
+    </div>
+    <div class="tool">
+      <button class="tool-btn" type="button" id="btn-routes" aria-label="Bus routes" aria-expanded="false" aria-controls="panel-routes" title="Bus routes"><svg class="ico" aria-hidden="true"><use href="#i-bus"/></svg><span class="tool-label">Routes</span><span class="badge" id="routes-badge" hidden></span></button>
+      <div class="panel" id="panel-routes" role="dialog" aria-label="Bus routes" hidden></div>
+    </div>
+    <div class="tool">
+      <button class="tool-btn" type="button" id="btn-layers" aria-label="Map layers" aria-expanded="false" aria-controls="panel-layers" title="Layers"><svg class="ico" aria-hidden="true"><use href="#i-layers"/></svg><span class="tool-label">Layers</span></button>
+      <div class="panel" id="panel-layers" role="dialog" aria-label="Map layers" hidden>
+        <div class="panel-head"><h2>Layers</h2><p>What to draw on the map</p></div>
+        <div class="layer-groups" id="layer-groups"><p class="panel-empty">Layers appear here as the map wakes up.</p></div>
+      </div>
+    </div>
+    <div class="tool">
+      <button class="tool-btn" type="button" id="btn-share" aria-label="Copy a link to this view" title="Copy a link to this view"><svg class="ico" aria-hidden="true"><use href="#i-share"/></svg><span class="tool-label">Share</span></button>
+    </div>
+    <div class="tool">
+      <a class="tool-btn" id="btn-about" href="about.html" aria-label="About this map" title="About"><svg class="ico" aria-hidden="true"><use href="#i-about"/></svg><span class="tool-label">About</span></a>
+    </div>
+  </nav>
+</header>
+
+<div class="map-btns" id="map-btns" role="toolbar" aria-label="View" aria-orientation="vertical">
+  <div class="btn-group">
+    <button class="sq" type="button" id="btn-theme" aria-label="Dark panels" aria-pressed="false" data-tip="Dark panels"><svg class="ico i-moon" aria-hidden="true"><use href="#i-moon"/></svg><svg class="ico i-sun" aria-hidden="true"><use href="#i-sun"/></svg></button>
+  </div>
+  <div class="btn-group">
+    <button class="sq" type="button" id="btn-zoom-in" aria-label="Zoom in" data-tip="Zoom in (+)"><svg class="ico" aria-hidden="true"><use href="#i-plus"/></svg></button>
+    <button class="sq" type="button" id="btn-zoom-out" aria-label="Zoom out" data-tip="Zoom out (−)"><svg class="ico" aria-hidden="true"><use href="#i-minus"/></svg></button>
+  </div>
+  <div class="btn-group">
+    <button class="sq" type="button" id="btn-rot-l" aria-label="Turn the map left" data-tip="Turn left (Q)"><svg class="ico" aria-hidden="true"><use href="#i-rot-l"/></svg></button>
+    <button class="sq" type="button" id="btn-rot-r" aria-label="Turn the map right" data-tip="Turn right (E)"><svg class="ico" aria-hidden="true"><use href="#i-rot-r"/></svg></button>
+  </div>
+  <div class="btn-group" id="fs-group">
+    <button class="sq" type="button" id="btn-fs" aria-label="Full screen" aria-pressed="false" data-tip="Full screen"><svg class="ico i-fs" aria-hidden="true"><use href="#i-fs"/></svg><svg class="ico i-fs-exit" aria-hidden="true"><use href="#i-fs-exit"/></svg></button>
+  </div>
+</div>
+
+<div id="cards" class="cards" aria-label="Details"></div>
+<div id="status" class="status" aria-live="off"></div>
+<footer class="credits" id="credits">
+  <span class="cr-full">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors · Bus data: <a href="https://ttm.osu.edu/cabs" target="_blank" rel="noopener">Ohio State CABS</a> · Weather: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> · <a href="about.html">Unofficial</a></span>
+  <span class="cr-short">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · <a href="about.html">Unofficial</a></span>
+</footer>
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+<canvas id="rot-fade" class="rot-fade" aria-hidden="true"></canvas>
+<div id="ui-root"></div>
+
+<div id="loading" role="status" aria-live="polite">
+  <div class="ld">
+    <svg class="ld-art" viewBox="0 0 160 112" aria-hidden="true">
+      <ellipse class="ld-shadow" cx="80" cy="90" rx="66" ry="10"/>
+      <path class="ld-side-l" d="M16 50 80 82v10L16 60z"/>
+      <path class="ld-side-r" d="M80 82 144 50v10L80 92z"/>
+      <path class="ld-top" d="M80 18 144 50 80 82 16 50z"/>
+      <path class="ld-road" d="M55.7 69.8 119.7 37.8M38.4 38.8 102.4 70.8"/>
+      <ellipse class="ld-oval" cx="80.6" cy="47.8" rx="14" ry="6.6"/>
+      <g class="ld-b ld-b1"><path class="f-l" d="M57.6 35.6 70.4 42v-16l-12.8-6.4z"/><path class="f-r" d="M70.4 42 86.4 34V18l-16 8z"/><path class="f-t" d="M57.6 19.6 73.6 11.6 86.4 18 70.4 26z"/></g>
+      <g class="ld-b ld-b2"><path class="f-l" d="M67.2 69.2 81.28 76.24v-10L67.2 59.2z"/><path class="f-r" d="M81.28 76.24 92.8 70.48v-10l-11.52 5.76z"/><path class="f-t" d="M67.2 59.2 78.72 53.44 92.8 60.48 81.28 66.24z"/></g>
+      <g class="ld-b ld-b3"><path class="f-l" d="M105.6 50 113.28 53.84v-26L105.6 24z"/><path class="f-r" d="M113.28 53.84 120.96 50V24l-7.68 3.84z"/><path class="f-t" d="M105.6 24 113.28 20.16 120.96 24 113.28 27.84z"/></g>
+      <g class="ld-trees"><circle cx="40" cy="47" r="3.6"/><circle cx="46.5" cy="51.5" r="3.2"/><circle cx="35" cy="52" r="3"/><circle cx="100" cy="62" r="3.4"/><circle cx="60" cy="60" r="3.2"/><circle cx="128" cy="51.5" r="3"/><circle cx="95" cy="38" r="2.8"/></g>
+      <g class="ld-bus-path"><rect class="ld-bus" x="-4.6" y="-2.3" width="9.2" height="4.6" rx="1.4"/></g>
+    </svg>
+    <p class="ld-title">Drawing the campus</p>
+    <p class="ld-words" aria-hidden="true"><span>Laying out the streets</span><span>Raising thirteen thousand buildings</span><span>Planting the trees on the Oval</span><span>Checking the sky over Columbus</span><span>Looking for buses</span></p>
+    <p class="ld-slow">Still drawing — a big campus takes a moment on a small computer.</p>
+    <p class="ld-err" hidden>The map couldn't load. <button type="button" onclick="location.reload()">Try again</button></p>
+  </div>
+</div>
+<script>
+  // If the engine itself fails to start there is no app to report it, so say so here rather than draw forever.
+  (function () {
+    var shown = false;
+    function fail() { if (shown || window.app) return; shown = true; var l = document.getElementById("loading"); if (!l) return; l.classList.add("failed"); l.querySelector(".ld-err").hidden = false; }
+    window.addEventListener("error", function (e) { if (e && e.target === window) setTimeout(fail, 50); });
+    window.addEventListener("unhandledrejection", function () { setTimeout(fail, 50); });
+    setTimeout(function () { if (!document.body.classList.contains("ready")) document.getElementById("loading").classList.add("slow"); }, 20000);
+  })();
+</script>
+<noscript><p class="noscript">Small OSU needs JavaScript to draw the map.</p></noscript>
+<script type="module" src="js/main.js"></script>
+</body>
+</html>

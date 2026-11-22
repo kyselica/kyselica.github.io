@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en" class="page">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>About Small OSU</title>
+<meta name="description" content="How Small OSU, an unofficial illustrated live map of the Ohio State campus, is made, and who to thank for the data.">
+<meta name="theme-color" content="#f3eee2">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 5 29 11.5 16 18 3 11.5z' fill='%23dfe3bf' stroke='%232a2622' stroke-width='1.4' stroke-linejoin='round'/%3E%3Cpath d='M3 11.5 16 18v7.5L3 19z' fill='%23b3202a'/%3E%3Cpath d='M16 18 29 11.5V19l-13 6.5z' fill='%23861820'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,400..700;1,9..144,400..600&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<script>
+  try { document.body.dataset.ui = localStorage.getItem("smallosu.ui") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); } catch (e) { document.body.dataset.ui = "light"; }
+  if (document.body.dataset.ui === "dark") document.querySelector('meta[name="theme-color"]').content = "#1c1a17";
+</script>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+  <symbol id="i-mark" viewBox="0 0 32 32"><path style="fill:var(--mk-top,#dfe3bf);stroke:var(--mk-edge,#2a2622)" stroke-width="1.3" stroke-linejoin="round" d="M16 5 29 11.5 16 18 3 11.5z"/><path style="fill:var(--mk-l,#b3202a)" d="M3 11.5 16 18v7.5L3 19z"/><path style="fill:var(--mk-r,#861820)" d="M16 18 29 11.5V19l-13 6.5z"/><path style="fill:var(--mk-oval,#a9c77f)" d="M16 9.4c3.1 0 5.4 1 5.4 2.1s-2.3 2.2-5.4 2.2-5.4-1-5.4-2.2 2.3-2.1 5.4-2.1z"/></symbol>
+</svg>
+
+<header class="page-top">
+  <a class="brand" href="./"><svg class="brand-mark" aria-hidden="true"><use href="#i-mark"/></svg><span class="brand-name">Small OSU</span></a>
+  <a class="back" href="./">Open the map</a>
+</header>
+
+<main class="about">
+  <p class="kicker">About this map</p>
+  <h1>A small, live, hand-drawn <em>Ohio State</em></h1>
+  <p class="lede">Small OSU is an illustrated, isometric map of the Ohio State campus in Columbus that you can drag, zoom and turn. The buses on it are the real ones, the sky is today's sky, and the people and cars are a gentle simulation of a campus going about its day.</p>
+
+  <svg class="art" viewBox="0 0 160 112" aria-hidden="true">
+    <ellipse cx="80" cy="90" rx="66" ry="10" fill="rgba(70,45,25,.12)"/>
+    <path d="M16 50 80 82v10L16 60z" fill="#8a6a4c"/><path d="M80 82 144 50v10L80 92z" fill="#6f553d"/>
+    <path d="M80 18 144 50 80 82 16 50z" fill="#e3e1c9" stroke="#6f6252" stroke-width="1.2" stroke-linejoin="round"/>
+    <path d="M55.7 69.8 119.7 37.8M38.4 38.8 102.4 70.8" stroke="#9a9b9e" stroke-width="3.2" stroke-linecap="round" fill="none"/>
+    <ellipse cx="80.6" cy="47.8" rx="14" ry="6.6" fill="#b9d08e"/>
+    <path d="M57.6 35.6 70.4 42v-16l-12.8-6.4z" fill="#b3563f"/><path d="M70.4 42 86.4 34V18l-16 8z" fill="#8f4333"/><path d="M57.6 19.6 73.6 11.6 86.4 18 70.4 26z" fill="#b9b7b2"/>
+    <path d="M67.2 69.2 81.28 76.24v-10L67.2 59.2z" fill="#d6c7a7"/><path d="M81.28 76.24 92.8 70.48v-10l-11.52 5.76z" fill="#b5a684"/><path d="M67.2 59.2 78.72 53.44 92.8 60.48 81.28 66.24z" fill="#c8c6c0"/>
+    <path d="M105.6 50 113.28 53.84v-26L105.6 24z" fill="#c9c5bd"/><path d="M113.28 53.84 120.96 50V24l-7.68 3.84z" fill="#a5a29b"/><path d="M105.6 24 113.28 20.16 120.96 24 113.28 27.84z" fill="#d5d3cc"/>
+    <g fill="#c9772f"><circle cx="40" cy="47" r="3.6"/><circle cx="46.5" cy="51.5" r="3.2" fill="#8f8a3c"/><circle cx="35" cy="52" r="3" fill="#b5532f"/><circle cx="100" cy="62" r="3.4" fill="#8f8a3c"/><circle cx="60" cy="60" r="3.2"/><circle cx="128" cy="51.5" r="3" fill="#b5532f"/></g>
+    <rect x="-4.6" y="-2.3" width="9.2" height="4.6" rx="1.4" fill="#b3202a" stroke="#fff" stroke-width=".8" transform="translate(88 53.8) rotate(-26.57)"/>
+  </svg>
+
+  <div class="note" role="note">
+    <p><b>Unofficial.</b> Small OSU is a fan project. It is not affiliated with, endorsed by or sponsored by The Ohio State University, and it uses none of the university's logos or marks. For official maps, bus times and campus information, use the university's own sites.</p>
+  </div>
+
+  <h2>How it's made</h2>
+  <ol class="steps">
+    <li><b>OpenStreetMap geometry.</b> Every building, street, path, tree, lamp post and patch of grass comes from <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">OpenStreetMap</a>, the map the world edits together. A small build script turns it into one compact file of footprints, heights, roof shapes and road widths.</li>
+    <li><b>An illustration, drawn in your browser.</b> Nothing here is a pre-rendered picture. The page projects that geometry into an isometric view (a camera tilted 30° down, in four directions) and paints it with a warm, hand-picked palette: brick and limestone walls, lit windows, soft shadows, the season's trees.</li>
+    <li><b>Tiles in the background.</b> The map is cut into tiles that are painted by web workers on separate threads, so dragging stays smooth while new streets are drawn. Buses and people are drawn on top each frame, and buildings that stand in front of them are redrawn so they pass behind.</li>
+    <li><b>Live buses.</b> Campus bus positions, routes and stops come from the Ohio State CABS feed every few seconds. Evenings and weekends only a route or two run, so a quiet map is often an honest one.</li>
+    <li><b>The real sky.</b> Temperature, cloud, rain and snow come from <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a>, and the light follows the sun over Columbus: golden hours, dusk, lit windows at night.</li>
+    <li><b>Simulated life.</b> Cars and students are not tracked. They are a simulation that walks the real paths and drives the real streets, busier between classes and quieter at night.</li>
+  </ol>
+
+  <h2>Getting around</h2>
+  <div class="keys">
+    <span>Drag, or arrow keys</span><span>move around</span>
+    <span>Scroll, pinch, <kbd>+</kbd> <kbd>−</kbd></span><span>zoom</span>
+    <span><kbd>Q</kbd> <kbd>E</kbd></span><span>turn the view a quarter turn</span>
+    <span><kbd>/</kbd></span><span>search buildings, streets, places, stops and routes</span>
+    <span><kbd>Esc</kbd></span><span>close the open card or panel</span>
+    <span>Click a building</span><span>its name, height and the nearest bus stops</span>
+  </div>
+  <p>The address bar always holds the current view, so a reload keeps your place, and the Share button copies a link to exactly what you're looking at.</p>
+
+  <h2>Credits and licences</h2>
+  <ul class="credits-list">
+    <li><b>Map data © OpenStreetMap contributors</b>Available under the <a href="https://opendatacommons.org/licenses/odbl/" target="_blank" rel="noopener">Open Database License (ODbL)</a>. See <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">openstreetmap.org/copyright</a>. If something is missing or wrong, you can fix it there.</li>
+    <li><b>Bus data: Ohio State CABS</b>Live vehicle positions, routes and stops from Ohio State's public <a href="https://ttm.osu.edu/cabs" target="_blank" rel="noopener">Campus Area Bus Service</a> feed. Route names and colours are theirs.</li>
+    <li><b>Weather: Open-Meteo</b>Weather data by <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a>, licensed under <a href="https://creativecommons.org/licenses/by/4.0/" target="_blank" rel="noopener">CC BY 4.0</a>.</li>
+    <li><b>Type: Fraunces and Inter</b>Both from Google Fonts under the SIL Open Font License.</li>
+    <li><b>Inspiration: Small SF</b>The idea of a small, illustrated, live city comes from <a href="https://smallsf.com/" target="_blank" rel="noopener">smallsf.com</a>.</li>
+  </ul>
+
+  <footer>Small OSU is an unofficial fan project and is not affiliated with The Ohio State University. <a href="./">Back to the map</a>.</footer>
+</main>
+</body>
+</html>
