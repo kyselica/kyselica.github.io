@@ -14,6 +14,11 @@
 //   open, cut where nearer buildings stand in front of it.
 //
 // Also: clicking a building label picks the building, a search provider for named buildings, and the "Labels" toggle.
+//
+// Frames (ARCHITECTURE.md "Frame scheduling"): nothing here moves by itself. "labels" asks for frames only while a label
+// or the palette is fading or a placement is unfinished, "building-highlight" only while a highlight fades, and
+// "street-labels" never (the "labels" layer asks for both). Anything that changes them between frames (the pointer
+// coming to rest on a building, fonts arriving, the projected scene becoming ready) calls app.requestRender().
 // app.labels exposes a little state for tests and the console (stats, shown(), states(), boxes(), highlight(i), hover(i),
 // bench(), placeOnce(), trace()).
 
@@ -21,6 +26,7 @@ const SERIF = '"Fraunces", Georgia, "Times New Roman", serif';
 const SANS = '"Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
 const FADE_S = 0.25;              // label fade in / out
 const HL_FADE_S = 0.14;           // highlight fade
+const FADE_DT = 0.05;             // s: the most a fade advances in one frame (the first frame after a pause has f.dt 0.25)
 const GAP = 3;                    // px between a roof and the bottom of its label
 const STREET_MIN_S = 2.5;         // street names from here (main roads a little earlier)
 const POI_MIN_S = 6;              // shop and café names from here
@@ -547,7 +553,7 @@ export function init(app) {
     if (sceneState[r]) return;
     sceneState[r] = 1;
     // it is built once (by the app too, after the first full map and after each turn), ~100 ms: never mid-gesture
-    idle(() => { app.scene.forRot(r); sceneState[r] = 2; dirty = true; });
+    idle(() => { app.scene.forRot(r); sceneState[r] = 2; markDirty("labels-scene"); });
   }
   /** 0 visible, 1 hidden, -1 not worked out yet (out of this placement's budget) */
   function spotHidden(ch, r, k) {
@@ -740,7 +746,7 @@ export function init(app) {
     }
     sprites = live.size;
   }
-  function invalidateText() { gen++; dirty = true; }
+  function invalidateText() { gen++; markDirty("labels-fonts"); }
   if (document.fonts) {
     const want = [`italic 500 12px Fraunces`, `italic 600 12px Fraunces`, `italic 400 12px Fraunces`, `500 10px Inter`, `600 10px Inter`];
     Promise.all(want.map((f) => document.fonts.load(f).catch(() => null))).then(invalidateText, () => {});
@@ -942,6 +948,8 @@ export function init(app) {
   // ---------------------------------------------------------------- placement
   let vis = [], visPrev = [];
   let stamp = 0, dirty = true;
+  /** placement must be redone: at the next frame, which is asked for (this may be called between frames) */
+  function markDirty(why) { dirty = true; app.requestRender(why || "labels"); }
   let lastX = NaN, lastY = NaN, lastS = NaN, lastR = -1, lastW = 0, lastH = 0, lastPlace = -1e9;
   const byK = (a, b) => b.k - a.k;
   let trace = null, prof = null;
@@ -959,7 +967,7 @@ export function init(app) {
       chrome.push([q.left - rc.left - 4, q.top - rc.top - 4, q.right - rc.left + 4, q.bottom - rc.top + 4]);
     }
   }
-  const chromeSoon = () => { chromeT = -1e9; setTimeout(() => { chromeT = -1e9; dirty = true; }, 320); };
+  const chromeSoon = () => { chromeT = -1e9; setTimeout(() => { chromeT = -1e9; markDirty("labels-chrome"); }, 320); };
   window.addEventListener("resize", chromeSoon);
 
   function gather(list, s, r, X0, Y0, X1, Y1, stepFor) {
@@ -1087,6 +1095,7 @@ export function init(app) {
   // than under it. Every other name stands above it all at z 90. One placement serves both: whichever layer draws first
   // in a frame advances the labels (placement, focus, palette, the sprite budget), then each draws its own kinds.
   let advFrame = -1, placeMs = 0, passMs = 0, made0 = 0, fadeStep = 0, budgetLeft = 0;
+  let fading = false, paletteWant = 0;   // this frame: a label still fading; the palette the mix eases toward
   function advance(f) {
     if (advFrame === f.frame) return;
     advFrame = f.frame;
@@ -1103,10 +1112,16 @@ export function init(app) {
     // included, shared by the two passes (each starts its own clock: other layers draw in between)
     budgetLeft = Math.max(0, 2.5 - placeMs);
     made0 = sprites;
-    fadeStep = motionMQ.matches ? 1 : f.dt / FADE_S;
-    const want = nightTarget();
-    if (paletteMix < 0) paletteMix = want;
-    paletteMix = want > paletteMix ? Math.min(want, paletteMix + f.dt / 0.6) : Math.max(want, paletteMix - f.dt / 0.6);
+    fading = false;
+    const dt = Math.min(f.dt, FADE_DT);
+    fadeStep = motionMQ.matches ? 1 : dt / FADE_S;
+    const want = (paletteWant = nightTarget());
+    if (paletteMix < 0 || motionMQ.matches) paletteMix = want;
+    paletteMix = want > paletteMix ? Math.min(want, paletteMix + dt / 0.6) : Math.max(want, paletteMix - dt / 0.6);
+  }
+  /** frames the labels need now: while anything fades, a placement is unfinished, or the view moved since the last one */
+  function labelsFps() {
+    return fading || dirty || paletteMix !== paletteWant || view.X !== lastX || view.Y !== lastY ? 60 : 0;
   }
 
   /** draw this frame's street names (streets = true) or all the other labels, fading each toward its state */
@@ -1129,6 +1144,7 @@ export function init(app) {
       // a label whose sprite isn't made yet waits at the start of its fade
       c.a = ok || c.a > 0 ? a1 : 0;
       c.used = f.frame;
+      if (c.on ? c.a < 1 : c.a > 0) fading = true;
     }
     ctx.globalAlpha = 1;
     const ms = performance.now() - t0;
@@ -1164,10 +1180,12 @@ export function init(app) {
     return null;
   }
 
-  app.addLayer({ id: "street-labels", z: 15, draw: drawStreetLabels });
+  // one placement and one set of fades serve both layers: "labels" asks for their frames (it is on whenever they draw)
+  app.addLayer({ id: "street-labels", z: 15, draw: drawStreetLabels, fps: 0 });
   const labelLayer = app.addLayer({
     id: "labels", z: 90,
     draw: drawLabels,
+    fps: labelsFps,
     hit: (px, py) => labelAt(px, py),
     onClick: (c, e) => {
       if (!c || c.bi < 0) return;
@@ -1192,7 +1210,7 @@ export function init(app) {
     selRoot = root;
     selCand = root >= 0 ? candByRoot.get(root) || null : null;
     setMark(true, root);
-    dirty = true;
+    markDirty("labels-select");
   }
 
   // the outline of building i (or the parts of a building drawn by its parts) for rotation r, in screen metres
@@ -1362,46 +1380,67 @@ export function init(app) {
     ctx.drawImage(m.cv, (q.X0 - view.X) * s + W2, (q.Y0 - view.Y) * s + H2, (q.X1 - q.X0) * s, (q.Y1 - q.Y0) * s);
   }
 
-  // pointer: hover is resolved once a frame at most, from the last position seen
+  // pointer: hover is worked out as the pointer moves (a frame is asked for only when the building under it changes),
+  // and again in a frame when the view has moved under a resting pointer
   const ptr = { x: 0, y: 0, inside: false, dirty: false };
-  let hoverRoot = -1, cursorSet = false, hvX = NaN, hvY = NaN, hvS = NaN, hvR = -1;
+  let hoverRoot = -1, cursorSet = false, hvX = NaN, hvY = NaN, hvS = NaN, hvR = -1, dwellTimer = 0;
+  // runs after the app's own hover handler (registered first), which resets the cursor on every move
   canvas.addEventListener("pointermove", (e) => {
     if (e.pointerType === "touch") return;                 // no hover on touch screens
     const rc = canvas.getBoundingClientRect();
-    ptr.x = e.clientX - rc.left; ptr.y = e.clientY - rc.top; ptr.inside = true; ptr.dirty = true;
+    ptr.x = e.clientX - rc.left; ptr.y = e.clientY - rc.top; ptr.inside = true;
+    hoverNow();
   }, { passive: true });
-  canvas.addEventListener("pointerleave", () => { ptr.inside = false; ptr.dirty = true; });
+  canvas.addEventListener("pointerleave", () => { ptr.inside = false; hoverNow(); });
   canvas.addEventListener("pointerdown", () => { ptr.dirty = true; });
+  function hoverNow() {
+    ptr.dirty = false;
+    if (resolveHover()) app.requestRender("labels-hover");
+  }
 
-  function otherLayerHit(px, py) {
-    for (const L of app.layers) {
-      if (L === labelLayer || L === hlLayer || !L.hit || !app.layerEnabled(L.id)) continue;
+  /** is the pointer on something of a layer other than these two (a bus, a stop, an aircraft)? above: only layers over the labels */
+  function otherLayerHit(px, py, above) {
+    const ls = app.layers;
+    for (let i = 0; i < ls.length; i++) {
+      const L = ls[i];
+      if (L === labelLayer || L === hlLayer || !L.hit || (above && !(L.z > labelLayer.z)) || !app.layerEnabled(L.id)) continue;
       try { if (L.hit(px, py)) return true; } catch { /* their problem, not the highlight's */ }
     }
     return false;
   }
+  /** the building under the pointer → hoverRoot (and its highlight, the cursor); true when it changed */
   function resolveHover() {
     const dragging = view.pointers && view.pointers.size > 0;
     let root = -1, other = false;
     if (ptr.inside && !dragging && app.status && app.status.loaded) {
       const lb = app.layerEnabled("labels") ? labelAt(ptr.x, ptr.y) : null;
-      // a label names its building; a bus or a stop in front of a building is what the pointer is on, not the building
-      if (lb) root = rootOf(lb.bi);
-      else if (!(other = otherLayerHit(ptr.x, ptr.y))) root = rootOf(app.pickBuilding(ptr.x, ptr.y));
-    }
-    if (root !== hoverRoot) {
-      hoverRoot = root;
-      setMark(false, root);
-      hoverCand = root >= 0 ? candByRoot.get(root) || null : null;
-      hoverSince = performance.now();
+      // a label names its building, unless an aircraft flies over it; a bus or a stop in front of a building is what
+      // the pointer is on, not the building
+      if (lb && otherLayerHit(ptr.x, ptr.y, true)) other = true;
+      else if (lb) root = rootOf(lb.bi);
+      else if (!(other = otherLayerHit(ptr.x, ptr.y, false))) root = rootOf(app.pickBuilding(ptr.x, ptr.y));
     }
     // the app clears the cursor on every move that finds nothing of a layer's under it: buildings are clickable too
     if (root >= 0) { canvas.style.cursor = "pointer"; cursorSet = true; }
     else if (cursorSet) { if (!other) canvas.style.cursor = ""; cursorSet = false; }
+    if (root === hoverRoot) return false;
+    hoverRoot = root;
+    setMark(false, root);
+    hoverCand = root >= 0 ? candByRoot.get(root) || null : null;
+    hoverSince = performance.now();
+    // its name is brought forward once the pointer has rested a moment (updateFocus): a frame then, not a frame loop
+    clearTimeout(dwellTimer);
+    if (hoverCand && view.s >= HOVER_LABEL_S) {
+      const c = hoverCand;
+      dwellTimer = setTimeout(() => { if (hoverCand === c) markDirty("labels-dwell"); }, HOVER_DWELL_MS + 15);
+    }
+    return true;
   }
+  let hlFading = false;
 
   const hlLayer = app.addLayer({
     id: "building-highlight", z: 60,
+    fps: () => (hlFading ? 60 : 0),
     draw(ctx, f) {
       const t0 = performance.now();
       const vmoved = view.X !== hvX || view.Y !== hvY || view.s !== hvS || view.rot !== hvR;
@@ -1409,13 +1448,15 @@ export function init(app) {
         ptr.dirty = false; hvX = view.X; hvY = view.Y; hvS = view.s; hvR = view.rot;
         resolveHover();
       }
+      hlFading = false;
       if (!marks.length) return;
-      const step = motionMQ.matches ? 1 : f.dt / HL_FADE_S;
+      const step = motionMQ.matches ? 1 : Math.min(f.dt, FADE_DT) / HL_FADE_S;
       const s = view.s, dpr = view.dpr;
       for (let i = marks.length - 1; i >= 0; i--) {
         const m = marks[i];
         m.a = m.want ? Math.min(1, m.a + step) : Math.max(0, m.a - step);
         if (m.a <= 0 && !m.want) marks.splice(i, 1);
+        else if (m.want ? m.a < 1 : m.a > 0) hlFading = true;
       }
       // hover first, the open card's building over it; a building both hovered and open is drawn once, as open
       for (const m of marks) if (!m.sel && m.a > 0 && !(m.root === selRoot && m.want)) drawMark(ctx, m, s, dpr);
@@ -1484,7 +1525,13 @@ export function init(app) {
     stats,
     counts: { buildings: buildingCand.size, areas: statics.length - buildingCand.size, streets: streets.length, curves: curves.length, pois: pois.length },
     highlight(i) { select(i); },
-    hover(i) { hoverRoot = rootOf(i); setMark(false, hoverRoot); hoverCand = candByRoot.get(hoverRoot) || null; hoverSince = performance.now(); },
+    hover(i) {
+      hoverRoot = rootOf(i); setMark(false, hoverRoot); hoverCand = candByRoot.get(hoverRoot) || null; hoverSince = performance.now();
+      app.requestRender("labels-hover");
+      setTimeout(() => markDirty("labels-dwell"), HOVER_DWELL_MS + 15);
+    },
+    /** what the layers ask for now: { labels, highlight } fps */
+    fps() { return { labels: labelsFps(), highlight: hlFading ? 60 : 0 }; },
     /** the buildings cut out of building i's highlight at this rotation */
     front(i) { const root = rootOf(i); return root < 0 ? [] : frontOf(hlShape(root, view.rot), view.rot, 20 / view.s); },
     shown() { return vis.filter((c) => c.on).map((c) => c.text); },

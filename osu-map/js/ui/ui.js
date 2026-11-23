@@ -154,6 +154,9 @@ export function init(app) {
   // ============================================================================================== cards
   const cards = new Map();               // id → handle
   let cardSeq = 0, cardRect = null, cardsDirty = true;
+  // the map draws on demand: when a card moves or changes size, its leader (ui-marks) needs one frame
+  const cardsMoved = () => { cardsDirty = true; app.requestRender("ui-cards"); };
+  const cardSizes = typeof ResizeObserver === "function" ? new ResizeObserver(cardsMoved) : null;
 
   // Focus. A card opened from the keyboard (Enter on a search result, a route, a nearby stop) takes focus on its title,
   // so it is announced and can be read and closed at once; closing it from the keyboard hands focus back to where the
@@ -248,10 +251,11 @@ export function init(app) {
     headEl.addEventListener("click", (e) => {
       if (isPhone() || e.target.closest("button, a") || cardsEl.firstElementChild === el || !h.open) return;
       cardsEl.prepend(el);
-      cardsDirty = true;
+      cardsMoved();
       revealAnchor(h);
     });
-    el.addEventListener("animationend", () => { cardsDirty = true; });
+    el.addEventListener("animationend", cardsMoved);
+    if (cardSizes) cardSizes.observe(el);
     attachSheetDrag(h);
     return h;
   }
@@ -290,6 +294,7 @@ export function init(app) {
     cards.delete(h.id);
     const el = h.el;
     const hadFocus = el.contains(document.activeElement);
+    if (cardSizes) cardSizes.unobserve(el);
     if (reducedMotion() || !el.isConnected) el.remove();
     else {
       el.classList.add("closing");
@@ -368,7 +373,7 @@ export function init(app) {
         if (dy > 60 || vy > 0.5) el.classList.remove("full");
         else if (dy < -40 || vy < -0.5) el.classList.add("full");
         else if (onGrip && Math.abs(dy) < 5) el.classList.toggle("full");
-        cardsDirty = true;
+        cardsMoved();
       };
       el.addEventListener("pointermove", move);
       el.addEventListener("pointerup", up);
@@ -387,13 +392,14 @@ export function init(app) {
   }
 
   // ============================================================================================== status line
-  const STATUS_ORDER = ["clock", "weather", "buses"];
+  // a live score is the most time-sensitive part: next to the clock, so it is the last to be squeezed
+  const STATUS_ORDER = ["clock", "game", "weather", "buses"];
   const statusParts = new Map();         // key → span
   let statusSeq = 0;
   function status(key, html) {
     key = String(key);
     let sp = statusParts.get(key);
-    if (html == null || html === "") { if (sp) { sp.remove(); statusParts.delete(key); } return; }
+    if (html == null || html === "") { if (sp) { sp.remove(); statusParts.delete(key); fitStatus(); } return; }
     if (!sp) {
       sp = document.createElement("span");
       sp.className = `st st-${key.replace(/[^a-z0-9_-]/gi, "")}`;
@@ -404,7 +410,25 @@ export function init(app) {
       statusParts.set(key, sp);
     }
     html = String(html);
-    if (sp._html !== html) { sp.innerHTML = html; sp._html = html; }
+    if (sp._html !== html) { sp.innerHTML = html; sp._html = html; fitStatus(); }
+  }
+  // When the parts don't all fit (a narrow window; buses, events and a live score at once), the line first drops its
+  // longer words and narrows its gaps, then the events part gives way (fading at its end, down to its flag), then it
+  // goes and the buses and the weather fade at their ends, rather than the line being cut off mid-word. Measured once after a change (a layout read).
+  let fitQueued = false;
+  function fitStatus() {
+    if (fitQueued) return;
+    fitQueued = true;
+    requestAnimationFrame(() => {
+      fitQueued = false;
+      const over = () => statusEl.scrollWidth > statusEl.clientWidth + 1;
+      statusEl.classList.remove("tight", "tighter", "tightest");
+      if (!statusEl.firstChild || !over()) return;
+      statusEl.classList.add("tight");
+      if (!over()) return;
+      statusEl.classList.add("tighter");
+      if (over()) statusEl.classList.add("tightest");
+    });
   }
 
   // the clock, in Columbus whatever the reader's time zone
@@ -682,7 +706,7 @@ export function init(app) {
     return name;
   }
 
-  const KIND_ICON = { building: "building", landmark: "building", street: "street", road: "street", place: "place", poi: "place", park: "park", area: "park", stop: "stop", route: "bus", bus: "bus", vehicle: "bus", weather: "sun", sky: "sun" };
+  const KIND_ICON = { building: "building", landmark: "building", street: "street", road: "street", place: "place", poi: "place", park: "park", area: "park", stop: "stop", route: "bus", bus: "bus", vehicle: "bus", weather: "sun", sky: "sun", plane: "plane", aircraft: "plane", heli: "plane", event: "flag", game: "flag" };
   function highlight(label, raw) {
     const L = String(label), i = raw ? L.toLowerCase().indexOf(raw.toLowerCase()) : -1;
     if (i < 0) return esc(L);
@@ -1094,26 +1118,42 @@ export function init(app) {
   app.on("click-empty", () => { closeCard(); closePanel(); closeSearch(); });
 
   // ---------------------------------------------------------------- what the UI draws on the map: the search pin, the card's leader
-  const DROP = 0.55, LEADER_DASH = [1.5, 4];
+  // Frames (ARCHITECTURE.md "Frame scheduling"): these layers are still pictures except while the pin drops, the street
+  // fades in, or the card's marker pulses (a few times when a card opens, then it rests): fps() is 0 otherwise.
+  const DROP = 0.55, LEADER_DASH = [1.5, 4], STREET_FADE = 400;
+  const PULSE_MS = 1600, PULSES = 3;
+  // the street's roads as ground-metre paths, made once per street card (not rebuilt every frame)
+  function streetPaths(st) {
+    if (!st.paths) {
+      st.paths = []; st.widths = [];
+      for (const i of st.s.ids) {
+        const r = data.roads[i], f = r.pts;
+        if (!f || f.length < 4) continue;
+        const p = new Path2D();
+        p.moveTo(f[0], f[1]);
+        for (let k = 2; k < f.length; k += 2) p.lineTo(f[k], f[k + 1]);
+        st.paths.push(p); st.widths.push(r.w || 6);
+      }
+    }
+    return st;
+  }
   app.addLayer({
     id: "ui-highlight", z: 60,
+    fps: () => (street && !reducedMotion() && performance.now() - street.t0 < STREET_FADE ? 60 : 0),
     draw(ctx) {
       if (!street) return;
       const s = view.s, o = geo.ROTS[view.rot], S = geo.SIN_T, d = view.dpr;
-      const a = reducedMotion() ? 1 : Math.min(1, (performance.now() - street.t0) / 400);
+      const a = reducedMotion() ? 1 : Math.min(1, (performance.now() - street.t0) / STREET_FADE);
+      const { paths, widths } = streetPaths(street);
       // ground metres straight onto the screen (see render.js setWorld): widths foreshorten like the roads themselves
       ctx.setTransform(d * s * o.R[0], -d * s * S * o.D[0], d * s * o.R[1], -d * s * S * o.D[1], d * (view.w / 2 - view.X * s), d * (view.h / 2 - view.Y * s));
       ctx.lineCap = "round"; ctx.lineJoin = "round";
       ctx.strokeStyle = "#b3202a";
       for (let pass = 0; pass < 2; pass++) {
         ctx.globalAlpha = (pass ? 0.55 : 0.2) * a;
-        for (const i of street.s.ids) {
-          const r = data.roads[i], f = r.pts;
-          ctx.lineWidth = pass ? Math.max(2, r.w * 0.35) : r.w + 9;
-          ctx.beginPath();
-          ctx.moveTo(f[0], f[1]);
-          for (let k = 2; k < f.length; k += 2) ctx.lineTo(f[k], f[k + 1]);
-          ctx.stroke();
+        for (let i = 0; i < paths.length; i++) {
+          ctx.lineWidth = pass ? Math.max(2, widths[i] * 0.35) : widths[i] + 9;
+          ctx.stroke(paths[i]);
         }
       }
     },
@@ -1122,18 +1162,26 @@ export function init(app) {
   // route pill right at the anchor): only the leader is drawn, and it stops short so the pill stays readable.
   const SELF_MARKED = new Set(["transit"]);
   const LEADER_GAP = 18;
+  let marksFps = 0;                      // what ui-marks needs after this frame: the pin dropping, the marker pulsing
+  let pulseKey = null, pulseT0 = 0;      // the anchor the marker last pulsed for (a card opened or reopened elsewhere)
   app.addLayer({
     id: "ui-marks", z: 95,
+    fps: () => marksFps,
     draw(ctx, f) {
+      marksFps = 0;
       const top = cards.size ? topCard() : null;
       const a = top ? anchorOf(top) : null;
-      if (!pin && !a) return;
+      if (!pin && !a) { pulseKey = null; return; }
       const still = reducedMotion();
       if (a && !(pin && pin.card === top.id)) drawAnchor(ctx, a, top, f.t, still);
       if (pin) drawPin(ctx, still);
     },
   });
   function drawAnchor(ctx, a, top, t, still) {
+    // a newly opened card's marker pulses a few times, then rests as a ring (a moving anchor is followed at its own
+    // layer's pace: a bus, an aircraft)
+    const key = top._st.anchor;
+    if (key !== pulseKey) { pulseKey = key; pulseT0 = t; }
     g2s(a.x, a.y, a.z || 0);
     const ax = P[0], ay = P[1];
     if (ax < -30 || ay < -30 || ax > view.w + 30 || ay > view.h + 30) return;
@@ -1159,8 +1207,10 @@ export function init(app) {
     }
     if (marked) return;
     // the marker: a soft pulse, then a ring
-    if (!still) {
-      const ph = ((t / 1600) % 1);
+    const age = t - pulseT0;
+    if (!still && age >= 0 && age < PULSE_MS * PULSES) {
+      marksFps = 30;
+      const ph = (age / PULSE_MS) % 1;
       ctx.beginPath();
       ctx.arc(ax, ay, 5 + ph * 12, 0, Math.PI * 2);
       ctx.globalAlpha = 0.45 * (1 - ph);
@@ -1183,6 +1233,7 @@ export function init(app) {
     const px = P[0], py = P[1];
     if (px < -30 || py < -10 || px > view.w + 30 || py > view.h + 40) return;
     const k = still ? 1 : Math.min(1, (performance.now() - pin.t0) / 1000 / DROP);
+    if (k < 1) marksFps = 60;
     // fall, then a small bounce (easeOutBounce, gentle)
     const e = k < 0.7 ? (k / 0.7) ** 2 : 1 - Math.sin(((k - 0.7) / 0.3) * Math.PI) * 0.12;
     const lift = (1 - e) * 46;
@@ -1300,10 +1351,15 @@ export function init(app) {
   });
 
   // keep #lat,lon,m,r current so a reload (or a copied address bar) lands on the same view
-  let hashDirty = false, lastViewChange = 0, hashOn = false, lastHash = location.hash.slice(1);
-  app.on("view", () => { hashDirty = true; lastViewChange = performance.now(); syncZoomButtons(); });
-  setInterval(() => {
-    if (!hashOn || !hashDirty || view.anim || performance.now() - lastViewChange < 450) return;
+  // (a timer only while the view has moved: nothing ticks while the map rests)
+  let hashDirty = false, lastViewChange = 0, hashOn = false, lastHash = location.hash.slice(1), hashTimer = 0;
+  const hashSoon = (ms = 480) => { if (!hashTimer) hashTimer = setTimeout(hashTick, ms); };
+  app.on("view", () => { hashDirty = true; lastViewChange = performance.now(); syncZoomButtons(); if (hashOn) hashSoon(); });
+  function hashTick() {
+    hashTimer = 0;
+    if (!hashOn || !hashDirty) return;
+    const wait = 450 - (performance.now() - lastViewChange);
+    if (view.anim || wait > 0) { hashSoon(view.anim ? 250 : Math.max(40, wait + 10)); return; }
     hashDirty = false;
     const h = viewParts();
     carryView(h);
@@ -1313,7 +1369,7 @@ export function init(app) {
     sp.delete("at");          // ?at= wins over the hash on load, so it must not linger once the view has moved
     const qs = sp.toString();
     try { history.replaceState(history.state, "", `${location.pathname}${qs ? "?" + qs : ""}#${h}`); } catch { /* sandboxed */ }
-  }, 250);
+  }
   // the About page's links back to the map carry this view in the hash, so returning lands here, not on the intro
   function carryView(h) { for (const a of aboutLinks) a.setAttribute("href", `about.html#${h}`); }
   const aboutLinks = [...document.querySelectorAll('a[href^="about.html"]')];
@@ -1348,6 +1404,7 @@ export function init(app) {
   }, true);
   window.addEventListener("resize", () => {
     cardsDirty = true;
+    fitStatus();
     if (openPanelName) placePanel(panels[openPanelName].panel, panels[openPanelName].btn);
     if (searchOpen && !isPhone()) placePanel(searchPanel, qEl.closest(".search"));
   });
@@ -1391,6 +1448,7 @@ export function init(app) {
     readyDone = true;
     setTimeout(() => { if (loading) loading.hidden = true; }, 700);
     hashOn = true;
+    if (hashDirty) hashSoon();
     carryView(viewParts());      // the view may never move (a reload of a shared link), and About should still lead back
     // build the search index while the reader is still looking, so the first keystroke answers at once
     const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 1500));

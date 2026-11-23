@@ -4,7 +4,10 @@
 // and the odd lightning flash. Publishes app.weather (ARCHITECTURE.md) and emits "weather" when it changes meaningfully.
 //
 // Layers: "sky" z 80 (cloud shadows, the light grade, stars, moon) · "sky-lights" z 82 (the night-lights tiles) ·
-// "sky-weather" z 88 (fog, rain, snow, lightning). One toggle, "sky", switches all three.
+// "sky-clouds" z 86 (cumulus aloft and mist round the diorama, zoomed far out) · "sky-weather" z 88 (fog, rain, snow,
+// lightning). One toggle, "sky", switches them all. Each says what frame rate it needs (fps(f), ARCHITECTURE.md
+// "Frame scheduling"): nothing while nothing of it moves; the light's slow change with the clock comes by a timer.
+// Test switch: ?noclouds hides the clouds aloft.
 
 const LAT = 40.0, LON = -83.02;
 const WX_URL = "https://api.open-meteo.com/v1/forecast?latitude=40.0&longitude=-83.02&current=temperature_2m,weather_code,cloud_cover,wind_speed_10m,wind_direction_10m,precipitation,rain,snowfall,snow_depth,is_day,visibility&temperature_unit=fahrenheit&wind_speed_unit=mph&timezone=America%2FNew_York";
@@ -367,7 +370,10 @@ export function init(app) {
     gr: 255, gg: 200, gb: 140, ga: 0, glowAz: 0, glowVer: 0, moonLift: 0, moonAz: 0,
     bg: null, stars: 0, moonA: 0, cloudA: 0, cloudCov: 0, daylight: 1,
     haze: [236, 236, 233], hazeVer: 0,
+    // the clouds aloft (lit tops, shaded undersides) and the mist round the diorama, which lie above the multiply
+    clLit: [255, 255, 255], clShade: [206, 214, 230], clA: 1, mist: [250, 248, 242], mistA: 1, cloudVer: 0,
   };
+  let lightSig = "";
   const G = new Float64Array(11);
   let lastSkyMs = NaN, lastMoonMs = NaN, lightAlt = NaN, lightWx = -1, lightMoon = NaN, lightSnow = NaN;
   let emittedPhase = "", emittedNight = -1, emittedAlt = -999;
@@ -404,11 +410,11 @@ export function init(app) {
     }
   }
 
-  // the colours of the light for this sun and weather; only when something actually changed
+  // the colours of the light for this sun and weather; only when something actually changed (→ true when it did)
   function computeLight() {
     const moonUp = W.moon.alt > 0 ? W.moon.fraction * smooth(0, 25, W.moon.alt) : 0;
     const tileSnowNow = num(app.tileStyle && app.tileStyle.snow, 0);
-    if (Math.abs(W.sunAlt - lightAlt) < 0.04 && lightWx === wxVer && Math.abs(moonUp - lightMoon) < 0.02 && tileSnowNow === lightSnow) return;
+    if (Math.abs(W.sunAlt - lightAlt) < 0.04 && lightWx === wxVer && Math.abs(moonUp - lightMoon) < 0.02 && tileSnowNow === lightSnow) return false;
     lightAlt = W.sunAlt; lightWx = wxVer; lightMoon = moonUp; lightSnow = tileSnowNow;
     gradeAt(W.sunAlt);
     const night = W.night, day = 1 - night;
@@ -447,12 +453,10 @@ export function init(app) {
     L.tw = smooth(3, -0.5, W.sunAlt) * (1 - smooth(-4.5, -8.5, W.sunAlt)) * (1 - 0.6 * over);
     L.vig = 0.16 * night;
     L.mulOn = L.mr < 0.996 || L.mg < 0.996 || L.mb < 0.996 || L.vig > 0.004 || L.tw > 0.01;
-    L.mulVer++;   // (the moon's wash, set below, is part of the multiply too)
     // The glow: the low sun's warmth, screened in from its side of the map (none once the sun is 9° down). A bright
     // moon's faint cool wash is folded into the multiply instead (getMulFill): a second full-screen pass all night for
     // a few percent of light isn't worth its cost, and the two fade independently rather than swapping in one frame.
     L.gr = G[4]; L.gg = lerp(G[5], G[5] + 12, dawn); L.gb = lerp(G[6], G[6] + 30, dawn); L.ga = ga; L.glowAz = W.sunAz;
-    L.glowVer++;
     L.moonLift = 0.07 * moon; L.moonAz = W.moon.az;
     // the multiply darkens the paper too, so ask for the paper colour that comes out right after it
     L.bg = hex(Math.min(255, sr / L.mr), Math.min(255, sg / L.mg), Math.min(255, sb / L.mb));
@@ -465,31 +469,65 @@ export function init(app) {
     // the haze colour fog takes on: paper-white by day, dusky rose at twilight, a dim blue-grey glow at night
     const tw = smooth(4, -2, W.sunAlt) * (1 - night);
     L.haze[0] = lerp(lerp(238, 214, tw), 70, night); L.haze[1] = lerp(lerp(237, 196, tw), 76, night); L.haze[2] = lerp(lerp(233, 200, tw), 98, night);
-    L.hazeVer++;
+    // Clouds aloft: sunlit white tops and cool undersides by day, greyer under a lid of overcast or rain, peach and mauve
+    // at the ends of the day, and at night dim blue-grey, faintly warmed underneath where the city lights a low deck.
+    const grey = Math.max(over, W.rain, W.snow * 0.6);
+    const cl = L.clLit, cs = L.clShade;
+    cl[0] = lerp(lerp(lerp(255, 232, grey), 255, tw), 74, night); cl[1] = lerp(lerp(lerp(255, 235, grey), 222, tw), 82, night); cl[2] = lerp(lerp(lerp(255, 240, grey), 204, tw), 110, night);
+    cs[0] = lerp(lerp(lerp(168, 150, grey), 176, tw), lerp(44, 70, cityGlow), night); cs[1] = lerp(lerp(lerp(180, 158, grey), 150, tw), lerp(50, 60, cityGlow), night); cs[2] = lerp(lerp(lerp(206, 176, grey), 182, tw), lerp(76, 70, cityGlow), night);
+    L.clA = lerp(1, 0.62, night) * (1 - 0.45 * W.fog);
+    // the mist on the paper: a paler breath of the paper's own colour (as it looks once the multiply is through)
+    const pr = sr, pg = sg, pb = sb, lift = lerp(0.55, 0.3, night);
+    L.mist[0] = lerp(pr, lerp(255, 120, night), lift); L.mist[1] = lerp(pg, lerp(253, 130, night), lift); L.mist[2] = lerp(pb, lerp(248, 168, night), lift);
+    L.mistA = lerp(1, 0.8, night);
+    // Only a change you could see bumps the versions the cached fills and sprites key on (the sun moves a little all
+    // day, but above 28 degrees and below -13 the light doesn't change at all): no redraws, no rebuilt caches for nothing.
+    const sig = [L.mr, L.mg, L.mb, L.tw, L.vig, L.moonLift, L.gr, L.gg, L.gb, L.ga, L.stars, L.moonA, L.cloudA, L.cloudCov, L.clA, L.mistA, L.haze[0], L.haze[1], L.haze[2], cl[0], cl[1], cl[2], cs[0], cs[1], cs[2], L.mist[0], L.mist[1], L.mist[2]]
+      .map((v) => Math.round(v * 400)).join() + `|${L.bg}|${Math.round(L.glowAz)}|${Math.round(L.moonAz)}`;
+    if (sig === lightSig) return false;
+    lightSig = sig;
+    L.mulVer++; L.glowVer++; L.hazeVer++; L.cloudVer++;
+    return true;
   }
 
+  let viewMoving = false;
   app.on("frame", (f) => {
+    viewMoving = f.moving;
     const ms = f.now.getTime();
     if (!(Math.abs(ms - lastSkyMs) < 1000)) updateSky(ms);
     computeLight();
     app.background = app.layerEnabled("sky") ? L.bg : null;
   });
+  // The light follows the clock even on a map nobody touches, without a standing frame rate: every few seconds of
+  // clock time, see whether the sky has visibly moved on and draw one frame if it has (updateSky's own "weather"
+  // emit draws one too). The sun crawls 0.04 degrees in about ten seconds at dusk; ?speed=N runs the check N times faster.
+  const SPEED = (() => { const v = app.params.get("speed"); const n = v == null || v === "" ? NaN : +v; return Number.isFinite(n) ? Math.max(0, n) : 1; })();
+  if (SPEED > 0) {
+    setInterval(() => {
+      if (document.hidden || !app.layerEnabled("sky")) return;
+      const ms = app.now().getTime();
+      if (!(Math.abs(ms - lastSkyMs) < 1000)) updateSky(ms);
+      if (computeLight()) app.requestRender("sky");
+    }, Math.max(250, Math.min(15000, 12000 / SPEED)));
+  }
 
   // ---------------------------------------------------------------- drawing helpers
   // Fill the ground the screen shows (clipped to the world) with a repeating pattern laid in ground metres, K metres per
   // texel, shifted by (ox, oy) metres: it then slides over the map consistently as you pan, zoom and rotate. d = pixels
-  // per CSS pixel of the target (the dpr for the map canvas, a fraction for the low-res sheets).
-  function fillGround(ctx, pattern, K, ox, oy, d) {
+  // per CSS pixel of the target (the dpr for the map canvas, a fraction for the low-res sheets). (tx, ty): where the
+  // target puts screen-metre (0, 0), in its pixels (default: the view's own centring); pad: CSS px of margin round the
+  // screen the target covers too.
+  function fillGround(ctx, pattern, K, ox, oy, d, tx = d * (view.w / 2 - view.X * view.s), ty = d * (view.h / 2 - view.Y * view.s), pad = 0) {
     const o = geo.ROTS[view.rot], S = geo.SIN_T, s = view.s, w = view.w, h = view.h;
     let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
     for (let c = 0; c < 4; c++) {
-      const X = ((c & 1 ? w : 0) - w / 2) / s + view.X, v = -(((c & 2 ? h : 0) - h / 2) / s + view.Y) / S;
+      const X = ((c & 1 ? w + pad + 2 : -pad - 2) - w / 2) / s + view.X, v = -(((c & 2 ? h + pad + 2 : -pad - 2) - h / 2) / s + view.Y) / S;
       const gx = X * o.R[0] + v * o.D[0], gy = X * o.R[1] + v * o.D[1];
       if (gx < x0) x0 = gx; if (gx > x1) x1 = gx; if (gy < y0) y0 = gy; if (gy > y1) y1 = gy;
     }
     x0 = Math.max(x0, world.x0); y0 = Math.max(y0, world.y0); x1 = Math.min(x1, world.x1); y1 = Math.min(y1, world.y1);
     if (x0 >= x1 || y0 >= y1) return;
-    ctx.setTransform(d * s * o.R[0], -d * s * S * o.D[0], d * s * o.R[1], -d * s * S * o.D[1], d * (w / 2 - view.X * s), d * (h / 2 - view.Y * s));
+    ctx.setTransform(d * s * o.R[0], -d * s * S * o.D[0], d * s * o.R[1], -d * s * S * o.D[1], tx, ty);
     ctx.transform(K, 0, 0, K, ox, oy);
     ctx.fillStyle = pattern;
     ctx.fillRect((x0 - ox) / K, (y0 - oy) / K, (x1 - x0) / K, (y1 - y0) / K);
@@ -716,41 +754,168 @@ export function init(app) {
     return S;
   }
 
+  // ---------------------------------------------------------------- full-resolution caches
+  // On a canvas rasterised by the CPU (no GPU: many laptops' browsers, every phone in power saving), the cheapest
+  // full-screen pass there is is a canvas blitted 1:1 at a whole-pixel offset: no resampling. A gradient fill costs about
+  // twice that, a low-res sheet stretched over the screen three to six times. So passes that hold still between frames
+  // are drawn once into canvases of the map's device-pixel size and blitted; the ground-fixed ones (the cloud shadows,
+  // the city's glow) carry a margin and are anchored like the core's base map, so a pan or the wind's drift only moves
+  // them by whole pixels until the margin runs out.
+  function devCanvas(C, Wd, Hd) {
+    if (!C.c) { C.c = makeCanvas(Wd, Hd); C.g = C.c.getContext("2d"); }
+    else if (C.c.width !== Wd || C.c.height !== Hd) { C.c.width = Wd; C.c.height = Hd; }   // (clears it, resets its state)
+    const g = C.g;
+    g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+    g.clearRect(0, 0, Wd, Hd);
+    return g;
+  }
+  /** give a cache's memory back (it rebuilds when next needed) */
+  function freeCanvas(C) { if (C.c && C.c.width > 1) { C.c.width = 1; C.c.height = 1; } C.ok = false; C.key = ""; }
+  // the base map's whole-pixel origin for the view as it is (core/app.js drawBase): device px = screen m · s · dpr − off
+  const baseOffX = () => Math.round((view.X * view.s - view.w / 2) * view.dpr);
+  const baseOffY = () => Math.round((view.Y * view.s - view.h / 2) * view.dpr);
+  /** the diorama's bounding box on the canvas (device px, walls included), clipped to it; false when off screen */
+  const _slab = [0, 0, 0, 0];
+  function slabRect(Wd, Hd) {
+    const b = view.worldBox, k = view.s * view.dpr;
+    const x0 = Math.max(0, Math.floor(b[0] * k - baseOffX()) - 2), y0 = Math.max(0, Math.floor(b[1] * k - baseOffY()) - 2);
+    const x1 = Math.min(Wd, Math.ceil(b[2] * k - baseOffX()) + 2), y1 = Math.min(Hd, Math.ceil((b[3] + SLAB_DEPTH * geo.COS_T) * k - baseOffY()) + 2);
+    if (x1 <= x0 || y1 <= y0) return false;
+    _slab[0] = x0; _slab[1] = y0; _slab[2] = x1 - x0; _slab[3] = y1 - y0;
+    return _slab;
+  }
+
+  /** A screen-fixed fill (the tint's gradient, the low sun's glow) drawn once into a device-pixel canvas. */
+  function fillCache(C, ctx, fill) {
+    const Wd = ctx.canvas.width, Hd = ctx.canvas.height;
+    if (C.ok && C.fill === fill && C.c.width === Wd && C.c.height === Hd) return C.c;
+    const g = devCanvas(C, Wd, Hd);
+    g.setTransform(view.dpr, 0, 0, view.dpr, 0, 0);   // (the gradients are laid out in CSS px)
+    g.fillStyle = fill;
+    g.fillRect(0, 0, view.w + 1, view.h + 1);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    C.ok = true; C.fill = fill;
+    return C.c;
+  }
+  const tintC = { c: null, g: null, ok: false, fill: null }, glowC = { c: null, g: null, ok: false, fill: null };
+
+  // The cloud shadows (with the tint folded in when it is one flat colour), CSS-px margin SH_PAD round the screen.
+  const SH_PAD = 128;
+  const shC = { c: null, g: null, ok: false, key: "", offX: 0, offY: 0, s: 0, rot: -1, d: 0, W: 0, H: 0, padD: 0, dx: 0, dy: 0 };
+  let cloudDX = 0, cloudDY = 0;   // the shadows' drift, ground metres, unwrapped (cloudOX/OY are it modulo the tile)
+  function shadowKey(tint) { return `${L.cloudVer}|${Math.round(L.cloudCov * 20)}|${tint}`; }
+  const shSheet = { c: null, g: null };
+  function renderShadows(ctx, tint) {
+    const d = view.dpr, padD = Math.round(SH_PAD * d), offX = baseOffX(), offY = baseOffY();
+    // composed at a quarter of the resolution and stretched once into the cache: sampling the skewed pattern at every
+    // pixel of it costs four times as much (a 40 ms hitch every couple of seconds of drift on a slow machine)
+    const sw = Math.ceil((ctx.canvas.width + 2 * padD) / SHEET_DIV), sh = Math.ceil((ctx.canvas.height + 2 * padD) / SHEET_DIV);
+    const sg = devCanvas(shSheet, sw, sh), q = 1 / SHEET_DIV;
+    sg.fillStyle = tint;
+    sg.fillRect(0, 0, sw, sh);
+    sg.globalCompositeOperation = "multiply";
+    sg.globalAlpha = L.cloudA;
+    fillGround(sg, cloudPattern(sg, L.cloudCov), CLOUD_TILE_M / NOISE_N, cloudOX, cloudOY, d * q, (padD - offX) * q, (padD - offY) * q, SH_PAD);
+    sg.setTransform(1, 0, 0, 1, 0, 0); sg.globalAlpha = 1; sg.globalCompositeOperation = "source-over";
+    const g = devCanvas(shC, sw * SHEET_DIV, sh * SHEET_DIV);
+    g.globalCompositeOperation = "copy";
+    g.drawImage(shSheet.c, 0, 0, sw * SHEET_DIV, sh * SHEET_DIV);
+    g.globalCompositeOperation = "source-over";
+    Object.assign(shC, { ok: true, key: shadowKey(tint), offX, offY, s: view.s, rot: view.rot, d, W: ctx.canvas.width, H: ctx.canvas.height, padD, dx: cloudDX, dy: cloudDY });
+  }
+  /**
+   * Where a ground-anchored cache C (drawn with the drift at (C.dx, C.dy)) goes now that the drift is at (dx, dy):
+   * device px of its top-left, or false when it has to be redrawn (another zoom, turn, size or key, or the margin used up).
+   */
+  const _at = [0, 0];
+  function anchoredAt(C, ctx, dx, dy, key) {
+    if (!C.ok || C.s !== view.s || C.rot !== view.rot || C.d !== view.dpr || C.W !== ctx.canvas.width || C.H !== ctx.canvas.height || C.key !== key) return false;
+    // the drift since it was drawn, projected (the ground moves the same for every point: one shift)
+    const o = geo.ROTS[view.rot], gx = dx - C.dx, gy = dy - C.dy, k = view.s * view.dpr;
+    const sx = Math.round((gx * o.R[0] + gy * o.R[1]) * k) + C.offX - baseOffX();
+    const sy = Math.round(-(gx * o.D[0] + gy * o.D[1]) * geo.SIN_T * k) + C.offY - baseOffY();
+    if (Math.abs(sx) > C.padD || Math.abs(sy) > C.padD) return false;
+    _at[0] = sx - C.padD; _at[1] = sy - C.padD;
+    return _at;
+  }
+  const shadowsAt = (ctx, tint) => anchoredAt(shC, ctx, cloudDX, cloudDY, shadowKey(tint));
+  // how fast the shadows cross the screen, device px/s (the wind's direction foreshortened like the ground)
+  const cloudSpeed = () => Math.max(4, W.windMph * 0.447 * 2.6);   // clouds ride faster winds aloft, m/s
+  function driftPx(s, d) {
+    windGround(_wg);
+    const o = geo.ROTS[view.rot], ax = _wg[0] * o.R[0] + _wg[1] * o.R[1], ay = (_wg[0] * o.D[0] + _wg[1] * o.D[1]) * geo.SIN_T;
+    return cloudSpeed() * s * d * Math.sqrt(ax * ax + ay * ay);
+  }
+
   // ---------------------------------------------------------------- layer: the light (z 80)
   app.addLayer({
     id: "sky", z: 80,
     draw(ctx, f) {
-      const w = f.w, h = f.h, dt = calm ? 0 : f.dt;
+      const w = f.w, h = f.h, d = f.dpr, dt = calm ? 0 : f.dt;
+      const tint = L.mulOn ? getMulFill(ctx, w, h) : null;   // a colour, a gradient, or nothing to do
+      const flat = typeof tint !== "object" || tint === null;
       if (L.cloudA > 0.01) {
-        // cloud shadows sliding over the ground with the wind, composed with the tint in one low-res sheet
+        // cloud shadows sliding over the ground with the wind
         windGround(_wg);
-        const sp = Math.max(4, W.windMph * 0.447 * 2.6);   // clouds ride faster winds aloft
-        cloudOX = (cloudOX + _wg[0] * sp * dt) % CLOUD_TILE_M; cloudOY = (cloudOY + _wg[1] * sp * dt) % CLOUD_TILE_M;
-        const S = sheet("light", w, h), g = S.g;
-        g.setTransform(S.k, 0, 0, S.k, 0, 0);
-        g.fillStyle = L.mulOn ? getMulFill(ctx, w, h) : "#fff";
-        g.fillRect(0, 0, w, h);
-        g.globalCompositeOperation = "multiply";
-        g.globalAlpha = L.cloudA;
-        fillGround(g, cloudPattern(g, L.cloudCov), CLOUD_TILE_M / NOISE_N, cloudOX, cloudOY, S.k);
-        ctx.globalCompositeOperation = "multiply";
-        ctx.drawImage(S.c, 0, 0, w, h);
-      } else if (L.mulOn) {
-        ctx.globalCompositeOperation = "multiply";
-        ctx.fillStyle = getMulFill(ctx, w, h);
-        ctx.fillRect(0, 0, w, h);
+        const sp = cloudSpeed();
+        cloudDX += _wg[0] * sp * dt; cloudDY += _wg[1] * sp * dt;
+        cloudOX = cloudDX % CLOUD_TILE_M; cloudOY = cloudDY % CLOUD_TILE_M;
+        const base = flat && tint ? tint : "#fff";
+        let at = shadowsAt(ctx, base);
+        // mid-zoom, the old way: tint and shadows composed in a low-res sheet and stretched over the screen (a cache
+        // drawn now would be stale next frame); otherwise (re)draw the cache, at most once per margin's worth of drift
+        if (!at && f.moving && shC.s !== view.s) {
+          const S = sheet("light", w, h), g = S.g;
+          g.setTransform(S.k, 0, 0, S.k, 0, 0);
+          g.fillStyle = tint || "#fff";
+          g.fillRect(0, 0, w, h);
+          g.globalCompositeOperation = "multiply";
+          g.globalAlpha = L.cloudA;
+          fillGround(g, cloudPattern(g, L.cloudCov), CLOUD_TILE_M / NOISE_N, cloudOX, cloudOY, S.k);
+          ctx.globalCompositeOperation = "multiply";
+          ctx.drawImage(S.c, 0, 0, w, h);
+        } else {
+          if (!at) { renderShadows(ctx, base); at = shadowsAt(ctx, base); }
+          ctx.setTransform(1, 0, 0, 1, 0, 0);
+          ctx.globalCompositeOperation = "multiply";
+          if (!flat) ctx.drawImage(fillCache(tintC, ctx, tint), 0, 0);   // a gradient tint stays put on the screen
+          if (at) {
+            // with no tint to lay over the paper, only the diorama has anything to darken: blit just its box
+            const r = base === "#fff" ? slabRect(ctx.canvas.width, ctx.canvas.height) : null;
+            if (r) ctx.drawImage(shC.c, r[0] - at[0], r[1] - at[1], r[2], r[3], r[0], r[1], r[2], r[3]);
+            else if (r !== false) ctx.drawImage(shC.c, at[0], at[1]);
+          }
+          ctx.setTransform(d, 0, 0, d, 0, 0);
+        }
+      } else {
+        if (shC.ok) { freeCanvas(shC); freeCanvas(shSheet); }
+        if (tint) {
+          ctx.globalCompositeOperation = "multiply";
+          if (flat) { ctx.fillStyle = tint; ctx.fillRect(0, 0, w, h); }   // one flat colour: a plain fill is cheapest
+          else { ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.drawImage(fillCache(tintC, ctx, tint), 0, 0); ctx.setTransform(d, 0, 0, d, 0, 0); }
+        }
       }
+      if (flat && tintC.ok) freeCanvas(tintC);
       // the low sun's glow: only around sunrise and sunset (at night the moon's wash rides in the multiply above)
       if (L.ga > 0.004) {
         ctx.globalCompositeOperation = "screen";
-        ctx.fillStyle = getGlowFill(ctx, w, h);
-        ctx.fillRect(0, 0, w, h);
-      }
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.drawImage(fillCache(glowC, ctx, getGlowFill(ctx, w, h)), 0, 0);
+        ctx.setTransform(d, 0, 0, d, 0, 0);
+      } else if (glowC.ok) freeCanvas(glowC);
       ctx.globalCompositeOperation = "source-over";
       if ((L.stars > 0.02 || L.moonA > 0.02) && !slabCoversScreen(w, h)) {
         if (L.stars > 0.02) drawStars(ctx, f);
         drawMoon(ctx, f);
       }
+    },
+    // Drifting cloud shadows are the only thing here that moves by itself (the light's slow changes come by the
+    // timer above; the stars twinkle only in frames drawn anyway). Their edges are soft over tens of metres, so a step
+    // of up to 3 device px a frame doesn't show: 0.5–8 fps.
+    fps(f) {
+      if (calm || !(L.cloudA > 0.01)) return 0;
+      const px = driftPx(f.s, f.dpr) / 3;
+      return px < 0.02 ? 0 : Math.max(0.5, Math.min(8, px));
     },
   });
 
@@ -864,10 +1029,50 @@ export function init(app) {
     turned = { r, roads: make(turned && turned.roads, false), all: make(turned && turned.all, true), X0: box[0], Y0: box[1], w: tw * C, h: th * C };
     return turned;
   }
+  // Kept at the view's scale (with a margin, on the base map's pixel grid) once the view is still: a 1:1 blit of the
+  // diorama's box instead of a stretched one of the whole sheet. One cache per caller (the lights, the fog's bloom).
+  const GLOW_PAD = 128;
+  const glowLights = { c: null, g: null, ok: false, key: "", offX: 0, offY: 0, s: 0, rot: -1, d: 0, W: 0, H: 0, padD: 0 };
+  const glowFog = { c: null, g: null, ok: false, key: "", offX: 0, offY: 0, s: 0, rot: -1, d: 0, W: 0, H: 0, padD: 0 };
+  function glowCached(ctx, C, ratio) {
+    const T = turnedGlow(view.rot), s = view.s, d = view.dpr, Wd = ctx.canvas.width, Hd = ctx.canvas.height;
+    const key = `${ratio}`;
+    let sx = 0, sy = 0;
+    const fresh = C.ok && C.s === s && C.rot === view.rot && C.d === d && C.W === Wd && C.H === Hd && C.key === key;
+    if (fresh) { sx = C.offX - baseOffX(); sy = C.offY - baseOffY(); }
+    if (!fresh || Math.abs(sx) > C.padD || Math.abs(sy) > C.padD) {
+      if (viewMoving && !(fresh)) return false;   // mid-zoom: stretch the sheets instead (a cache would be stale next frame)
+      const padD = Math.round(GLOW_PAD * d), offX = baseOffX(), offY = baseOffY();
+      const g = devCanvas(C, Wd + 2 * padD, Hd + 2 * padD), k = s * d;
+      const dx = T.X0 * k - offX + padD, dy = T.Y0 * k - offY + padD, dw = T.w * k, dh = T.h * k;
+      g.globalCompositeOperation = "lighter";
+      // roads + ratio × spots, from the two sheets (roads alone, roads with spots)
+      if (ratio > 0) { g.globalAlpha = ratio; g.drawImage(T.all, dx, dy, dw, dh); }
+      if (ratio < 1) { g.globalAlpha = 1 - ratio; g.drawImage(T.roads, dx, dy, dw, dh); }
+      g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+      Object.assign(C, { ok: true, key, offX, offY, s, rot: view.rot, d, W: Wd, H: Hd, padD });
+      sx = 0; sy = 0;
+    }
+    const r = slabRect(Wd, Hd);
+    if (!r) return true;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(C.c, r[0] - sx + C.padD, r[1] - sy + C.padD, r[2], r[3], r[0], r[1], r[2], r[3]);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+    return true;
+  }
   /** The city glow, roads at roadsA and spots at spotsA (≤ roadsA), added on top. Builds itself the first time. */
-  function drawCityGlow(ctx, roadsA, spotsA) {
+  function drawCityGlow(ctx, roadsA, spotsA, C = glowLights) {
     if (!cityGlow) cityGlow = cityGlowJob();
     if (!cityGlow.done) { cityGlow.step(3); return; }   // show it only once it's whole
+    if (roadsA < 0.004) return;
+    // the spots' share, quantised so that a slow fade doesn't redraw the cache every frame
+    const ratio = Math.round(Math.min(1, Math.max(0, spotsA / roadsA)) * 24) / 24;
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = roadsA;
+    const done = glowCached(ctx, C, ratio);
+    ctx.globalAlpha = 1;
+    ctx.globalCompositeOperation = "source-over";
+    if (done) return;
     const T = turnedGlow(view.rot), s = view.s;
     const dx = (T.X0 - view.X) * s + view.w / 2, dy = (T.Y0 - view.Y) * s + view.h / 2, dw = T.w * s, dh = T.h * s;
     ctx.globalCompositeOperation = "lighter";
@@ -896,16 +1101,20 @@ export function init(app) {
     id: "sky-lights", z: 82,
     draw(ctx, f) {
       // the lights tiles are only drawn (and so only rendered) once dusk comes
-      if (!app.layerEnabled("sky") || W.night <= 0.02) return;
+      if (!app.layerEnabled("sky") || W.night <= 0.02) { if (glowLights.ok) freeCanvas(glowLights); return; }
       const a = Math.min(1, W.night * 1.08), k = f.s * f.dpr;
       const tilesA = glowReady() ? smooth(HAND_LO, HAND_HI, k) : 1;
       if (tilesA > 0.01) app.tiles.draw(ctx, f.view, "lights", { alpha: a * tilesA, op: "lighter" });
       const roadsA = smooth(1.2, 0.45, k);
+      if (roadsA <= 0.01 && glowLights.ok) freeCanvas(glowLights);
       if (roadsA > 0.01) {
         const g = a * (1 - 0.5 * W.fog);
         drawCityGlow(ctx, g * roadsA, g * Math.min(roadsA, 1 - tilesA));
       }
     },
+    // nothing here moves by itself: the lights come up with the dusk by the clock's timer, and a lights tile that
+    // arrives draws its own frame
+    fps() { return 0; },
   });
 
   // ---------------------------------------------------------------- weather particles (screen space, but riding the map)
@@ -950,38 +1159,76 @@ export function init(app) {
   const FOG_BLOOM = [0.5, 0.75];   // the city glow over the fog, per unit of fog at full night: up close, from afar
 
   let hazeFill = null, hazeKey = NaN, hazeVer = -1, hazeH = 0;
+  // Like the cloud shadows: the drifting banks kept in a device-pixel cache with a margin (anchored on the base map's
+  // grid, shifted by the drift and pans), the screen-fixed haze in another; two 1:1 blits a frame instead of a
+  // low-res sheet recomposed and stretched over the whole screen (the old way, kept for mid-zoom frames).
+  const FOG_PAD = 128;
+  const fogC = { c: null, g: null, ok: false, key: "", offX: 0, offY: 0, s: 0, rot: -1, d: 0, W: 0, H: 0, padD: 0, dx: 0, dy: 0 };
+  const fogSheet = { c: null, g: null }, hazeC = { c: null, g: null, ok: false, fill: null };
+  let fogDX = 0, fogDY = 0;   // the banks' drift, ground metres, unwrapped
+  function freeFog() { freeCanvas(fogC); freeCanvas(fogSheet); freeCanvas(hazeC); }
   function drawFog(ctx, f) {
-    const w = f.w, h = f.h, fog = W.fog;
-    const S = sheet("fog", w, h), g = S.g;
-    g.clearRect(0, 0, S.w, S.h);
-    g.setTransform(S.k, 0, 0, S.k, 0, 0);
+    const w = f.w, h = f.h, d = f.dpr, fog = W.fog;
     // drifting banks over the ground, recoloured to the haze of the hour
     windGround(_wg);
     const dt = calm ? 0 : f.dt, sp = 1.5 + W.windMph * 0.2;
-    fogOX = (fogOX + _wg[0] * sp * dt) % FOG_TILE_M; fogOY = (fogOY + _wg[1] * sp * dt) % FOG_TILE_M;
+    fogDX += _wg[0] * sp * dt; fogDY += _wg[1] * sp * dt;
+    fogOX = fogDX % FOG_TILE_M; fogOY = fogDY % FOG_TILE_M;
     const [hr, hg, hb] = L.haze;
-    g.globalAlpha = fog * 0.55 * (1 - 0.35 * W.night);
-    fillGround(g, fogPattern(g), FOG_TILE_M / NOISE_N, fogOX, fogOY, S.k);
-    g.setTransform(S.k, 0, 0, S.k, 0, 0);
-    g.globalAlpha = 1;
-    g.globalCompositeOperation = "source-in";
-    g.fillStyle = hex(hr, hg, hb);
-    g.fillRect(0, 0, w, h);
+    const bankA = fog * 0.55 * (1 - 0.35 * W.night);
     // farther air is thicker: more haze up the screen, and more when zoomed out
-    g.globalCompositeOperation = "source-over";
     const zf = Math.round(clamp01(Math.log2(view.metresAcross() / 400) / 4) * 20) / 20;
     const key = fog * 1000 + zf;
     if (key !== hazeKey || L.hazeVer !== hazeVer || h !== hazeH) {
       hazeKey = key; hazeVer = L.hazeVer; hazeH = h;
       const top = fog * (0.66 + 0.2 * zf), bot = fog * (0.12 + 0.24 * zf);
-      hazeFill = g.createLinearGradient(0, 0, 0, h);
+      hazeFill = ctx.createLinearGradient(0, 0, 0, h);
       hazeFill.addColorStop(0, rgba(hr, hg, hb, top));
       hazeFill.addColorStop(0.55, rgba(hr, hg, hb, (top + bot) * 0.45));
       hazeFill.addColorStop(1, rgba(hr, hg, hb, bot));
     }
-    g.fillStyle = hazeFill;
-    g.fillRect(0, 0, w, h);
-    ctx.drawImage(S.c, 0, 0, w, h);
+    const fkey = `${L.hazeVer}|${Math.round(bankA * 400)}`;
+    let at = anchoredAt(fogC, ctx, fogDX, fogDY, fkey);
+    if (!at && f.moving && fogC.s !== view.s) {
+      // mid-zoom: the old way, everything in one low-res sheet stretched over the screen
+      const S = sheet("fog", w, h), g = S.g;
+      g.clearRect(0, 0, S.w, S.h);
+      g.globalAlpha = bankA;
+      fillGround(g, fogPattern(g), FOG_TILE_M / NOISE_N, fogOX, fogOY, S.k);
+      g.setTransform(S.k, 0, 0, S.k, 0, 0);
+      g.globalAlpha = 1;
+      g.globalCompositeOperation = "source-in";
+      g.fillStyle = hex(hr, hg, hb);
+      g.fillRect(0, 0, w, h);
+      g.globalCompositeOperation = "source-over";
+      g.fillStyle = hazeFill;
+      g.fillRect(0, 0, w, h);
+      ctx.drawImage(S.c, 0, 0, w, h);
+      return;
+    }
+    if (!at) {
+      const padD = Math.round(FOG_PAD * d), offX = baseOffX(), offY = baseOffY();
+      const sw = Math.ceil((ctx.canvas.width + 2 * padD) / SHEET_DIV), sh = Math.ceil((ctx.canvas.height + 2 * padD) / SHEET_DIV), q = 1 / SHEET_DIV;
+      const sg = devCanvas(fogSheet, sw, sh);
+      sg.globalAlpha = bankA;
+      fillGround(sg, fogPattern(sg), FOG_TILE_M / NOISE_N, fogOX, fogOY, d * q, (padD - offX) * q, (padD - offY) * q, FOG_PAD);
+      sg.setTransform(1, 0, 0, 1, 0, 0);
+      sg.globalAlpha = 1;
+      sg.globalCompositeOperation = "source-in";
+      sg.fillStyle = hex(hr, hg, hb);
+      sg.fillRect(0, 0, sw, sh);
+      sg.globalCompositeOperation = "source-over";
+      const g = devCanvas(fogC, sw * SHEET_DIV, sh * SHEET_DIV);
+      g.globalCompositeOperation = "copy";
+      g.drawImage(fogSheet.c, 0, 0, sw * SHEET_DIV, sh * SHEET_DIV);
+      g.globalCompositeOperation = "source-over";
+      Object.assign(fogC, { ok: true, key: fkey, offX, offY, s: view.s, rot: view.rot, d, W: ctx.canvas.width, H: ctx.canvas.height, padD, dx: fogDX, dy: fogDY });
+      at = anchoredAt(fogC, ctx, fogDX, fogDY, fkey);
+    }
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (at) ctx.drawImage(fogC.c, at[0], at[1]);
+    ctx.drawImage(fillCache(hazeC, ctx, hazeFill), 0, 0);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
   }
 
   function drawRain(ctx, f, want) {
@@ -1109,6 +1356,8 @@ export function init(app) {
     draw(ctx, f) {
       if (!app.layerEnabled("sky")) { panRot = -1; return; }
       panDelta(f, _pan);
+      if (glowFog.ok && !(W.fog > 0.02 && W.night > 0.02)) freeCanvas(glowFog);
+      if (fogC.ok && !(W.fog > 0.02)) freeFog();
       if (W.fog > 0.02) {
         drawFog(ctx, f);
         // Lights bloom in fog rather than vanish: over the fog sheet, the city glow again (soft already, 5 m texels:
@@ -1116,7 +1365,7 @@ export function init(app) {
         if (W.night > 0.02) {
           // a little more from afar, where the glow is all there is of the city's lights
           const b = Math.min(1, W.night * 1.08) * W.fog * lerp(FOG_BLOOM[0], FOG_BLOOM[1], smooth(1.2, 0.3, f.s * f.dpr));
-          drawCityGlow(ctx, b, b);
+          drawCityGlow(ctx, b, b, glowFog);
         }
       }
       // counts follow the screen's area, so a phone carries fewer drops than a desktop
@@ -1126,6 +1375,249 @@ export function init(app) {
       if (wantRain > 0) drawRain(ctx, f, wantRain); else rainN = 0;
       if (wantSnow > 0) drawSnow(ctx, f, wantSnow); else snowN = 0;
       if (W.storm && !calm) drawLightning(ctx, f);
+    },
+    // Rain and snow: 24 fps (a falling streak or a drifting flake needs no more; lightning rides along). Fog alone:
+    // its banks drift a pixel or two a frame, from 10 fps up close to one every couple of seconds from afar. With
+    // reduced motion nothing here moves by itself.
+    fps(f) {
+      if (calm || !app.layerEnabled("sky")) return 0;
+      if (W.rain > 0.01 || W.snow > 0.01 || W.storm) return 24;
+      if (W.fog > 0.02) {
+        windGround(_wg);
+        const o = geo.ROTS[view.rot], ax = _wg[0] * o.R[0] + _wg[1] * o.R[1], ay = (_wg[0] * o.D[0] + _wg[1] * o.D[1]) * geo.SIN_T;
+        const px = (1.5 + W.windMph * 0.2) * f.s * f.dpr * Math.sqrt(ax * ax + ay * ay) / 1.5;
+        return Math.max(0.5, Math.min(10, px));
+      }
+      return 0;
+    },
+  });
+
+  // ---------------------------------------------------------------- layer: clouds aloft, mist on the paper (z 86)
+  // Zoomed far out, a few fair-weather cumulus sail over the diorama with the wind, a few hundred metres up (low, as a
+  // model's clouds would be, so each still reads against the ground it shades), and banks of mist lie on the paper round
+  // the diorama's foot. More and thicker clouds with the real cloud cover, a few on the clearest day; always
+  // translucent, and gone by the time you zoom in past ~1.2 km across. Above the night lights (a cloud veils them),
+  // below the weather, the labels and the aircraft. Each cloud is one sprite drawn once for the zoom and the light of
+  // the hour, then blitted 1:1 at whole device pixels: cheap enough to drift at a few frames a second.
+  const CL_DOMAIN = 20000, CL_N = 130;         // a wrapping field of clouds round the view, metres
+  const CL_RIM0 = 7600, CL_RIM1 = 9400;        // faded out toward the field's rim, where a cloud wraps to the far side
+  const CL_IN0 = 1150, CL_IN1 = 2300;          // metres across the screen: none below the first, all from the second
+  const CL_PAR = 1.1;                          // parallax: nearer the eye than the ground, so they slide a little faster
+  const wisps = [];
+  {
+    let h = 0x2545f491;
+    const rnd = () => { h = Math.imul(h ^ (h >>> 15), 2246822507); h = Math.imul(h ^ (h >>> 13), 3266489909); h ^= h >>> 16; return (h >>> 0) / 4294967296; };
+    for (let i = 0; i < CL_N; i++) {
+      // puffs [x, y, r] in units of the cloud's width: a row along a flat base, bigger toward the middle, and a crown
+      const n = 4 + Math.floor(rnd() * 4), puffs = [];
+      for (let k = 0; k < n; k++) {
+        const t = k / (n - 1) - 0.5, r = 0.11 + 0.07 * rnd() + 0.09 * (1 - Math.abs(t) * 2);
+        puffs.push([t * 0.74 + (rnd() - 0.5) * 0.06, -r * 0.5 + (rnd() - 0.5) * 0.04, r]);
+      }
+      const m = 1 + (rnd() < 0.65 ? 1 : 0);
+      for (let k = 0; k < m; k++) puffs.push([(rnd() - 0.5) * 0.36, -0.2 - 0.09 * rnd(), 0.17 + 0.08 * rnd()]);
+      wisps.push({
+        x: (rnd() - 0.5) * CL_DOMAIN, y: (rnd() - 0.5) * CL_DOMAIN, z: 340 + 280 * rnd(),
+        size: 300 + 560 * rnd() * rnd() + 160 * rnd(),   // metres across: mostly modest, the odd big one
+        rank: rnd(), a: 0.7 + 0.3 * rnd(), flip: rnd() < 0.5, puffs, c: null, k: 0, ver: -1, ox: 0, oy: 0,
+      });
+    }
+    wisps.sort((a, b) => a.z - b.z);   // (drawn far to near below: lower ones first)
+  }
+  // soft round puffs, white and in the light of the hour (re-tinted when it changes)
+  const PUFF_N = 96;
+  let puffW = null, puffSoft = null, puffLit = null, puffLitVer = -1, shadowDisc = null;
+  function discs() {
+    if (!puffW) {
+      puffW = makeCanvas(PUFF_N, PUFF_N);
+      const g = puffW.getContext("2d"), r = PUFF_N / 2, gr = g.createRadialGradient(r, r, 0, r, r, r);
+      gr.addColorStop(0, "rgba(255,255,255,1)"); gr.addColorStop(0.8, "rgba(255,255,255,1)"); gr.addColorStop(0.9, "rgba(255,255,255,.7)"); gr.addColorStop(1, "rgba(255,255,255,0)");
+      g.fillStyle = gr; g.fillRect(0, 0, PUFF_N, PUFF_N);
+      shadowDisc = makeCanvas(PUFF_N, PUFF_N);
+      const sg = shadowDisc.getContext("2d"), sr = sg.createRadialGradient(r, r, 0, r, r, r);
+      sr.addColorStop(0, "rgba(46,58,92,1)"); sr.addColorStop(0.55, "rgba(46,58,92,.7)"); sr.addColorStop(1, "rgba(46,58,92,0)");
+      sg.fillStyle = sr; sg.fillRect(0, 0, PUFF_N, PUFF_N);
+      // the highlights' disc is soft all the way out, so overlapping ones blend instead of showing their rims
+      puffSoft = makeCanvas(PUFF_N, PUFF_N);
+      const hg = puffSoft.getContext("2d"), hr = hg.createRadialGradient(r, r, 0, r, r, r);
+      hr.addColorStop(0, "rgba(255,255,255,1)"); hr.addColorStop(0.45, "rgba(255,255,255,.6)"); hr.addColorStop(1, "rgba(255,255,255,0)");
+      hg.fillStyle = hr; hg.fillRect(0, 0, PUFF_N, PUFF_N);
+      puffLit = makeCanvas(PUFF_N, PUFF_N);
+    }
+    if (puffLitVer !== L.cloudVer) {
+      puffLitVer = L.cloudVer;
+      const g = puffLit.getContext("2d");
+      g.globalCompositeOperation = "copy"; g.drawImage(puffSoft, 0, 0);
+      g.globalCompositeOperation = "source-in"; g.fillStyle = hex(L.clLit[0], L.clLit[1], L.clLit[2]); g.fillRect(0, 0, PUFF_N, PUFF_N);
+    }
+  }
+  /** one cloud's sprite at k device px per metre, in the light of the hour */
+  function wispSprite(c, k) {
+    discs();
+    const Wp = c.size * k, cw = Math.ceil(Wp * 1.22) + 4, ch = Math.ceil(Wp * 0.72) + 4;
+    if (!c.c) c.c = makeCanvas(cw, ch);
+    else if (c.c.width !== cw || c.c.height !== ch) { c.c.width = cw; c.c.height = ch; }
+    const g = c.c.getContext("2d"), ox = cw / 2, oy = Math.round(ch * 0.74);   // (ox, oy): the middle of its flat base
+    g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+    g.clearRect(0, 0, cw, ch);
+    if (c.flip) { g.translate(cw, 0); g.scale(-1, 1); }
+    for (const p of c.puffs) g.drawImage(puffW, ox + (p[0] - p[2]) * Wp, oy + (p[1] - p[2]) * Wp, 2 * p[2] * Wp, 2 * p[2] * Wp);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    // the flat base: what hangs below it fades away
+    g.globalCompositeOperation = "destination-out";
+    const fb = g.createLinearGradient(0, oy - 0.03 * Wp, 0, oy + 0.1 * Wp);
+    fb.addColorStop(0, "rgba(0,0,0,0)"); fb.addColorStop(1, "rgba(0,0,0,1)");
+    g.fillStyle = fb; g.fillRect(0, oy - 0.03 * Wp, cw, ch);
+    // light from the upper left (as on the buildings), shade underneath and to the right
+    g.globalCompositeOperation = "source-atop";
+    const lit = hex(L.clLit[0], L.clLit[1], L.clLit[2]), shade = hex(L.clShade[0], L.clShade[1], L.clShade[2]);
+    const gr = g.createLinearGradient(ox - 0.25 * Wp, oy - 0.42 * Wp, ox + 0.12 * Wp, oy + 0.02 * Wp);
+    gr.addColorStop(0, lit); gr.addColorStop(0.5, lit); gr.addColorStop(0.9, shade); gr.addColorStop(1, shade);
+    g.fillStyle = gr; g.fillRect(0, 0, cw, ch);
+    // the cauliflower tops: each puff lit again on its upper left
+    g.globalAlpha = 0.75;
+    if (c.flip) { g.translate(cw, 0); g.scale(-1, 1); }
+    const left = c.flip ? 1 : -1;   // (in a mirrored sprite the screen's left is the sprite's right)
+    for (const p of c.puffs) {
+      const r = p[2] * Wp * 0.78;
+      g.drawImage(puffLit, ox + p[0] * Wp + left * p[2] * Wp * 0.3 - r, oy + p[1] * Wp - p[2] * Wp * 0.34 - r, 2 * r, 2 * r);
+    }
+    g.setTransform(1, 0, 0, 1, 0, 0); g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+    c.k = k; c.ver = L.cloudVer; c.ox = ox; c.oy = oy;
+  }
+  function freeWisps() { for (const c of wisps) c.c = null; }
+
+  // Mist on the paper: soft banks along the diorama's four sides, lying at the foot of its walls (the paper's level),
+  // pushed out so they mostly sit on the paper. Static (they'd only slide along the walls); two shapes, one per run of
+  // the sides on screen, three lengths, drawn once per zoom, turn and light.
+  const MIST = [];   // [x, y, side (0: along x, 1: along y), size variant, outward normal x, y]
+  {
+    const step = 1050, out = 360;
+    let v = 0;
+    for (let x = world.x0 + step * 0.45; x < world.x1 - step * 0.3; x += step) { MIST.push([x, world.y0 - out, 0, v++ % 3, 0, -1]); MIST.push([x + step * 0.5, world.y1 + out, 0, v++ % 3, 0, 1]); }
+    for (let y = world.y0 + step * 0.45; y < world.y1 - step * 0.3; y += step) { MIST.push([world.x0 - out, y, 1, v++ % 3, -1, 0]); MIST.push([world.x1 + out, y + step * 0.5, 1, v++ % 3, 1, 0]); }
+  }
+  const MIST_FAR = 260;   // the far sides' banks lie behind the diorama: further out, so they don't climb onto its top
+  const MIST_LEN = [1150, 1500, 1850], MIST_THICK = 0.3;
+  const mistSpr = [];   // [side * 3 + variant] → { c, ox, oy }
+  let mistK = 0, mistRot = -1, mistVer = -1;
+  function mistSprites(k) {
+    if (mistK === k && mistRot === view.rot && mistVer === L.cloudVer && mistSpr.length) return;
+    discs();
+    mistK = k; mistRot = view.rot; mistVer = L.cloudVer;
+    const o = geo.ROTS[view.rot], S = geo.SIN_T;
+    for (let side = 0; side < 2; side++) for (let v = 0; v < 3; v++) {
+      const len = MIST_LEN[v], th = len * MIST_THICK;
+      // the ground ellipse (len along the side, th across) through the view's projection, in device px
+      const ux = side ? 0 : 1, uy = side ? 1 : 0, nx = uy, ny = ux;
+      const a = (ux * o.R[0] + uy * o.R[1]) * k, b = -(ux * o.D[0] + uy * o.D[1]) * S * k;
+      const cc = (nx * o.R[0] + ny * o.R[1]) * k, d = -(nx * o.D[0] + ny * o.D[1]) * S * k;
+      const hw = Math.abs(a) * len / 2 + Math.abs(cc) * th / 2, hh = Math.abs(b) * len / 2 + Math.abs(d) * th / 2;
+      const cw = Math.ceil(hw * 2) + 4, ch = Math.ceil(hh * 2) + 4;
+      const sp = mistSpr[side * 3 + v] || (mistSpr[side * 3 + v] = { c: makeCanvas(cw, ch), ox: 0, oy: 0 });
+      if (sp.c.width !== cw || sp.c.height !== ch) { sp.c.width = cw; sp.c.height = ch; }
+      const g = sp.c.getContext("2d");
+      g.setTransform(1, 0, 0, 1, 0, 0); g.globalCompositeOperation = "source-over"; g.globalAlpha = 1;
+      g.clearRect(0, 0, cw, ch);
+      sp.ox = cw / 2; sp.oy = ch / 2;
+      g.setTransform(a, b, cc, d, sp.ox, sp.oy);
+      // a long soft bank: three overlapping puffs along its length
+      for (let q = -1; q <= 1; q++) g.drawImage(puffW, q * len * 0.27 - len * 0.3, -th / 2 - th * 0.1 * Math.abs(q), len * 0.6, th * (1 - 0.2 * Math.abs(q)));
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.globalCompositeOperation = "source-in";
+      g.fillStyle = hex(L.mist[0], L.mist[1], L.mist[2]);
+      g.fillRect(0, 0, cw, ch);
+      g.globalCompositeOperation = "source-over";
+    }
+  }
+  function freeMist() { mistSpr.length = 0; mistK = 0; }
+
+  let wispDX = 0, wispDY = 0, cloudsVis = 0, cloudsOn = false;
+  const noClouds = app.params.has("noclouds");
+  const cloudsWanted = (f) => app.layerEnabled("sky") && !noClouds ? smooth(CL_IN0, CL_IN1, f.w / f.s) : 0;
+  app.addLayer({
+    id: "sky-clouds", z: 86,
+    draw(ctx, f) {
+      const vis = cloudsWanted(f);
+      cloudsVis = vis;
+      if (vis < 0.01) { if (cloudsOn) { cloudsOn = false; freeWisps(); freeMist(); } return; }
+      cloudsOn = true;
+      const d = f.dpr, s = f.s, k = s * d, dt = calm ? 0 : f.dt;
+      // sprites are redrawn for a new zoom only once the view settles; mid-zoom they're stretched
+      const still = !f.moving;
+      const o = geo.ROTS[view.rot], S = geo.SIN_T, C = geo.COS_T;
+      const cover = clamp01(W.cloud / 100);
+      const day = L.daylight;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      // the mist on the paper first (it lies lowest): whole pixels on the base map's grid, so it holds still as you pan
+      const mistA = vis * 0.42 * L.mistA * (0.75 + 0.35 * cover) * (1 - 0.6 * W.fog);
+      if (mistA > 0.01) {
+        if (still || !mistSpr.length) mistSprites(k);
+        const kk = k / mistK, offX = baseOffX(), offY = baseOffY();
+        ctx.globalAlpha = mistA;
+        for (let i = 0; i < MIST.length; i++) {
+          const m = MIST[i], sp = mistSpr[m[2] * 3 + m[3]];
+          const far = m[4] * o.D[0] + m[5] * o.D[1] > 0 ? MIST_FAR : 0, mx = m[0] + m[4] * far, my = m[1] + m[5] * far;
+          const X = mx * o.R[0] + my * o.R[1], Y = -((mx * o.D[0] + my * o.D[1]) * S - SLAB_DEPTH * C);
+          const px = X * k - offX, py = Y * k - offY, cw = sp.c.width * kk, ch = sp.c.height * kk;
+          if (px + cw < 0 || px - cw > ctx.canvas.width || py + ch < 0 || py - ch > ctx.canvas.height) continue;
+          if (kk === 1) ctx.drawImage(sp.c, Math.round(px - sp.ox), Math.round(py - sp.oy));
+          else ctx.drawImage(sp.c, px - sp.ox * kk, py - sp.oy * kk, cw, ch);
+        }
+      }
+      // the clouds: drift with the wind, then each to the copy of the field nearest the middle of the view
+      windGround(_wg);
+      const sp = cloudSpeed();
+      wispDX = (wispDX + _wg[0] * sp * dt) % CL_DOMAIN; wispDY = (wispDY + _wg[1] * sp * dt) % CL_DOMAIN;
+      // the ground point at the middle of the screen
+      const u = view.X, v = -view.Y / S, cx = u * o.R[0] + v * o.D[0], cy = u * o.R[1] + v * o.D[1];
+      const density = 0.24 + 0.76 * cover;
+      const base = vis * L.clA * (0.5 + 0.2 * cover);
+      const kc = k * CL_PAR, W2 = ctx.canvas.width / 2, H2 = ctx.canvas.height / 2;
+      // two passes: by day first their shadows on the ground (all below every cloud), then the clouds
+      for (let pass = L.daylight > 0.05 ? 0 : 1; pass < 2; pass++) {
+        for (let i = 0; i < wisps.length; i++) {
+          const c = wisps[i];
+          const pres = smooth(c.rank - 0.07, c.rank + 0.07, density);
+          // (a cloud out of sight gives its sprite back: near the zoom they fade in at, on a retina screen, one is MBs)
+          if (pres < 0.01) { if (c.c) c.c = null; continue; }
+          let x = c.x + wispDX - cx, y = c.y + wispDY - cy;
+          x -= CL_DOMAIN * Math.round(x / CL_DOMAIN); y -= CL_DOMAIN * Math.round(y / CL_DOMAIN);
+          const rim = smooth(CL_RIM1, CL_RIM0, Math.max(Math.abs(x), Math.abs(y)));
+          const a = Math.min(0.62, base * pres * rim * c.a);
+          if (a < 0.01) { if (c.c) c.c = null; continue; }
+          // its place on the screen (device px), parallax about the middle; the sprite's anchor is its base
+          const px = W2 + (x * o.R[0] + y * o.R[1]) * kc, py = H2 - ((x * o.D[0] + y * o.D[1]) * S + c.z * C) * kc;
+          const half = c.size * kc * 0.62;
+          if (px + half < 0 || px - half > ctx.canvas.width || py + half < -half || py - half > ctx.canvas.height + half) { if (c.c) c.c = null; continue; }
+          if (pass === 0) {
+            // its shadow on the ground straight beneath it (at the ground's own scale), soft and faint; only on the
+            // diorama's top, not the paper far below (faded out as it nears an edge rather than clipped: a clip path
+            // costs a mask of the whole slab every frame)
+            const wx = x + cx, wy = y + cy;
+            const inside = Math.min(wx - world.x0, world.x1 - wx, wy - world.y0, world.y1 - wy);
+            const sa = a * 0.3 * L.daylight * smooth(-0.05 * c.size, 0.4 * c.size, inside);
+            if (sa < 0.01) continue;
+            const gx = W2 + (x * o.R[0] + y * o.R[1]) * k, gy = H2 - (x * o.D[0] + y * o.D[1]) * S * k;
+            const sw = c.size * k * 0.95, sh = sw * 0.36;
+            ctx.globalAlpha = sa;
+            ctx.drawImage(shadowDisc, gx - sw / 2, gy - sh / 2, sw, sh);
+            continue;
+          }
+          if (still && (c.k !== kc || c.ver !== L.cloudVer) || !c.c) wispSprite(c, kc);
+          ctx.globalAlpha = a;
+          if (c.k === kc) ctx.drawImage(c.c, Math.round(px - c.ox), Math.round(py - c.oy));
+          else { const q = kc / c.k; ctx.drawImage(c.c, px - c.ox * q, py - c.oy * q, c.c.width * q, c.c.height * q); }
+        }
+      }
+      ctx.globalAlpha = 1;
+      ctx.setTransform(d, 0, 0, d, 0, 0);
+    },
+    // they drift about a device pixel a frame: a frame or two a second from afar, up to 12 as they fade out
+    fps(f) {
+      if (calm || cloudsVis < 0.01) return 0;
+      const px = driftPx(f.s, f.dpr) * CL_PAR;
+      return px < 0.05 ? 0 : Math.max(0.5, Math.min(12, px));
     },
   });
 

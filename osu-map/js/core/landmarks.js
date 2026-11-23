@@ -12,7 +12,7 @@
 //           a roof over a rectangle (ground metres, centre x/y, `ang` the direction of L), standing on the building's
 //           roof (or at z). Several roofs over the wings of one footprint read as one hipped roof.
 //   orn     [{ type: tower|box|scaffold|turret|ring|flagpole, … , on? }]  ornaments (see buildOrn)
-//   walls   [{ type: band|piers|zone|shingle|grid, … , on? }]  paint on the building's own walls (see wallDeco)
+//   walls   [{ type: band|piers|zone|arcade|colonnade|shingle|grid|panel, … , on? }]  paint on its own walls (see paintWalls)
 // `on` (an OSM id or a list of them) says which record of the landmark draws it; by default the one that isn't a part.
 // Ornaments that rise above the building must be covered by its "top" (set/setId) so tiles don't clip them.
 
@@ -119,26 +119,31 @@ function pyramidFaces(api, pr, it, ring, z, ax, ay, az, col, snowable = true) {
   faces.sort((A, B) => B.d - A.d);
   for (const f of faces) addFace(it, f.pts, f.col, snowable ? "roof" : "wall");
 }
-// a dome (half ellipsoid) of radius rad and height h over (cx, cy) at z
-function domeFaces(api, pr, it, cx, cy, z, rad, h, col, n = 16, bands = 4) {
-  const ring = (k) => { const ph = (k / bands) * (Math.PI / 2); return [Math.cos(ph) * rad, z + Math.sin(ph) * h]; };
+// a dome (half ellipsoid) of radius rad (ry across, the axes turned by ang) and height h over (cx, cy) at z
+function domeFaces(api, pr, it, cx, cy, z, rad, h, col, n = 16, bands = 4, ry = rad, ang = 0, soft = false) {
+  const ca = Math.cos(ang), sa = Math.sin(ang);
+  // a point at angle a round the rim, f of the way out (cos of the latitude), height zz
+  const at = (a, f, zz) => { const u = Math.cos(a) * rad * f, v = Math.sin(a) * ry * f; return pr.P(cx + u * ca - v * sa, cy + u * sa + v * ca, zz); };
   const faces = [];
   for (let k = 0; k < bands; k++) {
-    const [r0, z0] = ring(k), [r1, z1] = ring(k + 1);
-    const phm = ((k + 0.5) / bands) * (Math.PI / 2);
+    const ph0 = (k / bands) * (Math.PI / 2), ph1 = ((k + 1) / bands) * (Math.PI / 2);
+    const f0 = Math.cos(ph0), f1 = Math.cos(ph1), z0 = z + Math.sin(ph0) * h, z1 = z + Math.sin(ph1) * h;
+    const phm = (ph0 + ph1) / 2;
     for (let j = 0; j < n; j++) {
       const a0 = (j / n) * TAU, a1 = ((j + 1) / n) * TAU, am = (a0 + a1) / 2;
-      let nx = (Math.cos(phm) * Math.cos(am)) / rad, ny = (Math.cos(phm) * Math.sin(am)) / rad, nz = Math.sin(phm) / h;
+      const lx = (Math.cos(phm) * Math.cos(am)) / rad, ly = (Math.cos(phm) * Math.sin(am)) / ry;
+      let nx = lx * ca - ly * sa, ny = lx * sa + ly * ca, nz = Math.sin(phm) / h;
       const m = Math.hypot(nx, ny, nz); nx /= m; ny /= m; nz /= m;
       if (!pr.roofVis(nx, ny, nz)) continue;
       const pts = k === bands - 1
-        ? [pr.P(cx + Math.cos(a0) * r0, cy + Math.sin(a0) * r0, z0), pr.P(cx + Math.cos(a1) * r0, cy + Math.sin(a1) * r0, z0), pr.P(cx, cy, z + h)]
-        : [pr.P(cx + Math.cos(a0) * r0, cy + Math.sin(a0) * r0, z0), pr.P(cx + Math.cos(a1) * r0, cy + Math.sin(a1) * r0, z0), pr.P(cx + Math.cos(a1) * r1, cy + Math.sin(a1) * r1, z1), pr.P(cx + Math.cos(a0) * r1, cy + Math.sin(a0) * r1, z1)];
-      faces.push({ d: pr.depth(cx + Math.cos(am) * r0, cy + Math.sin(am) * r0) - k * 0.001, pts: flat(pts), col: shd(api, col, pr.roofF(nx, ny)) });
+        ? [at(a0, f0, z0), at(a1, f0, z0), pr.P(cx, cy, z + h)]
+        : [at(a0, f0, z0), at(a1, f0, z0), at(a1, f1, z1), at(a0, f1, z1)];
+      const u = Math.cos(am) * rad * f0, v = Math.sin(am) * ry * f0;
+      faces.push({ d: pr.depth(cx + u * ca - v * sa, cy + u * sa + v * ca) - k * 0.001, pts: flat(pts), col: shd(api, col, pr.roofF(nx, ny)) });
     }
   }
   faces.sort((A, B) => B.d - A.d);
-  for (const f of faces) addFace(it, f.pts, f.col, "roof");
+  for (const f of faces) { addFace(it, f.pts, f.col, "roof"); if (soft) it.faces[it.faces.length - 1].soft = true; }
 }
 // a roof over a rectangle: hipped, gabled, pyramidal, mansard (steep lower slopes to a low hip), vault (a barrel), dome
 function roofItem(api, pr, b, o, r, wallCol) {
@@ -150,7 +155,13 @@ function roofItem(api, pr, b, o, r, wallCol) {
   const G = (along, across) => [o.x + lx * along + wx * across, o.y + ly * along + wy * across];
   const P = (along, across, zz) => { const g = G(along, across); return pr.P(g[0], g[1], zz); };
   const shape = o.shape || "hipped";
-  if (shape === "dome") { domeFaces(api, pr, it, o.x, o.y, z, Math.min(L, W) / 2, rh, col); return it; }
+  if (shape === "dome") {
+    // round over the shorter side, or (oval) an ellipse over L × W
+    // (a smooth shell: its facets edged in their own colour, so no seams and no wireframe)
+    if (o.oval) domeFaces(api, pr, it, o.x, o.y, z, L / 2, rh, col, o.n || 28, o.bands || 5, W / 2, ang, o.soft !== false);
+    else domeFaces(api, pr, it, o.x, o.y, z, Math.min(L, W) / 2, rh, col);
+    return it;
+  }
   if (shape === "vault") {
     // a barrel along L: strips across W, then the arched ends (walls)
     const M = 10, hw = W / 2 + ov, hl = L / 2 + ov;
@@ -704,6 +715,12 @@ function roofOver(W, f) {
   return false;
 }
 const BIG = 1e6;
+// distance from (x, y) to the segment [x0, y0, x1, y1] (ground metres)
+function segDist(l, x, y) {
+  const dx = l[2] - l[0], dy = l[3] - l[1], L2 = dx * dx + dy * dy || 1;
+  const t = Math.max(0, Math.min(1, ((x - l[0]) * dx + (y - l[1]) * dy) / L2));
+  return Math.hypot(l[0] + dx * t - x, l[1] + dy * t - y);
+}
 function clipWall(ctx, w, own) {
   // to the wall itself, then out of everything that covers it (each a complement clip)
   ctx.beginPath(); ctx.moveTo(own[0], own[1]); for (let q = 2; q < own.length; q += 2) ctx.lineTo(own[q], own[q + 1]); ctx.closePath(); ctx.clip();
@@ -713,7 +730,22 @@ function clipWall(ctx, w, own) {
     ctx.clip("evenodd");
   }
 }
-// draw (or, at night, rub out) the wall paint of building i; mode 0 day, 1 blot
+// does panel o go on this wall (ground ring g, wall wv)? (its outward normal against o.dir)
+function panelFaces(o, g, wv) {
+  if (!o.dir) return true;
+  const ax = g[2 * wv.c], ay = g[2 * wv.c + 1], bx = g[2 * wv.a], by = g[2 * wv.a + 1];
+  let cx = 0, cy = 0;
+  const n = g.length / 2;
+  for (let q = 0; q < n; q++) { cx += g[2 * q]; cy += g[2 * q + 1]; }
+  cx /= n; cy /= n;
+  const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy) || 1;
+  let nx = dy / L, ny = -dx / L;
+  if (nx * ((ax + bx) / 2 - cx) + ny * ((ay + by) / 2 - cy) < 0) { nx = -nx; ny = -ny; }
+  const dl = Math.hypot(o.dir[0], o.dir[1]) || 1;
+  const facing = (nx * o.dir[0] + ny * o.dir[1]) / dl > 0.7;
+  return o.away ? !facing : facing;
+}
+// draw (or, at night, rub out) the wall paint of building i; mode 0 day, 1 blot, 2 its own night lights (uplit columns)
 function paintWalls(api, ctx, r, k, i, mode) {
   const W = wallsOf(api, i, r);
   if (!W) return;
@@ -731,7 +763,9 @@ function paintWalls(api, ctx, r, k, i, mode) {
     const f0 = 0.7 + 0.36 * wv.light;
     for (const o of W.decos) {
       if (o.minK && k < o.minK) continue;
-      if (mode === 1 && !((o.type === "band" && !o.windows) || o.type === "piers" || o.type === "zone" || o.type === "arcade")) continue;
+      if (mode === 1 && !((o.type === "band" && !o.windows) || o.type === "piers" || o.type === "zone" || o.type === "arcade" || o.type === "colonnade" || o.type === "panel")) continue;
+      if (mode === 2 && !(o.type === "panel" && o.glow) && (!(o.type === "colonnade" || (o.type === "arcade" && o.glow)) || k < 0.9)) continue;
+      if (o.type === "panel" && !panelFaces(o, b.p[wv.ri], wv)) continue;
       if (!clipped && W.list[n].cover.length) { ctx.save(); clipWall(ctx, W.list[n], ol.walls[n]); clipped = true; }
       const col = mode === 1 ? "#000" : o.color ? shd(api, o.color, f0) : null;
       ctx.beginPath();
@@ -772,12 +806,13 @@ function paintWalls(api, ctx, r, k, i, mode) {
         }
       } else if (o.type === "arcade") {
         // round-arched openings along the wall, `step` apart, from z0 up to the crown at z1 (a Romanesque ground
-        // floor, a two-storey arcade)
+        // floor, a two-storey arcade); with `glow`, some of them lit at night
         if (k < 1 || wv.L < o.step * 0.9) continue;
         const nA = Math.max(1, Math.floor(wv.L / o.step)), pad = (wv.L - nA * o.step) / 2 / wv.L, span = o.step / wv.L;
         const half = (span * (o.w || 0.6)) / 2, rad = half * wv.L, zs = Math.min(he, o.z1) - rad, z0 = Math.max(base, o.z0 || 0);
         if (zs <= z0) continue;
         for (let q = 0; q < nA; q++) {
+          if (mode === 2 && api.nHash(i * 131 + n * 17 + q * 7 + 3) > 0.42) continue;   // at night some of them lit
           const tc = pad + span * (q + 0.5);
           const X = (t, z) => [x1 + (x2 - x1) * t, y1 + (y2 - y1) * t - z * pr.C];
           let P = X(tc - half, z0); ctx.moveTo(P[0], P[1]);
@@ -786,19 +821,86 @@ function paintWalls(api, ctx, r, k, i, mode) {
           ctx.closePath();
         }
         if (mode === 0) { ctx.fillStyle = o.color ? shd(api, o.color, f0) : "#3a3532"; ctx.fill(); if (o.frame) { ctx.strokeStyle = shd(api, o.frame, f0); ctx.lineWidth = 0.18; ctx.stroke(); } continue; }
+        if (mode === 2) { ctx.fillStyle = o.glow; ctx.fill(); continue; }
+      } else if (o.type === "colonnade") {
+        // a row of columns before a shaded loggia (Page Hall's Ionic front, Sullivant Hall's colonnade): along `line`
+        // (ground metres, its ends the colonnade's ends) on the walls within `dist` of it, from z0 to z1, an
+        // entablature `ent` m deep above; columns `cw` m wide about `step` m apart. At night the columns are floodlit, or
+        // with `glow` the openings between them are lit windows
+        const g = b.p[wv.ri], ax = g[2 * wv.c], ay = g[2 * wv.c + 1], bx = g[2 * wv.a], by = g[2 * wv.a + 1];
+        if (segDist(o.line, (ax + bx) / 2, (ay + by) / 2) > o.dist) continue;
+        const ldx = o.line[2] - o.line[0], ldy = o.line[3] - o.line[1], Ll = Math.hypot(ldx, ldy) || 1;
+        const sA = ((ax - o.line[0]) * ldx + (ay - o.line[1]) * ldy) / Ll, sB = ((bx - o.line[0]) * ldx + (by - o.line[1]) * ldy) / Ll;
+        if (Math.abs(sB - sA) < 0.5) continue;
+        const tA = (0 - sA) / (sB - sA), tB = (Ll - sA) / (sB - sA);
+        const t0 = Math.max(0, Math.min(tA, tB)), t1 = Math.min(1, Math.max(tA, tB)), span = (t1 - t0) * wv.L;
+        const za = Math.max(base, o.z0 || 0), zb = Math.min(he - 0.3, o.z1), ze = Math.min(he, zb + (o.ent != null ? o.ent : 0.9));
+        if (span < 1.5 || zb <= za + 1) continue;
+        if (mode === 1) { api.quad(ctx, x1, y1, x2, y2, t0, t1, za, ze); ctx.fillStyle = "#000"; ctx.fill(); continue; }
+        const nC = Math.max(1, Math.round(span / (o.step || 3))), cw = (o.cw || 0.9) / wv.L / 2;
+        if (mode === 2 && o.glow) {
+          // tall windows between pilasters (Thompson's reading room): lit between the columns
+          for (let q = 0; q < nC; q++) { const ta = t0 + ((t1 - t0) * q) / nC + cw, tb = t0 + ((t1 - t0) * (q + 1)) / nC - cw; if (tb > ta) api.quad(ctx, x1, y1, x2, y2, ta, tb, za, zb); }
+          ctx.fillStyle = o.glow; ctx.fill();
+          continue;
+        }
+        if (mode === 2) {
+          // floodlit from below: each column warm at its foot, fading up its shaft
+          for (let q = 0; q <= nC; q++) { const t = t0 + ((t1 - t0) * q) / nC; api.quad(ctx, x1, y1, x2, y2, Math.max(t0, t - cw), Math.min(t1, t + cw), za, za + (zb - za) * 0.55); }
+          ctx.fillStyle = "rgba(255,214,160,.34)"; ctx.fill();
+          ctx.beginPath();
+          for (let q = 0; q <= nC; q++) { const t = t0 + ((t1 - t0) * q) / nC; api.quad(ctx, x1, y1, x2, y2, Math.max(t0, t - cw), Math.min(t1, t + cw), za + (zb - za) * 0.55, zb); }
+          ctx.fillStyle = "rgba(255,214,160,.16)"; ctx.fill();
+          continue;
+        }
+        api.quad(ctx, x1, y1, x2, y2, t0, t1, za, zb);
+        ctx.fillStyle = shd(api, o.shadow || "#5b5650", f0); ctx.fill();
+        // the columns, then the entablature over them (from afar the loggia's shadow under it is the colonnade)
+        ctx.beginPath();
+        if (k >= 0.9) for (let q = 0; q <= nC; q++) { const t = t0 + ((t1 - t0) * q) / nC; api.quad(ctx, x1, y1, x2, y2, Math.max(t0, t - cw), Math.min(t1, t + cw), za, zb); }
+        api.quad(ctx, x1, y1, x2, y2, t0, t1, zb, ze);
+        ctx.fillStyle = shd(api, o.color || st.trim, f0 * 1.04); ctx.fill();
+        if (k >= 2) {
+          // capitals: a slightly wider block at the top of each column
+          ctx.beginPath();
+          for (let q = 0; q <= nC; q++) { const t = t0 + ((t1 - t0) * q) / nC; api.quad(ctx, x1, y1, x2, y2, Math.max(t0, t - cw * 1.6), Math.min(t1, t + cw * 1.6), zb - 0.5, zb); }
+          ctx.fillStyle = shd(api, o.color || st.trim, f0 * 1.12); ctx.fill();
+        }
+        continue;
+      } else if (o.type === "panel") {
+        // a rectangle on the wall, from t0 to t1 along it and z0 to z1 up (an opening, a sign, a screen), or a grid of
+        // them: nx across × nz up, each filling fw × fh of its cell (slit windows). `dir` [x, y]: only on walls facing
+        // that way (`away`: only on the others). With `glow`, lit at night (from afar too)
+        if (mode === 2 && k < (o.glowK || 0.3)) continue;
+        const za = Math.max(base, o.z0 || 0), zb = Math.min(he, o.z1 != null ? o.z1 : he);
+        const ta = o.t0 != null ? o.t0 : 0, tb = o.t1 != null ? o.t1 : 1;
+        if (zb <= za || (o.minW && wv.L < o.minW)) continue;
+        // (`every` m: as many across as fit that spacing on this wall)
+        const nx = o.every ? Math.max(1, Math.round((wv.L * (tb - ta)) / o.every)) : o.nx || 1, nz = o.nz || 1, fw = o.fw || 1, fh = o.fh || 1;
+        const cw = (tb - ta) / nx, ch = (zb - za) / nz;
+        for (let u = 0; u < nx; u++) for (let v = 0; v < nz; v++) {
+          if (mode === 2 && o.lit != null && api.nHash(i * 977 + n * 131 + u * 17 + v * 7) > o.lit) continue;
+          const tc = ta + cw * (u + 0.5), zc = za + ch * (v + 0.5);
+          api.quad(ctx, x1, y1, x2, y2, tc - (cw * fw) / 2, tc + (cw * fw) / 2, zc - (ch * fh) / 2, zc + (ch * fh) / 2);
+        }
+        if (mode === 2) { ctx.fillStyle = o.glow; ctx.fill(); continue; }
+        if (mode === 0) { ctx.fillStyle = o.color ? shd(api, o.color, o.flat ? 1 : f0) : "#3a3532"; ctx.fill(); continue; }
       } else if (o.type === "shingle") {
-        // courses of stone shingles: fine horizontal lines, the joints staggered
+        // courses of stone shingles: from mid zoom every other course a shade darker, close up fine joints between them
+        const step = o.step || 0.9, za = Math.max(base, o.z0 != null ? o.z0 : base), zb = Math.min(he, o.z1 != null ? o.z1 : he);
+        if (zb <= za + step) continue;
+        if (k >= 1 && o.tone) {
+          for (let z = za, q = 0; z + step <= zb + 0.01; z += step, q++) if (q & 1) api.quad(ctx, x1, y1, x2, y2, 0, 1, z, z + step);
+          ctx.fillStyle = o.tone; ctx.fill(); ctx.beginPath();
+        }
         if (k < 2.2) continue;
-        const step = o.step || 0.9;
-        for (let z = base + step; z < he - 0.2; z += step) { ctx.moveTo(x1, y1 - z * pr.C); ctx.lineTo(x2, y2 - z * pr.C); }
+        for (let z = za + step; z < zb - 0.2; z += step) { ctx.moveTo(x1, y1 - z * pr.C); ctx.lineTo(x2, y2 - z * pr.C); }
         ctx.strokeStyle = o.line || "rgba(120,120,116,.28)"; ctx.lineWidth = 0.05; ctx.stroke();
         continue;
       } else if (o.type === "grid") {
         // a white grid laid on walls near a line (a scaffold standing against them)
         const g = b.p[wv.ri], ax = g[2 * wv.c], ay = g[2 * wv.c + 1], bx = g[2 * wv.a], by = g[2 * wv.a + 1];
-        const [lx0, ly0, lx1, ly1] = o.line;
-        const dist = (x, y) => { const dx = lx1 - lx0, dy = ly1 - ly0, L2 = dx * dx + dy * dy, t = Math.max(0, Math.min(1, ((x - lx0) * dx + (y - ly0) * dy) / L2)); return Math.hypot(lx0 + dx * t - x, ly0 + dy * t - y); };
-        if (dist((ax + bx) / 2, (ay + by) / 2) > o.dist) continue;
+        if (segDist(o.line, (ax + bx) / 2, (ay + by) / 2) > o.dist) continue;
         const cell = o.cell || 3.6, nseg = Math.max(1, Math.round(wv.L / cell));
         for (let q = 0; q <= nseg; q++) { const t = q / nseg, X = x1 + (x2 - x1) * t, Y = y1 + (y2 - y1) * t; ctx.moveTo(X, Y - base * pr.C); ctx.lineTo(X, Y - he * pr.C); }
         for (let z = base + cell; z < he; z += cell) { ctx.moveTo(x1, y1 - z * pr.C); ctx.lineTo(x2, y2 - z * pr.C); }
@@ -857,7 +959,8 @@ export function decorate(api, ctx, r, cam, i, style) {
       fillPoly(ctx, fc.pts);
       const col = fc.kind === "roof" && snow > 0.15 ? mixd(api, fc.col, "#f6f8fa", Math.min(0.92, snow * 1.15)) : fc.col;
       ctx.fillStyle = col; ctx.fill();
-      if (outline) { ctx.strokeStyle = shd(api, col, 0.72); ctx.lineWidth = lineW; ctx.stroke(); }
+      if (fc.soft) { ctx.strokeStyle = col; ctx.lineWidth = lineW * 0.7; ctx.stroke(); }
+      else if (outline) { ctx.strokeStyle = shd(api, col, 0.72); ctx.lineWidth = lineW; ctx.stroke(); }
     }
     for (const d of it.details) {
       if (k < d.minK) continue;
@@ -883,7 +986,10 @@ export function lights(api, ctx, r, cam, i, style) {
   api.setScreen(ctx, cam);
   const op = ctx.globalCompositeOperation;
   // the wall paint hides the windows it is painted over by day
-  if (spec.walls && k >= 0.6) { ctx.globalCompositeOperation = "destination-out"; paintWalls(api, ctx, r, k, i, 1); }
+  if (spec.walls && k >= 0.6) {
+    ctx.globalCompositeOperation = "destination-out"; paintWalls(api, ctx, r, k, i, 1);
+    ctx.globalCompositeOperation = "source-over"; paintWalls(api, ctx, r, k, i, 2);
+  }
   const items = itemsOf(api, i, r);
   // each piece, back to front, hides the lights behind it (its faces wound alike, one fill; a deck with its
   // courtyards apart), then shows its own

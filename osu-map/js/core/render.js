@@ -1128,8 +1128,8 @@ export function makeRenderer(scene) {
       if ((dy / L) * o.D[0] + (-dx / L) * o.D[1] >= 0) continue;
       projInto(PQ, 0, q[2 * a], q[2 * a + 1], 0, r); projInto(PQ, 2, q[2 * c], q[2 * c + 1], 0, r);
       ctx.beginPath();
-      quad(ctx, PQ[0], PQ[1], PQ[2], PQ[3], 0.14, 0.38, 1.1, 2.0);
-      quad(ctx, PQ[0], PQ[1], PQ[2], PQ[3], 0.62, 0.86, 1.1, 2.0);
+      quadF(ctx, PQ[0], PQ[1], PQ[2], PQ[3], 0.14, 0.38, 1.1, 2.0);
+      quadF(ctx, PQ[0], PQ[1], PQ[2], PQ[3], 0.62, 0.86, 1.1, 2.0);
       ctx.fillStyle = col; ctx.fill();
     }
   }
@@ -1147,7 +1147,10 @@ export function makeRenderer(scene) {
         if (i >= B || data.buildings[i].hidden) continue;
         const kind = styleOf(i).kind;
         if (kind !== (pass === 0 ? "house" : "apt")) continue;
-        ringPath(ctx, data.buildings[i].p[0]);
+        // (each ring closed by going round past its start to its second corner, not by closePath(), which is slow on a
+        // path of many: see quadF. The stroke then joins at the start like everywhere else, and the fill is the same.)
+        const f = data.buildings[i].p[0];
+        linePath(ctx, f); ctx.lineTo(f[0], f[1]); ctx.lineTo(f[2], f[3]);
         any = true;
       }
       if (!any) continue;
@@ -1982,7 +1985,7 @@ export function makeRenderer(scene) {
       const x = arr[s] + sx * 0.7, y = arr[s + 1] + sy * 0.7, ca = Math.cos(arr[s + 2]), sa = Math.sin(arr[s + 2]);
       const l = 2.45, w = 1.05;
       ctx.moveTo(x + ca * l - sa * w, y + sa * l + ca * w); ctx.lineTo(x + ca * l + sa * w, y + sa * l - ca * w);
-      ctx.lineTo(x - ca * l + sa * w, y - sa * l - ca * w); ctx.lineTo(x - ca * l - sa * w, y - sa * l + ca * w); ctx.closePath();
+      ctx.lineTo(x - ca * l + sa * w, y - sa * l - ca * w); ctx.lineTo(x - ca * l - sa * w, y - sa * l + ca * w);
     }
     ctx.fillStyle = "rgba(38,50,60,.2)"; ctx.fill();
     setScreen(ctx, cam);
@@ -2111,17 +2114,33 @@ export function makeRenderer(scene) {
     setWorld(sctx, cam, r);
     sctx.fillStyle = "#000";
     sctx.save();
-    // buildings: one path (their hulls all turn the same way, so they simply union)
-    sctx.beginPath();
-    for (const i of ids) {
-      if (i >= B) continue;
-      const poly = shadowPoly(i, r, sx, sy);
-      if (!poly) continue;
-      sctx.moveTo(poly[0], poly[1]);
-      for (let q = 2; q < poly.length; q += 2) sctx.lineTo(poly[q], poly[q + 1]);
-      sctx.closePath();
+    // buildings: their hulls all turn the same way, so they simply union. They come as ready-made paths, one per cell of
+    // a grid (built once per rotation, in ground metres): a far tile fills a few hundred of them where it used to add
+    // every corner of thousands of buildings (most of a whole-world tile's time went into that).
+    if (shadowGridOK) {
+      const grid = shadowGrid(r, k <= 0.3 ? 1 : 0, sx, sy);
+      const stamp = ++shadowStamp;
+      for (const i of ids) {
+        if (i >= B) continue;
+        const c = grid.of[i];
+        if (c < 0 || grid.seen[c] === stamp) continue;
+        grid.seen[c] = stamp;
+        let p = grid.paths[c];
+        if (p === undefined) p = grid.paths[c] = shadowCellPath(grid, c, r, sx, sy);
+        if (p) sctx.fill(p);
+      }
+    } else {
+      sctx.beginPath();
+      for (const i of ids) {
+        if (i >= B) continue;
+        const poly = shadowPoly(i, r, sx, sy);
+        if (!poly) continue;
+        sctx.moveTo(poly[0], poly[1]);
+        for (let q = 2; q < poly.length; q += 2) sctx.lineTo(poly[q], poly[q + 1]);
+        sctx.closePath();
+      }
+      sctx.fill();
     }
-    sctx.fill();
     // trees: soft discs; bare ones throw a thin, dappled shade
     const soft = off && k >= 0.45 ? softSprite("shadow") : null;
     if (soft) {
@@ -2176,6 +2195,47 @@ export function makeRenderer(scene) {
     }
     shadowCache.set(key, poly);
     return poly;
+  }
+  // The grid the building shadows are cached in: a building belongs to the cell of its footprint's first corner. Two
+  // sizes: fine cells for near tiles (few buildings each, so a tile fills little it doesn't show) and coarse ones for
+  // the far levels (a whole-world tile fills ~60 paths instead of ~1000).
+  const shadowGridOK = typeof Path2D !== "undefined";
+  const SH_CELLS = [128, 1024];
+  const shadowGrids = new Map();
+  let shadowStamp = 0;
+  function shadowGrid(r, coarse, sx, sy) {
+    const key = r * 2 + coarse;
+    let g = shadowGrids.get(key);
+    if (g) return g;
+    const w = data.world, size = SH_CELLS[coarse];
+    const cols = Math.max(1, Math.ceil((w.x1 - w.x0) / size) + 1), rows = Math.max(1, Math.ceil((w.y1 - w.y0) / size) + 1);
+    const of = new Int32Array(B).fill(-1), members = new Map();
+    for (let i = 0; i < B; i++) {
+      const b = data.buildings[i];
+      if (b.hidden) continue;
+      const f = b.p[0];
+      const cx = clamp(Math.floor((f[0] - w.x0) / size), 0, cols - 1), cy = clamp(Math.floor((f[1] - w.y0) / size), 0, rows - 1);
+      const c = cy * cols + cx;
+      of[i] = c;
+      let list = members.get(c);
+      if (!list) members.set(c, (list = []));
+      list.push(i);
+    }
+    g = { of, members, paths: new Array(cols * rows), seen: new Int32Array(cols * rows) };
+    shadowGrids.set(key, g);
+    return g;
+  }
+  function shadowCellPath(g, c, r, sx, sy) {
+    const p = new Path2D();
+    let any = false;
+    for (const i of g.members.get(c) || []) {
+      const poly = shadowPoly(i, r, sx, sy);
+      if (!poly) continue;
+      p.moveTo(poly[0], poly[1]);
+      for (let q = 2; q < poly.length; q += 2) p.lineTo(poly[q], poly[q + 1]);   // (left open: see quadF)
+      any = true;
+    }
+    return any ? p : null;
   }
 
   let scratch = null;
@@ -2526,6 +2586,14 @@ export function makeRenderer(scene) {
     const ax = x1 + (x2 - x1) * t0, ay = y1 + (y2 - y1) * t0, bx = x1 + (x2 - x1) * t1, by = y1 + (y2 - y1) * t1;
     ctx.moveTo(ax, ay - z0 * C); ctx.lineTo(bx, by - z0 * C); ctx.lineTo(bx, by - z1 * C); ctx.lineTo(ax, ay - z1 * C); ctx.closePath();
   }
+  // The same, for paths that are only filled (or clipped to), as every one in this file is: left open. Filling closes a
+  // subpath anyway, and closePath() costs Chrome time in proportion to the whole path so far, so on a path of many
+  // subpaths (a wall's windows, a lot's cars, a tile's shadows) closing each one made building the path quadratic:
+  // 6000 little polygons took half a second to add up, against 10 ms left open.
+  function quadF(ctx, x1, y1, x2, y2, t0, t1, z0, z1) {
+    const ax = x1 + (x2 - x1) * t0, ay = y1 + (y2 - y1) * t0, bx = x1 + (x2 - x1) * t1, by = y1 + (y2 - y1) * t1;
+    ctx.moveTo(ax, ay - z0 * C); ctx.lineTo(bx, by - z0 * C); ctx.lineTo(bx, by - z1 * C); ctx.lineTo(ax, ay - z1 * C);
+  }
   const wallTop = (b) => (b.roof && b.roof !== "flat" && b.obb ? b.h - b.rh : b.h);
 
   // LANDMARK HOOK (draw/decorate): a landmark may draw itself entirely, or add geometry after the standard building
@@ -2565,7 +2633,7 @@ export function makeRenderer(scene) {
           if ((wv.light >= 0.45) !== (pass === 0)) continue;
           const f = rings[wv.ri];
           ctx.moveTo(f[2 * wv.c], f[2 * wv.c + 1] - bot); ctx.lineTo(f[2 * wv.a], f[2 * wv.a + 1] - bot);
-          ctx.lineTo(f[2 * wv.a], f[2 * wv.a + 1] - top); ctx.lineTo(f[2 * wv.c], f[2 * wv.c + 1] - top); ctx.closePath();
+          ctx.lineTo(f[2 * wv.a], f[2 * wv.a + 1] - top); ctx.lineTo(f[2 * wv.c], f[2 * wv.c + 1] - top);   // (filled only: open, see quadF)
           any = true;
         }
         if (any) { ctx.fillStyle = sh(st.wall, pass === 0 ? 0.96 : 0.76); ctx.fill(); }
@@ -2609,11 +2677,11 @@ export function makeRenderer(scene) {
     const L = wv.L;
     // ambient occlusion near the ground
     if (k >= 2 && base < 0.5 && hgt > 2.5) {
-      ctx.beginPath(); quad(ctx, x1, y1, x2, y2, 0, 1, 0, Math.min(1.4, hgt * 0.3));
+      ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, 0, 1, 0, Math.min(1.4, hgt * 0.3));
       ctx.fillStyle = "rgba(40,32,24,.09)"; ctx.fill();
     }
     if (st.plinth && k >= 1.5 && base < 0.5 && hgt > 5) {
-      ctx.beginPath(); quad(ctx, x1, y1, x2, y2, 0, 1, 0, 0.9);
+      ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, 0, 1, 0, 0.9);
       ctx.fillStyle = sh(st.trim, 0.72 + 0.3 * wv.light); ctx.fill();
     }
     if (st.siding && k >= 4 && hgt < 12) {
@@ -2624,19 +2692,19 @@ export function makeRenderer(scene) {
     if (st.string && k >= 3 && hgt > 8) {
       const floors = Math.max(1, Math.round(hgt / st.fh)), fhh = hgt / floors;
       ctx.beginPath();
-      for (let fl = 1; fl < floors; fl++) { const z = base + fl * fhh; quad(ctx, x1, y1, x2, y2, 0, 1, z - 0.12, z + 0.1); }
+      for (let fl = 1; fl < floors; fl++) { const z = base + fl * fhh; quadF(ctx, x1, y1, x2, y2, 0, 1, z - 0.12, z + 0.1); }
       ctx.fillStyle = sh(st.trim, 0.66 + 0.34 * wv.light); ctx.fill();
     }
     drawWindows(ctx, b, st, wv, x1, y1, x2, y2, k >= 2 ? 1 : 0, k, front);
     if (st.cornice && k >= 1.5 && hgt > 4) {
       // a cornice: a light band at the top with a soft shadow under it
       const c0 = he - Math.min(0.8, hgt * 0.08);
-      ctx.beginPath(); quad(ctx, x1, y1, x2, y2, 0, 1, c0, he);
+      ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, 0, 1, c0, he);
       ctx.fillStyle = sh(st.trim, 0.74 + 0.32 * wv.light); ctx.fill();
-      if (k >= 3) { ctx.beginPath(); quad(ctx, x1, y1, x2, y2, 0, 1, c0 - 0.25, c0); ctx.fillStyle = "rgba(30,25,20,.14)"; ctx.fill(); }
+      if (k >= 3) { ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, 0, 1, c0 - 0.25, c0); ctx.fillStyle = "rgba(30,25,20,.14)"; ctx.fill(); }
     } else if (pitched && k >= 2) {
       // the eaves' shadow
-      ctx.beginPath(); quad(ctx, x1, y1, x2, y2, 0, 1, he - 0.35, he);
+      ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, 0, 1, he - 0.35, he);
       ctx.fillStyle = "rgba(30,25,20,.16)"; ctx.fill();
     }
   }
@@ -2653,6 +2721,7 @@ export function makeRenderer(scene) {
     const fhh = hgt / floors;
     const L = wv.L;
     const idBase = strHashInt(b.id) + wv.c * 131 + wv.ri * 7919;
+    if (f === "blank") return;   // no windows: a landmark paints its own (landmarks.js walls)
     if (f === "parking") {
       // open decks: a dark band per level
       const g = mode === 2 && litBatch ? litBatch[3] : ctx;
@@ -2660,7 +2729,7 @@ export function makeRenderer(scene) {
       for (let fl = 0; fl < floors; fl++) {
         const z0 = base + fl * fhh + fhh * 0.38, z1 = base + fl * fhh + fhh * 0.86;
         if (mode === 2 && nHash(strHashInt(b.id) + fl * 7) < 0.35) continue;
-        quad(g, x1, y1, x2, y2, 0.02, 0.98, z0, z1);
+        quadF(g, x1, y1, x2, y2, 0.02, 0.98, z0, z1);
         if (g !== ctx) litUsed[3] = true;
       }
       if (g === ctx) {
@@ -2671,7 +2740,7 @@ export function makeRenderer(scene) {
         // columns between the openings
         ctx.beginPath();
         const n = Math.max(1, Math.round(L / 8));
-        for (let c = 1; c < n; c++) quad(ctx, x1, y1, x2, y2, c / n - 0.25 / L, c / n + 0.25 / L, base, he);
+        for (let c = 1; c < n; c++) quadF(ctx, x1, y1, x2, y2, c / n - 0.25 / L, c / n + 0.25 / L, base, he);
         ctx.fillStyle = sh(st.wall, 0.75 + 0.3 * wv.light); ctx.fill();
       }
       return;
@@ -2681,7 +2750,7 @@ export function makeRenderer(scene) {
       if (mode !== 1 || L < 3 || hgt < 2.2 || (b.k !== "garage" && b.k !== "garages")) return;
       const n = b.k === "garages" ? Math.max(1, Math.floor(L / 3.2)) : 1;
       ctx.beginPath();
-      for (let d = 0; d < n; d++) { const c = (d + 0.5) / n, hw = Math.min(1.25, L / n * 0.4) / L; quad(ctx, x1, y1, x2, y2, c - hw, c + hw, base, base + Math.min(2.1, hgt - 0.3)); }
+      for (let d = 0; d < n; d++) { const c = (d + 0.5) / n, hw = Math.min(1.25, L / n * 0.4) / L; quadF(ctx, x1, y1, x2, y2, c - hw, c + hw, base, base + Math.min(2.1, hgt - 0.3)); }
       ctx.fillStyle = sh(st.wall, 0.82); ctx.fill();
       return;
     }
@@ -2703,7 +2772,7 @@ export function makeRenderer(scene) {
             const cl = hsh < on * 0.22 ? 0 : hsh < on * 0.62 ? 1 : 2;
             if (cl !== pass) continue;
             const t0 = pad + ((1 - 2 * pad) * w) / nb, t1 = pad + ((1 - 2 * pad) * (w + 1)) / nb;
-            quad(g, x1, y1, x2, y2, t0 + 0.04 / L, t1 - 0.04 / L, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
+            quadF(g, x1, y1, x2, y2, t0 + 0.04 / L, t1 - 0.04 / L, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
             any = true;
           }
           if (!any) continue;
@@ -2712,7 +2781,7 @@ export function makeRenderer(scene) {
         return;
       }
       ctx.beginPath();
-      for (let fl = 0; fl < floors; fl++) quad(ctx, x1, y1, x2, y2, pad, 1 - pad, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
+      for (let fl = 0; fl < floors; fl++) quadF(ctx, x1, y1, x2, y2, pad, 1 - pad, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
       const gl = f === "curtain" ? sh(st.glass, 0.8 + 0.3 * wv.light) : sh(st.glass, 0.85 + 0.25 * wv.light);
       ctx.fillStyle = mode === 0 ? mx(gl, sh(st.wall, 0.8), 0.3) : gl; ctx.fill();
       if (mode === 1) {
@@ -2723,7 +2792,7 @@ export function makeRenderer(scene) {
           for (let fl = 0; fl < floors; fl++) {
             const za = base + fl * fhh + fhh * z0f, zb = base + fl * fhh + fhh * z1f;
             const ta = clamp(s0 + fl * 0.03, pad, 1 - pad), tb = clamp(ta + 0.18, pad, 1 - pad);
-            quad(ctx, x1, y1, x2, y2, ta, tb, za, zb);
+            quadF(ctx, x1, y1, x2, y2, ta, tb, za, zb);
           }
           ctx.fillStyle = "rgba(255,255,255,.13)"; ctx.fill();
         }
@@ -2756,13 +2825,13 @@ export function makeRenderer(scene) {
         for (let fl = 0; fl < floors; fl++) {
           if (fl === 0 && store) {
             // shop fronts: most of them lit
-            if (pass === 1 && nHash(idBase + 3) < 0.75) { quad(g, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); any = true; }
+            if (pass === 1 && nHash(idBase + 3) < 0.75) { quadF(g, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); any = true; }
             continue;
           }
           const z0 = base + fl * fhh + fhh * z0f, z1 = base + fl * fhh + fhh * z1f;
           for (let w = 0; w < count; w++) {
             if (fl === 0 && w === doorSlot) {
-              if (pass === 1 && (front || nHash(idBase + 9) < 0.7)) { const t0 = pad + span * w + (span * (1 - (front ? 0.3 : 0.7))) / 2; quad(g, x1, y1, x2, y2, t0, t0 + span * (front ? 0.3 : 0.7), base, base + Math.min(2.6, fhh * 0.7)); any = true; }
+              if (pass === 1 && (front || nHash(idBase + 9) < 0.7)) { const t0 = pad + span * w + (span * (1 - (front ? 0.3 : 0.7))) / 2; quadF(g, x1, y1, x2, y2, t0, t0 + span * (front ? 0.3 : 0.7), base, base + Math.min(2.6, fhh * 0.7)); any = true; }
               continue;
             }
             const hsh = nHash(idBase + fl * 977 + w * 31);
@@ -2770,7 +2839,7 @@ export function makeRenderer(scene) {
             const cl = hsh < on * 0.22 ? 0 : hsh < on * 0.62 ? 1 : 2;
             if (cl !== pass) continue;
             const t0 = pad + span * w + (span * (1 - ww)) / 2;
-            quad(g, x1, y1, x2, y2, t0, t0 + span * ww, z0, z1);
+            quadF(g, x1, y1, x2, y2, t0, t0 + span * ww, z0, z1);
             any = true;
           }
         }
@@ -2784,9 +2853,9 @@ export function makeRenderer(scene) {
       // from afar: each floor's row of windows as one band, its colour half way to the wall's
       ctx.beginPath();
       for (let fl = 0; fl < floors; fl++) {
-        if (fl === 0 && store) { quad(ctx, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); continue; }
+        if (fl === 0 && store) { quadF(ctx, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); continue; }
         const t0 = pad + (span * (1 - ww)) / 2, t1 = pad + span * (count - 1) + (span * (1 + ww)) / 2;
-        quad(ctx, x1, y1, x2, y2, t0, t1, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
+        quadF(ctx, x1, y1, x2, y2, t0, t1, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
       }
       ctx.fillStyle = mx(glass, sh(st.wall, 0.7 + 0.36 * wv.light), 0.45); ctx.fill();
       return;
@@ -2803,8 +2872,8 @@ export function makeRenderer(scene) {
         for (let w = 0; w < count; w++) {
           if (fl === 0 && w === doorSlot) continue;
           const t0 = pad + span * w + (span * (1 - ww)) / 2, t1 = t0 + span * ww;
-          if (frame) quad(ctx, x1, y1, x2, y2, t0 - fw, t1 + fw, z0 - 0.1, z1 + 0.1);
-          if (sill) { quad(ctx, x1, y1, x2, y2, t0 - fw * 1.6, t1 + fw * 1.6, z0 - 0.2, z0); quad(ctx, x1, y1, x2, y2, t0 - fw, t1 + fw, z1, z1 + 0.16); }
+          if (frame) quadF(ctx, x1, y1, x2, y2, t0 - fw, t1 + fw, z0 - 0.1, z1 + 0.1);
+          if (sill) { quadF(ctx, x1, y1, x2, y2, t0 - fw * 1.6, t1 + fw * 1.6, z0 - 0.2, z0); quadF(ctx, x1, y1, x2, y2, t0 - fw, t1 + fw, z1, z1 + 0.16); }
         }
       }
       // frames and sills share one fill (the frame's colour where there are frames)
@@ -2812,12 +2881,12 @@ export function makeRenderer(scene) {
     }
     ctx.beginPath();
     for (let fl = 0; fl < floors; fl++) {
-      if (fl === 0 && store) { quad(ctx, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); continue; }
+      if (fl === 0 && store) { quadF(ctx, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); continue; }
       const z0 = base + fl * fhh + fhh * z0f, z1 = base + fl * fhh + fhh * z1f;
       for (let w = 0; w < count; w++) {
         if (fl === 0 && w === doorSlot) continue;
         const t0 = pad + span * w + (span * (1 - ww)) / 2;
-        quad(ctx, x1, y1, x2, y2, t0, t0 + span * ww, z0, z1);
+        quadF(ctx, x1, y1, x2, y2, t0, t0 + span * ww, z0, z1);
       }
     }
     ctx.fillStyle = glass; ctx.fill();
@@ -2829,7 +2898,7 @@ export function makeRenderer(scene) {
         for (let w = 0; w < count; w++) {
           if (fl === 0 && w === doorSlot) continue;
           const t0 = pad + span * w + (span * (1 - ww)) / 2;
-          quad(ctx, x1, y1, x2, y2, t0, t0 + span * ww * 0.45, z0 + (z1 - z0) * 0.55, z1);
+          quadF(ctx, x1, y1, x2, y2, t0, t0 + span * ww * 0.45, z0 + (z1 - z0) * 0.55, z1);
         }
       }
       ctx.fillStyle = "rgba(255,255,255,.12)"; ctx.fill();
@@ -2838,17 +2907,17 @@ export function makeRenderer(scene) {
       // mullions in the shop windows and an awning line over them
       ctx.beginPath();
       const n = Math.max(1, Math.round(L / 3));
-      for (let c = 1; c < n; c++) quad(ctx, x1, y1, x2, y2, c / n - 0.07 / L, c / n + 0.07 / L, base + 0.35, base + Math.min(3, fhh * 0.82));
-      quad(ctx, x1, y1, x2, y2, 0.04, 0.96, base + Math.min(3, fhh * 0.82), base + Math.min(3.35, fhh * 0.9));
+      for (let c = 1; c < n; c++) quadF(ctx, x1, y1, x2, y2, c / n - 0.07 / L, c / n + 0.07 / L, base + 0.35, base + Math.min(3, fhh * 0.82));
+      quadF(ctx, x1, y1, x2, y2, 0.04, 0.96, base + Math.min(3, fhh * 0.82), base + Math.min(3.35, fhh * 0.9));
       ctx.fillStyle = sh(st.wall, 0.55); ctx.fill();
     }
     if (doorSlot >= 0) {
       const dw = front ? 0.3 : 0.7;
       const t0 = pad + span * doorSlot + (span * (1 - dw)) / 2, t1 = t0 + span * dw;
       const dh = front ? Math.min(2.2, fhh * 0.72) : Math.min(2.7, fhh * 0.72);
-      ctx.beginPath(); quad(ctx, x1, y1, x2, y2, t0 - fw * 1.5, t1 + fw * 1.5, base, base + dh + 0.25);
+      ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, t0 - fw * 1.5, t1 + fw * 1.5, base, base + dh + 0.25);
       ctx.fillStyle = sh(front ? "#f2eee6" : st.trim, 0.8 + 0.25 * wv.light); ctx.fill();
-      ctx.beginPath(); quad(ctx, x1, y1, x2, y2, t0, t1, base, base + dh);
+      ctx.beginPath(); quadF(ctx, x1, y1, x2, y2, t0, t1, base, base + dh);
       ctx.fillStyle = front ? sh(pick(DOORS, st.h4), 0.8 + 0.25 * wv.light) : sh("#34414c", 0.9 + 0.2 * wv.light); ctx.fill();
     }
   }
@@ -3001,7 +3070,7 @@ export function makeRenderer(scene) {
       const x = arr[s] + sx * 0.7, y = arr[s + 1] + sy * 0.7, ca = Math.cos(arr[s + 2]), sa = Math.sin(arr[s + 2]);
       const l = 2.45, w = 1.05;
       ctx.moveTo(x + ca * l - sa * w, y + sa * l + ca * w); ctx.lineTo(x + ca * l + sa * w, y + sa * l - ca * w);
-      ctx.lineTo(x - ca * l + sa * w, y - sa * l - ca * w); ctx.lineTo(x - ca * l - sa * w, y - sa * l + ca * w); ctx.closePath();
+      ctx.lineTo(x - ca * l + sa * w, y - sa * l - ca * w); ctx.lineTo(x - ca * l - sa * w, y - sa * l + ca * w);
     }
     ctx.fillStyle = "rgba(38,50,60,.2)"; ctx.fill();
     setScreen(ctx, cam);
@@ -3096,7 +3165,7 @@ export function makeRenderer(scene) {
         if (it.type === "solar") continue;
         const Q = rectQuad(it.cx + sx * it.h * 0.9, it.cy + sy * it.h * 0.9, it.ang, it.hx, it.hy);
         for (let c = 0; c < 4; c++) { projInto(PQ, 2 * c, Q[2 * c], Q[2 * c + 1], it.z, r); }
-        ctx.moveTo(PQ[0], PQ[1]); ctx.lineTo(PQ[2], PQ[3]); ctx.lineTo(PQ[4], PQ[5]); ctx.lineTo(PQ[6], PQ[7]); ctx.closePath();
+        ctx.moveTo(PQ[0], PQ[1]); ctx.lineTo(PQ[2], PQ[3]); ctx.lineTo(PQ[4], PQ[5]); ctx.lineTo(PQ[6], PQ[7]);   // (filled only)
       }
       ctx.fillStyle = "rgba(38,50,60,.13)"; ctx.fill();
     }
@@ -3298,7 +3367,15 @@ export function makeRenderer(scene) {
       R2[j] = rout[j] - rimW;
     }
     const P = (j, rr, z) => [cx + dirX[j] * rr, cy + dirY[j] * rr, z];
-    const seatLo = shoe ? "#bcb8b0" : "#b9b5ad", seatUp = shoe ? "#aeaaa3" : "#b3afa8";
+    const seatLo = shoe ? "#c3b6b2" : "#b9b5ad", seatUp = shoe ? "#b3aca8" : "#b3afa8";
+    // The Horseshoe's stands are grey seats with a scarlet cast; solid scarlet in the middle of each sideline's lower
+    // deck and toward the ends of the upper deck (as in aerial photos)
+    const seatCol = (j, upper) => {
+      if (!shoe) return upper ? seatUp : seatLo;
+      const sd = Math.abs(Math.sin(((j + 0.5) / N) * TAU - fo.ang));
+      if (!upper) return sd > 0.93 ? "#b3474f" : seatLo;
+      return sd > 0.5 && sd < 0.72 ? "#b0525a" : seatUp;
+    };
     const wallCol = b.lm === "Ohio Stadium" ? "#dccfb2" : "#cfc6b5";
     for (let j = 0; j < N; j++) {
       const j2 = (j + 1) % N;
@@ -3308,12 +3385,12 @@ export function makeRenderer(scene) {
       pieces.push({ kind: "fieldwall", pts: [...P(j, rin[j], 0), ...P(j2, rin[j2], 0), ...P(j2, rin[j2], zw), ...P(j, rin[j], zw)], nx: -ux, ny: -uy, col: "#5b6a5e", j });
       // lower tier
       const sl = Math.atan2(Z1[j] - zw, R1[j] - rin[j]);
-      pieces.push({ kind: "seats", pts: [...P(j, rin[j], zw), ...P(j2, rin[j2], zw), ...P(j2, R1[j2], Z1[j2]), ...P(j, R1[j], Z1[j])], ux, uy, slope: sl, col: seatLo, j, rows: (R1[j] - rin[j]) / 0.9 });
+      pieces.push({ kind: "seats", pts: [...P(j, rin[j], zw), ...P(j2, rin[j2], zw), ...P(j2, R1[j2], Z1[j2]), ...P(j, R1[j], Z1[j])], ux, uy, slope: sl, col: seatCol(j, false), j, rows: (R1[j] - rin[j]) / 0.9 });
       // the suites' glass face (faces in)
       pieces.push({ kind: "suites", pts: [...P(j, R1[j], Z1[j]), ...P(j2, R1[j2], Z1[j2]), ...P(j2, R1[j2], Z2[j2]), ...P(j, R1[j], Z2[j])], nx: -ux, ny: -uy, col: "#3e4b57", j });
       // upper tier
       const su = Math.atan2(rim - Z2[j], R2[j] - R1[j]);
-      pieces.push({ kind: "seats", pts: [...P(j, R1[j], Z2[j]), ...P(j2, R1[j2], Z2[j2]), ...P(j2, R2[j2], rim), ...P(j, R2[j], rim)], ux, uy, slope: su, col: seatUp, j, rows: (R2[j] - R1[j]) / 0.95 });
+      pieces.push({ kind: "seats", pts: [...P(j, R1[j], Z2[j]), ...P(j2, R1[j2], Z2[j2]), ...P(j2, R2[j2], rim), ...P(j, R2[j], rim)], ux, uy, slope: su, col: seatCol(j, true), j, rows: (R2[j] - R1[j]) / 0.95 });
       // concourse at the rim, the parapet's inner face, the facade
       pieces.push({ kind: "rim", pts: [...P(j, R2[j], rim), ...P(j2, R2[j2], rim), ...P(j2, rout[j2], rim), ...P(j, rout[j], rim)], ux, uy, slope: 0, col: "#d9d1c0", j });
       pieces.push({ kind: "parapet", pts: [...P(j, rout[j], rim), ...P(j2, rout[j2], rim), ...P(j2, rout[j2], rim + 1.1), ...P(j, rout[j], rim + 1.1)], nx: -ux, ny: -uy, col: sh(wallCol, 0.95), j });
@@ -3797,17 +3874,31 @@ export function makeRenderer(scene) {
   function roofItemsShown(b, st, k) {
     return k >= 2 && !(b.roof && b.roof !== "flat" && b.obb) && b.h - (b.mh || 0) >= 2.5 && st.kind !== "house" && st.kind !== "small" && st.kind !== "parking" && st.kind !== "bowl" && st.kind !== "bleachers";
   }
-  // append a polygon (screen metres) to a path, as device pixels for the scale s and offset (ox, oy)
+  // append a polygon (screen metres) to a path, as device pixels for the scale s and offset (ox, oy). (Silhouettes are
+  // only ever filled or clipped to: their subpaths are left open, see quadF.)
   function polyOut(p, f, s, ox, oy) {
     p.moveTo(f[0] * s - ox, f[1] * s - oy);
     for (let q = 2; q < f.length; q += 2) p.lineTo(f[q] * s - ox, f[q + 1] * s - oy);
-    p.closePath();
+  }
+  // append a polygon (screen metres) to a path as it is (left open: for fills, see quadF)
+  function polyAdd(p, f) {
+    p.moveTo(f[0], f[1]);
+    for (let q = 2; q < f.length; q += 2) p.lineTo(f[q], f[q + 1]);
+  }
+  // an outline's courtyard holes, wound against its roof (so under the nonzero rule they open only their own roof)
+  function holesReversed(ol) {
+    if (ol.holesRev) return ol.holesRev;
+    return (ol.holesRev = ol.holes.map((h) => {
+      const p = orientPoly(h), n = p.length / 2, out = new Float32Array(p.length);
+      for (let q = 0; q < n; q++) { out[2 * q] = p[2 * (n - 1 - q)]; out[2 * q + 1] = p[2 * (n - 1 - q) + 1]; }
+      return out;
+    }));
   }
   function quadOut(p, s, ox, oy, ax, ay, bx, by, cx, cy, dx, dy) {
     // four corners in any order round the quad: wound like rect()
     const a = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
     if (a < 0) { let t = bx; bx = dx; dx = t; t = by; by = dy; dy = t; }
-    p.moveTo(ax * s - ox, ay * s - oy); p.lineTo(bx * s - ox, by * s - oy); p.lineTo(cx * s - ox, cy * s - oy); p.lineTo(dx * s - ox, dy * s - oy); p.closePath();
+    p.moveTo(ax * s - ox, ay * s - oy); p.lineTo(bx * s - ox, by * s - oy); p.lineTo(cx * s - ox, cy * s - oy); p.lineTo(dx * s - ox, dy * s - oy);
   }
 
   /**
@@ -3855,7 +3946,7 @@ export function makeRenderer(scene) {
         return path;
       }
       const cy = Yg - Math.max(h - rad, h * 0.55) * C;
-      if (lod < 0.7 || !canAdd) { path.moveTo((X + rad) * s - ox, cy * s - oy); path.arc(X * s - ox, cy * s - oy, rad * s, 0, TAU); path.closePath(); if (lod < 0.7) return path; }
+      if (lod < 0.7 || !canAdd) { path.moveTo((X + rad) * s - ox, cy * s - oy); path.arc(X * s - ox, cy * s - oy, rad * s, 0, TAU); if (lod < 0.7) return path; }
       const tw = Math.max(0.12, rad * 0.07);
       quadOut(path, s, ox, oy, X - tw, Yg, X + tw, Yg, X + tw * 0.6, cy, X - tw * 0.6, cy);
       if (canAdd) path.addPath(leafTemplate(Math.floor(hh2 * 6)).sil, new DOMMatrix([s * rad, 0, 0, s * rad, X * s - ox, cy * s - oy]));
@@ -3905,7 +3996,25 @@ export function makeRenderer(scene) {
       if (pool) { ctx.globalAlpha = 0.85; ctx.drawImage(pool, X - rad, Y - rad * S, rad * 2, rad * 2 * S); ctx.globalAlpha = 1; }
       if (k >= 1.2) cabinWindows(ctx, r, rectQuad(b.cx, b.cy, Math.atan2(P.uy, P.ux), b.S.L / 2, b.S.W / 2), "#ffd28a");
     }
-    const blot = (f) => { ctx.moveTo(f[0], f[1]); for (let q = 2; q < f.length; q += 2) ctx.lineTo(f[q], f[q + 1]); ctx.closePath(); };
+    const blot = (f) => { ctx.moveTo(f[0], f[1]); for (let q = 2; q < f.length; q += 2) ctx.lineTo(f[q], f[q + 1]); };   // (fills only: open, see quadF)
+    // Under 0.5 px/m no window is lit: past the pools above, every object only rubs light out, and rubbing out commutes.
+    // So the blots are gathered into three paths (buildings; bare crowns' haze; crowns and trunks) and rubbed out
+    // together, before anything adds light again (a landmark's own lights) and at the end: the same picture for a
+    // fraction of the fills. (Where two crowns overlap they now dim the light behind them once, not twice.)
+    const far = k < 0.5 && typeof Path2D !== "undefined";
+    let farB = null, farH = null, farT = null;
+    const farFlush = () => {
+      if (!farB && !farH && !farT) return;
+      ctx.globalCompositeOperation = "destination-out";
+      ctx.fillStyle = "#000";
+      setScreen(ctx, cam);
+      if (farB) ctx.fill(farB, "nonzero");
+      if (farH) { ctx.globalAlpha = 0.35; ctx.fill(farH); }
+      if (farT) { ctx.globalAlpha = 0.8; ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fill(farT); setScreen(ctx, cam); }
+      ctx.globalAlpha = 1;
+      ctx.globalCompositeOperation = "source-over";
+      farB = farH = farT = null;
+    };
     // then every object back to front: it blots out the light behind it, then adds its own
     for (const i of ids) {
       if (DBG.on) { DBG.id = i < B ? i : -1; DBG.part = 3; }
@@ -3915,6 +4024,21 @@ export function makeRenderer(scene) {
         const st = styleOf(i);
         const ol = outlineOf(i, r);
         if (!ol) continue;
+        if (far) {
+          // its walls and roof, courtyards open (the holes wind the other way, so they cancel only their own roof)
+          if (!farB) farB = new Path2D();
+          for (const f of ol.walls) polyAdd(farB, f);
+          for (const f of ol.roof) polyAdd(farB, f);
+          if (ol.holes.length) for (const f of holesReversed(ol)) polyAdd(farB, f);
+          if (b.lm != null) {
+            // (its own lights, as at the landmark hook for lights below)
+            farFlush();
+            LM.lights(api, ctx, r, cam, i, style);
+            ctx.globalCompositeOperation = "source-over"; ctx.globalAlpha = 1;
+            setScreen(ctx, cam);
+          }
+          continue;
+        }
         const rings = Sr.objRings[i];
         const walls = visibleWalls(i, r);
         const base = b.mh || 0, he2 = wallTop(b);
@@ -3994,6 +4118,16 @@ export function makeRenderer(scene) {
       } else if (i < B + T) {
         // a tree dims the lights behind it: its crown (exactly the day's shape) mostly, a bare one's twigs a little
         const t = i - B;
+        if (far) {
+          if (treeBare(t, style)) {
+            const tr = data.trees, x = tr[5 * t], y = tr[5 * t + 1], rad = tr[5 * t + 2], h = tr[5 * t + 3];
+            const X = x * geo.ROTS[r].R[0] + y * geo.ROTS[r].R[1], Yc = -(x * geo.ROTS[r].D[0] + y * geo.ROTS[r].D[1]) * S - Math.max(h - rad, h * 0.55) * C;
+            if (!farH) farH = new Path2D();
+            farH.moveTo(X + rad, Yc); farH.arc(X, Yc, rad, 0, TAU);
+          }
+          silhouette(farT || (farT = new Path2D()), r, cam, i, style);
+          continue;
+        }
         ctx.globalCompositeOperation = "destination-out";
         if (treeBare(t, style)) {
           const tr = data.trees, x = tr[5 * t], y = tr[5 * t + 1], rad = tr[5 * t + 2], h = tr[5 * t + 3];
@@ -4017,12 +4151,13 @@ export function makeRenderer(scene) {
         if (head) ctx.drawImage(head, X - 1.6, hy - 1.6, 3.2, 3.2);
       }
     }
+    farFlush();
   }
   // From mid-distance (0.5–1 px/m) a window is under a pixel: a sparse speckle of lit ones stands in, about one per 9 m
   // of wall (more on tall walls) at varied heights, ~45 % of them on. Deterministic per building and wall.
   function speckle(ctx, b, st, wv, x1, y1, x2, y2, k) {
     const base = b.mh || 0, he = wallTop(b), hgt = he - base;
-    if (hgt < 2.5 || wv.L < 3 || st.facade === "small") return;
+    if (hgt < 2.5 || wv.L < 3 || st.facade === "small" || st.facade === "blank") return;
     const on = st.kind === "hospital" ? 0.62 : st.kind === "ind" ? 0.22 : st.facade === "parking" ? 0.6 : 0.45;
     const n = Math.max(1, Math.round((wv.L / (st.kind === "hospital" ? 7 : 9)) * clamp(hgt / 10, 1, 4)));
     const idBase = strHashInt(b.id) + wv.c * 131 + wv.ri * 7919;
@@ -4041,7 +4176,7 @@ export function makeRenderer(scene) {
         const fl = Math.min(floors - 1, Math.floor(nHash(idBase + s * 7 + 11) * floors));
         const zm = base + fl * fhh + fhh * (st.z0f + st.z1f) / 2;
         const z0 = clamp(zm - dz / 2, base, he - dz);
-        quad(g, x1, y1, x2, y2, t, t + dt, z0, z0 + dz);
+        quadF(g, x1, y1, x2, y2, t, t + dt, z0, z0 + dz);
         any = true;
       }
       if (!any) continue;

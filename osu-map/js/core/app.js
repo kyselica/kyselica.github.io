@@ -103,14 +103,11 @@ export async function createApp({ canvas, dataUrl = "data/campus.json" }) {
     /** the most frames per second layers' animations get (movement of the view itself runs at the display's rate) */
     fpsCap: +params.get("fps") > 0 ? Math.min(240, +params.get("fps")) : mobile ? 30 : 60,
     /**
-     * TEMPORARY, until every module gives its animated layers an fps(f): what a layer WITHOUT fps() is taken to ask
-     * for, by id (a number, or a function (f) → number). Any layer not listed here and without fps() is static.
+     * Ambient mode: while the window isn't focused (the map on a second screen, another app in front) or nobody has
+     * touched the page for AMBIENT_IDLE_MS, layer-paced animation is capped further, at ambientFps (0 turns it off).
      */
-    legacyFps: {
-      buses: 30, cars: 30, people: 30,
-      sky: 10,   // cloud shadows drift, the light changes with the clock
-      "sky-weather": () => { const w = app.weather; return w && (w.rain > 0.01 || w.snow > 0.01 || w.fog > 0.02 || w.storm) ? 30 : 0; },
-    },
+    ambientFps: params.has("ambient") ? +params.get("ambient") : 15,
+    get ambient() { return ambientNow(); },
     perf,
     /** CSS px of a lat/lon (z metres up) in the current view */
     project(lat, lon, z = 0) { return view.latLonToScreen(lat, lon, z); },
@@ -230,6 +227,20 @@ export async function createApp({ canvas, dataUrl = "data/campus.json" }) {
     setTimeout(() => scene.forRot(r), 50);
   });
 
+  // ---------------------------------------------------------------- ambient mode
+  const AMBIENT_IDLE_MS = 120000;
+  let lastInput = performance.now();
+  const onInput = () => {
+    const was = ambientNow();
+    lastInput = performance.now();
+    if (was) kick(false, "input");   // back to the full pace at once
+  };
+  for (const ev of ["pointerdown", "pointermove", "wheel", "keydown", "touchstart"]) window.addEventListener(ev, onInput, { passive: true, capture: true });
+  window.addEventListener("focus", onInput);
+  function ambientNow() {
+    return app.ambientFps > 0 && (!document.hasFocus() || performance.now() - lastInput > AMBIENT_IDLE_MS);
+  }
+
   // ---------------------------------------------------------------- the frame
   // Drawn on demand (ARCHITECTURE.md "Frame scheduling"): at the display's rate while the view moves (and for LINGER_MS
   // after), else at the highest rate an enabled layer's fps(f) asks for (capped by app.fpsCap), else not at all until
@@ -334,14 +345,13 @@ export async function createApp({ canvas, dataUrl = "data/campus.json" }) {
     ctx.drawImage(base.a, 0, 0);
   }
 
-  /** the most frames per second the enabled layers ask for right now (layers without fps(): app.legacyFps, else 0) */
+  /** the most frames per second the enabled layers ask for right now (a layer without fps asks 0) */
   function layersFps() {
     let want = 0;
     for (let i = 0; i < layers.length; i++) {
       const L = layers[i];
       if (!layerEnabled(L.id)) continue;
       let v = L.fps;
-      if (v == null) v = app.legacyFps && app.legacyFps[L.id];
       if (typeof v === "function") {
         try { v = v.call(L, f); } catch (e) { if (!L._fpsErr) { console.error(`layer ${L.id} fps:`, e); L._fpsErr = true; } v = 0; }
       }
@@ -386,7 +396,7 @@ export async function createApp({ canvas, dataUrl = "data/campus.json" }) {
       // let go when the reader moves, when the new turn is fully drawn, or once stand-ins cover every tile (not before
       // ROT_HOLD, and never later than 5 s): fading onto bare holes looks broken
       const age = now - rotSnap.t0;
-      if (rotSnap.fade == null && (moved || tiles.complete(view) || (age > ROT_HOLD && !tiles.holes) || age > 5000)) rotSnap.fade = now;
+      if (rotSnap.fade == null && (moved || tiles.complete(view, BASE_ONLY) || (age > ROT_HOLD && !tiles.holes) || age > 5000)) rotSnap.fade = now;
       const a = rotSnap.fade == null ? 1 : 1 - (now - rotSnap.fade) / ROT_FADE;
       if (a <= 0) rotSnap = null;
       else {
@@ -396,7 +406,7 @@ export async function createApp({ canvas, dataUrl = "data/campus.json" }) {
         ctx.globalAlpha = 1;
       }
     }
-    if (!firstComplete && tiles.complete(view)) {
+    if (!firstComplete && tiles.complete(view, BASE_ONLY)) {
       firstComplete = true;
       app.status.loaded = true;
       emit("ready", app);
@@ -407,7 +417,7 @@ export async function createApp({ canvas, dataUrl = "data/campus.json" }) {
     inFrame = false;
     // what next: full rate while anything moves (or something asked during this frame), else the layers' pace, else sleep
     const end = performance.now();
-    const want = Math.min(app.fpsCap, layersFps());
+    const want = Math.min(app.fpsCap, layersFps(), ambientNow() ? app.ambientFps : Infinity);
     perf.fps = want;
     perf.frames++; perf.ms += end - t0;
     if (dirty || !still || rotSnap || view.active() || end < lingerUntil) { due = 0; schedule(0); }
@@ -432,6 +442,7 @@ export function seasonFor(d) {
 }
 
 const BASE_STILL = { quality: "high", prefetch: true }, BASE_MOVING = { quality: "low", prefetch: false };
+const BASE_ONLY = ["base"];
 
 // the diorama: the campus as a slab of earth, its two near sides showing
 const SLAB_DEPTH = 46;

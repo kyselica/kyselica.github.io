@@ -277,11 +277,25 @@ export class Tiles {
       if (!c.g) c.g = c.c.getContext("2d");
       c.g.setTransform(1, 0, 0, 1, 0, 0);
       c.g.clearRect(0, 0, W, H);
+      this._missList = c.missList || (c.missList = []);
+      c.missList.length = 0;
       c.missing = this.drawTiles(c.g, view, layer, COMPOSE_OPTS);
+      this._missList = null;
       c.X = view.X; c.Y = view.Y; c.s = view.s; c.rot = view.rot; c.W = W; c.H = H; c.ver = this.ver; c.gen = gen;
       // only the part tiles cover is copied back (a composite op costs per pixel, transparent ones too)
       const B = this.box;
       c.x0 = Math.max(0, B[0]); c.y0 = Math.max(0, B[1]); c.x1 = Math.min(W, B[2]); c.y1 = Math.min(H, B[3]);
+    }
+    else if (c.missing > 0) {
+      // The picture is reused while tiles of it are still missing: keep wishing for them, or a wish dropped while the
+      // workers were busy (pump forgets wishes after 2 frames) is never made again and the layer stays half drawn
+      // until the view moves. Their arrival bumps the layer's generation and the picture is composed again.
+      const L = c.missList;
+      for (let i = 0; i < L.length; i += 6) {
+        const e = this.cache.get(this.key(layer, c.rot, L[i], L[i + 1], L[i + 2]));
+        if (!e || e.ver !== this.ver) this.request(layer, c.rot, L[i], L[i + 1], L[i + 2], L[i + 3], L[i + 4], L[i + 5], 0);
+      }
+      this.pump();
     }
     if (c.x1 > c.x0 && c.y1 > c.y0) {
       ctx.save();
@@ -338,6 +352,7 @@ export class Tiles {
       }
       missing++;
       this.request(layer, r, z, tx, ty, cx, cy, k, 0);
+      if (this._missList) this._missList.push(z, tx, ty, cx, cy, k);
       // stand-ins: an ancestor's corner (up to the pinned level), else finer tiles, each quarter from the nearest level
       let drawn = false;
       for (let up = 1; up <= maxUp && !drawn && z - up >= ZMIN; up++) {
@@ -484,13 +499,20 @@ export class Tiles {
     for (const [key, e] of this.cache) if (!layer || key.startsWith(layer + "/")) { if (e.bmp.close) e.bmp.close(); this.cache.delete(key); this.countLevel(key, -1); }
   }
 
-  /** True when every tile of the base layer in view is current. */
-  complete(view) {
+  /**
+   * True when every tile in view is current: of the base layer, and of each other tiled layer drawn in the last
+   * frames (the night lights), unless layers names the ones to check.
+   */
+  complete(view, layers) {
     const z = this.levelFor(view), k = Math.pow(2, z), s = view.s;
     const X0 = view.X - view.w / 2 / s, X1 = view.X + view.w / 2 / s, Y0 = view.Y - view.h / 2 / s, Y1 = view.Y + view.h / 2 / s;
     const [tx0, ty0, tx1, ty1] = this.range(view.worldBox, k, X0, Y0, X1, Y1);
-    for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
-      const e = this.cache.get(this.key("base", view.rot, z, tx, ty));
+    if (!layers) {
+      layers = ["base"];
+      for (const layer in this.comp) { const c = this.comp[layer]; if (c.c && this.frame - c.used <= 2) layers.push(layer); }
+    }
+    for (const layer of layers) for (let ty = ty0; ty <= ty1; ty++) for (let tx = tx0; tx <= tx1; tx++) {
+      const e = this.cache.get(this.key(layer, view.rot, z, tx, ty));
       if (!e || e.ver !== this.ver) return false;
     }
     return true;

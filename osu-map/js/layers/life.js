@@ -1540,7 +1540,7 @@ export function init(app) {
       return out;
     },
     // run the simulation on for sec seconds without drawing (for tests of how the traffic settles)
-    advance(sec, dt = 0.1) { for (let t = 0; t < sec; t += dt) stepFrame({ dt }); return this.state(); },
+    advance(sec, dt = 0.1) { for (let t = 0; t < sec; t += dt) stepSim(dt); return this.state(); },
     // where a cyclist is (for tests: fly there and look)
     cyclist() { for (let i = 0; i < nPeople; i++) if (pBike[i]) return geo.toLatLon(pX[i], pY[i]); return null; },
     // every approach to the junctions near a lat/lon: its controls, and the cars on it
@@ -1573,27 +1573,78 @@ export function init(app) {
   Object.defineProperty(life, "debug", { enumerable: false });
   app.life = life;
 
-  let failed = false;
-  app.on("frame", (f) => {
+  // ---------------------------------------------------------------- stepping and pace
+  // The simulation steps in every map frame, by the time since its last step. The map only draws while something moves
+  // on screen, so between frames a 4 Hz timer carries the traffic on (lights change, queues pull away, cars drive in
+  // from the margin) and wakes the map when something on screen starts to move.
+  let failed = false, lastSimAt = performance.now();
+  function step(maxDt) {
     if (failed) return;
-    try { stepFrame(f); } catch (e) {
+    const now = performance.now(), dt = Math.min(maxDt, Math.max(0, (now - lastSimAt) / 1000));
+    lastSimAt = now;
+    try { stepSim(dt); } catch (e) {
       // a broken simulation should not spam the console every frame: report once, then rest
       failed = true; nCars = 0; nPeople = 0;
       console.error("life: simulation stopped", e);
     }
-  });
-  function stepFrame(f) {
+  }
+  app.on("frame", () => step(0.25));
+  let askCars = 0, askPeople = 0;   // what the layers last asked for (0: the map may be asleep)
+  setInterval(() => {
+    if (failed || document.hidden || performance.now() - lastSimAt < 200) return;   // frames are coming: they step it
+    const carsOn = app.layerEnabled("cars"), peopleOn = app.layerEnabled("people");
+    if (!carsOn && !peopleOn && !nCars && !nPeople) return;
+    step(0.5);
+    if ((carsOn && askCars === 0 && carsWant() > 0) || (peopleOn && askPeople === 0 && peopleWant() > 0)) app.requestRender("life");
+  }, 250);
+  // Frames per second for a step of about STEP px a frame by the fastest car (person) on screen, within limits, and
+  // enough for a fade in or out to look smooth; 0 when nothing of the layer on screen moves.
+  const STEP = 2;
+  function carsWant() {
+    if (failed || !nCars || SCALE < CAR_MIN_S) return 0;
+    const m = Math.max(12, 8 * SCALE);
+    let v = 0, fade = false;
+    for (let i = 0; i < nCars; i++) {
+      if ((cShow[i] <= 0.01 && cFade[i] <= 0) || R.eTn[cLink[i] >> 1]) continue;
+      const px = PA * cX[i] + PB * cY[i] + PE, py = PC * cX[i] + PD * cY[i] + PF;
+      if (px < -m || px > VW + m || py < -m - 4 * PK || py > VH + m) continue;
+      if (cV[i] > v) v = cV[i];
+      if (cFade[i] !== 0) fade = true;
+    }
+    const pxps = v * SCALE;
+    // (far out the cars are specks a few px/s: a step of up to STEP px at 4 fps is as smooth as the eye can tell there)
+    let want = pxps > 0.4 ? Math.min(30, Math.max(SCALE >= 2 ? 8 : 4, pxps / STEP)) : 0;
+    if (fade && want < 8) want = 8;
+    return want;
+  }
+  function peopleWant() {
+    if (failed || !Wk || !nPeople || SCALE < PEOPLE_MIN_S) return 0;
+    const m = 6 * SCALE;
+    let v = 0, fade = false;
+    for (let i = 0; i < nPeople; i++) {
+      if (pShow[i] <= 0.01 && pFade[i] <= 0) continue;
+      const px = PA * pX[i] + PB * pY[i] + PE, py = PC * pX[i] + PD * pY[i] + PF;
+      if (px < -m || px > VW + m || py < -m || py > VH + m) continue;
+      if (pV[i] > v) v = pV[i];
+      if (pFade[i] !== 0) fade = true;
+    }
+    const pxps = v * SCALE;
+    // close up their legs swing (about a stride a second): that wants 15 frames a second to read as walking
+    let want = pxps > 0.4 ? Math.min(30, Math.max(SCALE >= PEOPLE_DETAIL_S ? 15 : 6, pxps / STEP)) : 0;
+    if (fade && want < 8) want = 8;
+    return want;
+  }
+  function stepSim(dt) {
     const t0 = performance.now();
     setCamera();
     if (simT - clockAt > 1 || clockAt < 0) { clockAt = simT; readClock(); }
-    const dt = Math.min(0.1, Math.max(0, f.dt || 0));
     const carsOn = app.layerEnabled("cars"), peopleOn = app.layerEnabled("people");
     simT += dt;
     screenRegion(region);
     if (carsOn && SCALE >= CAR_MIN_S) {
       manageCars();
       // big steps are split so that following and stopping stay smooth
-      const n = dt > 0.05 ? 2 : 1;
+      const n = Math.max(1, Math.ceil(dt / 0.05 - 1e-6));
       for (let k = 0; k < n; k++) stepCars(dt / n);
     } else if (!carsOn && nCars) clearCars();
     if (Wk && peopleOn && SCALE >= PEOPLE_SIM_S) {
@@ -1608,9 +1659,10 @@ export function init(app) {
   }
   app.on("rotate", () => { cOccT.fill(0); cBeamT.fill(0); pOccT.fill(0); });
 
-  app.addLayer({ id: "cars", z: 30, draw: (ctx) => drawCars(ctx) });
-  app.addLayer({ id: "people", z: 35, draw: (ctx) => drawPeople(ctx) });
-  app.addLayer({ id: "cars-lights", z: 84, draw: (ctx) => { if (app.layerEnabled("cars")) drawCarLights(ctx); } });
+  app.addLayer({ id: "cars", z: 30, fps: () => (askCars = carsWant()), draw: (ctx) => drawCars(ctx) });
+  app.addLayer({ id: "people", z: 35, fps: () => (askPeople = peopleWant()), draw: (ctx) => drawPeople(ctx) });
+  // the lamps and beams move with the cars, whose layer asks for the frames
+  app.addLayer({ id: "cars-lights", z: 84, fps: 0, draw: (ctx) => { if (app.layerEnabled("cars")) drawCarLights(ctx); } });
 
   if (app.ui && app.ui.registerToggle) {
     app.ui.registerToggle({ id: "cars", label: "Traffic", count: "simulated" });

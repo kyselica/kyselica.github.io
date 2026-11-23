@@ -685,6 +685,7 @@ export function init(app) {
 
   function tick() {
     if (document.hidden) return;
+    idleStep();
     const t = Date.now();
     if (!net.list.busy && t >= net.list.next) loadList();
     routes.forEach((r, i) => {
@@ -716,7 +717,7 @@ export function init(app) {
       offD: 0, offDV: 0, offX: 0, offY: 0, offXV: 0, offYV: 0, w: 3,   // the decaying correction (critically damped)
       repPat: null, repRaw: 0, repAt: 0, repX: 0, repY: 0,
       bx: 0, by: 0, x: 0, y: 0, fx: 0, fy: 1, hdg: 0, hdgT: 0, lane: 0,
-      appear: 0, alpha: 1, stale: false, age: 0,
+      appear: 0, alpha: 1, stale: false, age: 0, mv: 0, fadeV: 0,   // mv, fadeV: m/s moved and fade/s over the last step
       sx: 0, sy: 0, depth: 0, bb0: 0, bb1: 0, bb2: 0, bb3: 0, hw: 0, occ: 0, occB: false, drawn: false,
       pl: [0, 0, 0, 0], plF: -1,     // the route pill's box (CSS px) and the frame it was drawn in
       pub: { id, routeCode: "", lat: 0, lon: 0, heading: 0, destination: "", predictions: [], updated: null, speed: 0, x: 0, y: 0, stale: false, delayed: false },
@@ -1040,8 +1041,23 @@ export function init(app) {
     const n = liveCount();
     if (n !== lastCount) { lastCount = n; UI()?.setCount?.("buses", n ? String(n) : ""); app.emit("count", { id: "buses", n }); }
     updateStatus(n);
-    app.emit("transit", transit);
+    emitTransit();
     if (changedData !== false) refreshCard();
+  }
+  // "transit" tells the UI (badges, the routes panel, nearby stops) that bus data changed. Every route's poll publishes,
+  // so the event is coalesced: it goes out with the next map frame when frames are being drawn anyway (an event emitted
+  // during a frame wakes nothing), else within TRANSIT_MS on its own (which draws one frame).
+  const TRANSIT_MS = 1500;
+  let transitDue = false, transitTimer = 0;
+  function emitTransit() {
+    transitDue = true;
+    if (!transitTimer) transitTimer = setTimeout(flushTransit, TRANSIT_MS);
+  }
+  function flushTransit() {
+    if (transitTimer) { clearTimeout(transitTimer); transitTimer = 0; }
+    if (!transitDue) return;
+    transitDue = false;
+    app.emit("transit", transit);
   }
   function updateStatus(n = liveCount()) {
     const dot = (cls) => `<span class="bus-live ${cls}" aria-hidden="true"></span>`;
@@ -1255,24 +1271,31 @@ export function init(app) {
     const o = geo.ROTS[view.rot];
     const X = T.x * o.R[0] + T.y * o.R[1], Y = -(T.x * o.D[0] + T.y * o.D[1]) * SIN_T - 1.5 * COS_T + (app.mobile ? (view.h * 0.2) / view.s : 0);
     const k = 1 - Math.exp(-Math.min(dt, 0.1) * 3.2);
-    view.set(view.X + (X - view.X) * k, view.Y + (Y - view.Y) * k);
+    // a step under a twentieth of a pixel is no move: with the bus stopped, the view comes to rest (and the map sleeps)
+    if (Math.max(Math.abs(X - view.X), Math.abs(Y - view.Y)) * k * view.s > 0.05) view.set(view.X + (X - view.X) * k, view.Y + (Y - view.Y) * k);
     follow.lastX = view.X; follow.lastY = view.Y; follow.lastS = view.s;
   }
   // Turning the camera moves the view's screen coordinates at a stroke (same ground point, new projection), which the
   // check above would take for a pan: the next step starts afresh instead.
   app.on("rotate", () => { if (follow.id) follow.phase = "fly"; });
 
-  // ------------------------------------------------------------------------------------------------ frame
-  let lastP = performance.now();
-  const perf = { ms: 0, n: 0 };
-  app.on("frame", (f) => {
-    const t0 = performance.now();
-    const dt = Math.min(0.25, (t0 - lastP) / 1000);
-    lastP = t0;
+  // ------------------------------------------------------------------------------------------------ simulation and pace
+  // The buses' motion is integrated in every map frame. The map only draws while something moves on screen, so between
+  // frames the network tick (4 Hz) carries the motion on, and wakes the map when a bus on screen starts to move (or
+  // drives into view). Steps are split to ≤ 0.1 s: the correction springs are integrated explicitly.
+  let lastSimAt = performance.now();
+  function simulate(nowP) {
+    const span = Math.min(1, Math.max(0, (nowP - lastSimAt) / 1000));
+    lastSimAt = nowP;
+    if (span <= 0) return;
+    const n = Math.ceil(span / 0.1), dt = span / n;
     let dropped = false;
     for (const [id, T] of tracks) {
-      const wasStale = T.stale;
-      updateTrack(T, dt, t0);
+      const wasStale = T.stale, x0 = T.x, y0 = T.y, h0 = T.hdg, a0 = T.alpha * T.appear;
+      for (let k = 0; k < n; k++) updateTrack(T, dt, nowP);
+      // how fast it changes on screen: metres per second moved (a turn counts its nose's swing), and fade per second
+      T.mv = T.mode ? (Math.hypot(T.x - x0, T.y - y0) + Math.abs(angDiff(T.hdg, h0)) * (Math.PI / 180) * BUS.L * 0.5) / span : 0;
+      T.fadeV = Math.abs(T.alpha * T.appear - a0) / span;
       if (T.stale !== wasStale && T.mode) dropped = true;
       if ((T.goneAt || T.age > DROP_MS) && T.alpha < 0.02) {
         tracks.delete(id); dropped = true;
@@ -1280,8 +1303,47 @@ export function init(app) {
       }
     }
     if (dropped) publish(false);
+  }
+  // Frames per second the buses need right now: enough for a step of about BUS_STEP px between frames for the fastest
+  // bus on screen (3D buses at least 8, far-out markers at least 3, at most 30), more while one fades in or out, 12 for
+  // the selected bus's breathing halo; 0 when none on screen changes.
+  const BUS_STEP = 1.5;
+  let lastAsk = 0;
+  function busesWant() {
+    if (!tracks.size || !app.layerEnabled("buses")) return 0;
+    setCam();
+    const s = cam.s, big = s >= MARKER_S, m = 40 + BUS.L * s;
+    let pxps = 0, fade = false, halo = false;
+    for (const T of tracks.values()) {
+      if (!T.mode || (T.alpha * T.appear <= 0.01 && T.fadeV < 0.01) || offSlab(T.x, T.y) > 0) continue;
+      const sx = cam.a * T.x + cam.b * T.y + cam.c, sy = cam.d * T.x + cam.e * T.y + cam.f;
+      if (sx < -m || sx > cam.w + m || sy < -m || sy > cam.h + m) continue;
+      const v = T.mv * s;
+      if (v > pxps) pxps = v;
+      if (T.fadeV > 0.02) fade = true;
+      if (big && isHi(T) && s > 0.8) halo = true;
+    }
+    let want = pxps > 0.4 ? clamp(pxps / BUS_STEP, big ? 8 : 3, 30) : 0;
+    if (fade) want = Math.max(want, big ? 15 : 8);
+    if (halo && !reduceMotion.matches) want = Math.max(want, 12);
+    return want;
+  }
+  // between frames (from the network tick): carry the motion on; wake the map if the buses now need frames
+  function idleStep() {
+    const nowP = performance.now();
+    if (nowP - lastSimAt < 200) return;   // frames are coming: they do it
+    simulate(nowP);
+    if (lastAsk === 0 && busesWant() > 0) app.requestRender("buses");
+  }
+
+  // ------------------------------------------------------------------------------------------------ frame
+  const perf = { ms: 0, n: 0 };
+  app.on("frame", (f) => {
+    const t0 = performance.now();
+    simulate(t0);
     followStep(f.dt);
     if (card && card.anchor && card.kind === "bus") { const T = tracks.get(card.id); if (T) { card.anchor.x = T.x; card.anchor.y = T.y; } }
+    if (transitDue) flushTransit();
     perf.ms += performance.now() - t0;
   });
 
@@ -1293,7 +1355,7 @@ export function init(app) {
   // colours lifts the lines above the night tint. Stop poles are static too, so they go in the same tiles, each followed
   // by the objects standing in front of it, erased the same way. Tiles render a few at a time between frames; until one
   // is ready its parent stands in, else the lines and poles are drawn directly (unoccluded).
-  const OT = { cache: new Map(), want: new Map(), pool: [], cover: new Map(), ver: 1, timer: 0, frame: 0, max: app.mobile ? 22 : 44, ms: 0, n: 0 };
+  const OT = { cache: new Map(), want: new Map(), pool: [], cover: new Map(), ver: 1, gen: 0, timer: 0, frame: 0, max: app.mobile ? 22 : 44, ms: 0, n: 0, exact: true };
   const newCanvas = () => (typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(TS, TS) : Object.assign(document.createElement("canvas"), { width: TS, height: TS }));
   app.on("style", () => { OT.ver++; });
   let lastDpr = view.dpr;
@@ -1448,6 +1510,7 @@ export function init(app) {
     OT.timer = setTimeout(() => {
       OT.timer = 0;
       const t0 = performance.now();
+      let made = false;
       // a few milliseconds of painting between frames, nearest the centre first
       while (OT.want.size && performance.now() - t0 < 7) {
         let best = null, bk = null;
@@ -1462,9 +1525,13 @@ export function init(app) {
         const old = OT.cache.get(bk);
         if (old && old.c !== c) OT.pool.push(old.c);
         OT.cache.set(bk, { c, ver, used: OT.frame });
+        OT.gen++;
+        made = true;
         evictTiles();
       }
       if (OT.want.size) pumpTiles();
+      // the map only draws when asked: show what just came in (each batch is wanted by the view, so it shows)
+      if (made) app.requestRender("bus-tiles");
     }, 0);
   }
   function evictTiles() {
@@ -1483,7 +1550,7 @@ export function init(app) {
     const L = level(z);
     ctx.globalAlpha = alpha;
     if (z < TILE_Z0) {
-      if (lines) { groundXform(ctx); strokeRoutes(ctx, set, L, viewGroundBox(L.halo), dark); }
+      if (lines) { groundXform(ctx); strokeRoutes(ctx, set, L, viewGroundBox(L.halo), dark); bbAdd(-1e9, -1e9, 1e9, 1e9); }
       return;
     }
     const k = L.k, s = view.s, dpr = view.dpr, r = view.rot;
@@ -1502,13 +1569,15 @@ export function init(app) {
       const dx0 = edgeX((tx * TS) / k), dx1 = edgeX(((tx + 1) * TS) / k), dy0 = edgeY((ty * TS) / k), dy1 = edgeY(((ty + 1) * TS) / k);
       const e = OT.cache.get(key);
       const dist = Math.hypot(((tx + 0.5) * TS) / k - cx, ((ty + 0.5) * TS) / k - cy) * k;
+      bbAdd(dx0, dy0, dx1, dy1);
       if (e) {
         e.used = OT.frame;
         ctx.drawImage(e.c, dx0, dy0, dx1 - dx0, dy1 - dy0);
-        if (e.ver !== OT.ver) wantTile(key, { set, dark, lines, poles, r, z, tx, ty }, 1e9 + dist);
+        if (e.ver !== OT.ver) { wantTile(key, { set, dark, lines, poles, r, z, tx, ty }, 1e9 + dist); OT.exact = false; }
         continue;
       }
       wantTile(key, { set, dark, lines, poles, r, z, tx, ty }, dist);
+      OT.exact = false;   // a stand-in: the picture is not final
       // the parent tile, scaled, if we have it
       const pe = OT.cache.get(tileKey(set, dark, lines, poles, r, z - 1, tx >> 1, ty >> 1));
       if (pe && z - 1 >= TILE_Z0) {
@@ -1547,23 +1616,75 @@ export function init(app) {
     ctx.globalAlpha = 1;
   }
   // lines, and the stop poles when they are on and near enough to be poles
-  function drawGround(ctx, lines) {
+  function drawGround(ctx, lines, f) {
     const poles = app.layerEnabled("stops") && view.s >= POLE_S && stopList.length > 0;
     projectStops();
+    if (!lines && !poles) return;
     // after dark the routes' own dark-mode colours (lighter) take over, so the lines survive the night tint while
     // everything that drives over them still covers them. Laid over the day set they cross-fade through dusk; once
-    // they are opaque the day set beneath would be hidden, so it is not drawn (nor are its tiles rendered).
-    const night = nightLevel(), a = night > 0.05 ? Math.min(1, night * 1.1) : 0;
+    // they are opaque the day set beneath would be hidden, so it is not drawn (nor are its tiles rendered). The blend
+    // moves in 64ths, so a still picture is not recomposed for every imperceptible step of dusk.
+    const night = nightLevel(), a = night > 0.05 ? Math.round(Math.min(1, night * 1.1) * 64) / 64 : 0;
+    const hi = selectedRoute(), W = app.canvas.width, H = app.canvas.height, K = RC.k;
+    if (RC.c && K.X === view.X && K.Y === view.Y && K.s === view.s && K.rot === view.rot && K.W === W && K.H === H && K.dpr === view.dpr &&
+      K.ver === OT.ver && K.gen === OT.gen && K.geom === geomVer && K.hi === hi && K.lines === lines && K.poles === poles && K.a === a) {
+      blitGround(ctx);
+      return;
+    }
+    K.X = NaN;
+    if (f.moving || !W || !H) { paintGround(ctx, lines, poles, a); return; }
+    // a still view: compose once, then copy (also this frame)
+    if (!RC.c || RC.c.width !== W || RC.c.height !== H) {
+      RC.c = typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(W, H) : Object.assign(document.createElement("canvas"), { width: W, height: H });
+      RC.g = RC.c.getContext("2d");
+    }
+    const g = RC.g;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalAlpha = 1; g.globalCompositeOperation = "source-over";
+    g.clearRect(0, 0, W, H);
+    g.imageSmoothingQuality = ctx.imageSmoothingQuality;
+    OT.exact = true;
+    const B = RC.bb;
+    B[0] = B[1] = Infinity; B[2] = B[3] = -Infinity;
+    paintGround(g, lines, poles, a);
+    // the part painted, on whole pixels inside the canvas (empty: x0 ≥ x1)
+    B[0] = Math.max(0, Math.floor(B[0])); B[1] = Math.max(0, Math.floor(B[1])); B[2] = Math.min(W, Math.ceil(B[2])); B[3] = Math.min(H, Math.ceil(B[3]));
+    // only a picture made of final tiles is kept (until then each arriving batch draws a frame and recomposes)
+    if (OT.exact) {
+      K.X = view.X; K.Y = view.Y; K.s = view.s; K.rot = view.rot; K.W = W; K.H = H; K.dpr = view.dpr;
+      K.ver = OT.ver; K.gen = OT.gen; K.geom = geomVer; K.hi = hi; K.lines = lines; K.poles = poles; K.a = a;
+    }
+    blitGround(ctx);
+  }
+  function blitGround(ctx) {
+    const B = RC.bb, w = B[2] - B[0], h = B[3] - B[1];
+    if (w <= 0 || h <= 0) return;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.globalAlpha = 1;
+    ctx.drawImage(RC.c, B[0], B[1], w, h, B[0], B[1], w, h);
+  }
+  // grow the box of what the composition holds (device px); drawing straight onto the map, it is not needed
+  function bbAdd(x0, y0, x1, y1) {
+    const B = RC.bb;
+    if (x0 < B[0]) B[0] = x0; if (y0 < B[1]) B[1] = y0; if (x1 > B[2]) B[2] = x1; if (y1 > B[3]) B[3] = y1;
+  }
+  function paintGround(ctx, lines, poles, a) {
     if (a < 0.999) drawRoutes(ctx, 1, false, lines, poles);
     if (a > 0) drawRoutes(ctx, a, true, lines, poles);
   }
+  // A still view's lines and poles are composed once into a canvas the size of the map and copied 1:1 in the frames after
+  // (scaling a screenful of overlay tiles, or stroking every route from afar, costs 10–20 ms a frame on a canvas without
+  // a GPU; the copy about 1). While the view moves they are drawn straight onto the map.
+  const RC = { c: null, g: null, bb: [0, 0, 0, 0], k: { X: NaN, Y: 0, s: 0, rot: 0, W: 0, H: 0, dpr: 0, ver: 0, gen: 0, geom: 0, hi: null, lines: false, poles: false, a: 0 } };
+  app.on("layers", () => { if (!app.layerEnabled("routes") && !app.layerEnabled("stops")) { RC.c = RC.g = null; RC.k.X = NaN; } });
   app.addLayer({
     id: "routes", z: 10,
+    fps: 0,   // still: what moves over the lines (buses) asks for its own frames
     draw(ctx, f) {
       OT.frame = f.frame;
       if (!routes.length || !geomVer) return;
       setCam();
-      drawGround(ctx, true);
+      drawGround(ctx, true, f);
     },
     hit(px, py) {
       if (!geomVer || view.s < 0.25) return null;
@@ -1598,13 +1719,14 @@ export function init(app) {
   const visStops = [];
   app.addLayer({
     id: "stops", z: 20,
+    fps: 0,
     draw(ctx, f) {
       OT.frame = f.frame;
       if (!stopList.length) return;
       setCam();
       if (cam.s < POLE_S) { projectStops(); for (const st of visStops) drawStopDot(ctx, st); return; }
       // the poles live in the route tiles; with the route lines switched off, draw those tiles here
-      if (!app.layerEnabled("routes")) drawGround(ctx, false);
+      if (!app.layerEnabled("routes")) drawGround(ctx, false, f);
       // the selected stop stands out: drawn again, a size up, over its tile
       const st = sel.kind === "stop" && stops.get(sel.id);
       if (st && st.vis) {
@@ -1723,12 +1845,16 @@ export function init(app) {
       T.sx = sx; T.sy = sy; T.depth = T.x * cam.D0 + T.y * cam.D1;
       visBuses.push(T);
     }
-    visBuses.sort((a, b) => b.depth - a.depth);
+    visBuses.sort(byDepthDesc);
   }
+  const byDepthDesc = (a, b) => b.depth - a.depth;
+  const OCC = [0, 0, 0, 0], FRONT_OPTS = { buildingsOnly: true };   // scratch (no allocation per frame)
   const isHi = (T) => (sel.kind === "bus" && sel.id === T.id) || follow.id === T.id;
 
   app.addLayer({
     id: "buses", z: 50,
+    // after each frame: what the buses on screen need (see busesWant); the tags and lights move with them
+    fps() { lastAsk = busesWant(); return lastAsk; },
     draw(ctx, f) {
       const t0 = performance.now();
       setCam();
@@ -1742,7 +1868,8 @@ export function init(app) {
             const R = drawHalo(ctx, T, f.t), rx = R * cam.s + 2, ry = R * cam.s * SIN_T + 2;
             ctx.setTransform(cam.dpr, 0, 0, cam.dpr, 0, 0);
             ctx.globalAlpha = 1;
-            app.occlude(ctx, T.x, T.y, [T.sx - rx, T.sy - ry, T.sx + rx, T.sy + ry], R);
+            OCC[0] = T.sx - rx; OCC[1] = T.sy - ry; OCC[2] = T.sx + rx; OCC[3] = T.sy + ry;
+            app.occlude(ctx, T.x, T.y, OCC, R);
           }
           drawBus(ctx, T, night);
           T.drawn = true;
@@ -1750,7 +1877,8 @@ export function init(app) {
           ctx.globalAlpha = 1;
           const hw = 0.5 * (BUS.L * Math.abs(T.fx * cam.R0 + T.fy * cam.R1) + BUS.W * Math.abs(T.fy * cam.R0 - T.fx * cam.R1));
           T.hw = hw;
-          T.occ = app.occlude(ctx, T.x, T.y, [T.bb0 - 1, T.bb1 - 1, T.bb2 + 1, T.bb3 + 1], hw);
+          OCC[0] = T.bb0 - 1; OCC[1] = T.bb1 - 1; OCC[2] = T.bb2 + 1; OCC[3] = T.bb3 + 1;
+          T.occ = app.occlude(ctx, T.x, T.y, OCC, hw);
           // the night glow (drawn above the tint, so not occluded) is held back only where a building is in front
           T.occB = night > 0.05 && T.occ > 0 && buildingInFront(T, hw);
         }
@@ -1786,7 +1914,7 @@ export function init(app) {
     onHover(t, e) { setHover(t ? "bus" : null, t && t.id, e); },
   });
 
-  const buildingInFront = (T, hw) => app.inFront(T.x, T.y, [T.bb0, T.bb1, T.bb2, T.bb3], hw, { buildingsOnly: true }).length > 0;
+  const buildingInFront = (T, hw) => { OCC[0] = T.bb0; OCC[1] = T.bb1; OCC[2] = T.bb2; OCC[3] = T.bb3; return app.inFront(T.x, T.y, OCC, hw, FRONT_OPTS).length > 0; };
   /** is the pixel (px, py) on a building that stands in front of ground point (x, y)? Then the building is what shows
    *  there, and it should take the click. */
   function behindBuilding(x, y, hw, px, py) {
@@ -1797,18 +1925,38 @@ export function init(app) {
   function nightLevel() { if (!app.layerEnabled("sky")) return 0; const W = app.weather; return W && Number.isFinite(W.night) ? clamp(W.night, 0, 1) : 0; }
 
   // a soft pool of light on the ground round the selected or followed bus, ringed in its route colour
+  const ringCol = new Map();   // route colour → the ring's rgba
   function drawHalo(ctx, T, t) {
     const pulse = reduceMotion.matches ? 1 : 1 + 0.06 * Math.sin(t / 420);
     groundXform(ctx);
     const col = T.route ? T.route.color : "#b3202a", R = 10.5 * pulse;
-    const g = ctx.createRadialGradient(T.x, T.y, 0, T.x, T.y, R);
-    g.addColorStop(0, "rgba(255, 250, 235, .7)"); g.addColorStop(0.62, "rgba(255, 250, 235, .35)"); g.addColorStop(1, "rgba(255, 250, 235, 0)");
-    ctx.fillStyle = g;
-    ctx.beginPath(); ctx.arc(T.x, T.y, R, 0, Math.PI * 2); ctx.fill();
-    ctx.strokeStyle = rgba(col, 0.55); ctx.lineWidth = Math.max(0.35, 1.6 / cam.s);
+    if (SPR.halo) ctx.drawImage(SPR.halo, T.x - R, T.y - R, 2 * R, 2 * R);
+    let ring = ringCol.get(col);
+    if (!ring) ringCol.set(col, (ring = rgba(col, 0.55)));
+    ctx.strokeStyle = ring; ctx.lineWidth = Math.max(0.35, 1.6 / cam.s);
     ctx.beginPath(); ctx.arc(T.x, T.y, R * 0.86, 0, Math.PI * 2); ctx.stroke();
     return R;
   }
+  // light sprites, drawn once: the halo's pool (a disc of radius 1 in a 2 × 2 square) and a headlight pool on the road
+  // (u forward 0…BEAM.L m, v across ±BEAM.W m, as BEAM.px px per metre), both laid on the ground by the transform
+  const BEAM = { L: 22, W: 4.5, px: 8 };
+  const SPR = (() => {
+    const mk = (w, h) => (typeof OffscreenCanvas !== "undefined" ? new OffscreenCanvas(w, h) : Object.assign(document.createElement("canvas"), { width: w, height: h }));
+    try {
+      const halo = mk(128, 128), h = halo.getContext("2d");
+      const g = h.createRadialGradient(64, 64, 0, 64, 64, 64);
+      g.addColorStop(0, "rgba(255, 250, 235, .7)"); g.addColorStop(0.62, "rgba(255, 250, 235, .35)"); g.addColorStop(1, "rgba(255, 250, 235, 0)");
+      h.fillStyle = g; h.beginPath(); h.arc(64, 64, 64, 0, Math.PI * 2); h.fill();
+      const k = BEAM.px, bw = Math.round(BEAM.L * k), bh = Math.round(2 * BEAM.W * k);
+      const beam = mk(bw, bh), b = beam.getContext("2d");
+      const lg = b.createLinearGradient(0, 0, bw, 0);
+      lg.addColorStop(0, "rgba(255, 224, 165, .5)"); lg.addColorStop(1, "rgba(255, 224, 165, 0)");
+      b.fillStyle = lg;
+      const c = bh / 2, hw = (BUS.W / 2) * k;
+      b.beginPath(); b.moveTo(0, c - hw); b.lineTo(0, c + hw); b.lineTo(bw, bh); b.lineTo(bw, 0); b.closePath(); b.fill();
+      return { halo, beam };
+    } catch { return {}; }
+  })();
 
   // The bus: a box 12 × 2.55 × 2.85 m on 0.32 m of clearance. Each visible face is drawn in its own flat frame (u along
   // the face, h up it) by putting the face's projection into the canvas transform — the view is affine, so rectangles
@@ -1950,6 +2098,7 @@ export function init(app) {
   // ------------------------------------------------------------------------------------------------ layer: lights (night)
   app.addLayer({
     id: "bus-lights", z: 84,
+    fps: 0,   // drawn with the buses, at their pace
     draw(ctx) {
       const night = nightLevel();
       if (night < 0.05) return;
@@ -1961,46 +2110,48 @@ export function init(app) {
         const a = night * T.alpha * T.appear * (T.occB ? 0.3 : 1);
         if (a < 0.02) continue;
         const fx = T.fx, fy = T.fy, rx = fy, ry = -fx, hl = BUS.L / 2, hw = BUS.W / 2;
-        // headlight pools on the road ahead
-        groundXform(ctx);
-        const x0 = T.x + fx * hl, y0 = T.y + fy * hl;
-        const g = ctx.createLinearGradient(x0, y0, x0 + fx * 22, y0 + fy * 22);
-        g.addColorStop(0, `rgba(255, 224, 165, ${0.5 * a})`); g.addColorStop(1, "rgba(255, 224, 165, 0)");
-        ctx.fillStyle = g;
-        ctx.beginPath();
-        ctx.moveTo(x0 - rx * hw, y0 - ry * hw); ctx.lineTo(x0 + rx * hw, y0 + ry * hw);
-        ctx.lineTo(x0 + fx * 22 + rx * 4.5, y0 + fy * 22 + ry * 4.5); ctx.lineTo(x0 + fx * 22 - rx * 4.5, y0 + fy * 22 - ry * 4.5);
-        ctx.closePath(); ctx.fill();
+        // headlight pools on the road ahead: the sprite laid in the bus's ground frame (u ahead, v across)
+        if (SPR.beam) {
+          groundXform(ctx);
+          ctx.transform(fx, fy, rx, ry, T.x + fx * hl, T.y + fy * hl);
+          ctx.globalAlpha = a;
+          ctx.drawImage(SPR.beam, 0, -BEAM.W, BEAM.L, 2 * BEAM.W);
+          ctx.globalAlpha = 1;
+        }
         // lit windows, the sign, the tail lamps
         const Fx = cam.a * fx + cam.b * fy, Fy = cam.d * fx + cam.e * fy, Rx = cam.a * rx + cam.b * ry, Ry = cam.d * rx + cam.e * ry, zf = cam.zf;
         const rd = rx * cam.D0 + ry * cam.D1, fd = fx * cam.D0 + fy * cam.D1;
         if (Math.abs(rd) > 0.015 && !T.occB) {
           const sg = rd < 0 ? 1 : -1;
           ctx.setTransform(dpr * Fx, dpr * Fy, 0, dpr * zf, dpr * (T.sx + Rx * hw * sg - Fx * hl), dpr * (T.sy + Ry * hw * sg - Fy * hl + zf * BUS.clear));
-          ctx.fillStyle = `rgba(255, 196, 112, ${0.78 * a})`;
+          ctx.fillStyle = "rgb(255, 196, 112)"; ctx.globalAlpha = 0.78 * a;
           ctx.fillRect(0.5, 1.2, BUS.L - 1.0, 1.12);
         }
         if (Math.abs(fd) > 0.015) {
           const front = fd < 0, sg = front ? 1 : -1;
           ctx.setTransform(dpr * Rx, dpr * Ry, 0, dpr * zf, dpr * (T.sx + Fx * hl * sg - Rx * hw), dpr * (T.sy + Fy * hl * sg - Ry * hw + zf * BUS.clear));
-          if (front) { ctx.fillStyle = `rgba(255, 180, 70, ${0.8 * a})`; ctx.fillRect(0.28, 2.5, BUS.W - 0.56, 0.24); ctx.fillStyle = `rgba(255, 245, 215, ${a})`; ctx.fillRect(0.14, 0.34, 0.38, 0.16); ctx.fillRect(BUS.W - 0.52, 0.34, 0.38, 0.16); }
-          else { ctx.fillStyle = `rgba(255, 60, 40, ${0.8 * a})`; ctx.fillRect(0.1, 0.36, 0.26, 0.5); ctx.fillRect(BUS.W - 0.36, 0.36, 0.26, 0.5); }
+          if (front) { ctx.fillStyle = "rgb(255, 180, 70)"; ctx.globalAlpha = 0.8 * a; ctx.fillRect(0.28, 2.5, BUS.W - 0.56, 0.24); ctx.fillStyle = "rgb(255, 245, 215)"; ctx.globalAlpha = a; ctx.fillRect(0.14, 0.34, 0.38, 0.16); ctx.fillRect(BUS.W - 0.52, 0.34, 0.38, 0.16); }
+          else { ctx.fillStyle = "rgb(255, 60, 40)"; ctx.globalAlpha = 0.8 * a; ctx.fillRect(0.1, 0.36, 0.26, 0.5); ctx.fillRect(BUS.W - 0.36, 0.36, 0.26, 0.5); }
         }
+        ctx.globalAlpha = 1;
       }
       ctx.globalCompositeOperation = "source-over";
     },
   });
 
   // ------------------------------------------------------------------------------------------------ layer: tags (markers, pills, labels)
-  const textW = new Map();
+  const textW = new Map();   // font → text → width
   function measure(ctx, font, text) {
-    const key = font + "|" + text;
-    let w = textW.get(key);
-    if (w == null) { ctx.font = font; w = ctx.measureText(text).width; textW.set(key, w); }
+    let m = textW.get(font);
+    if (!m) textW.set(font, (m = new Map()));
+    let w = m.get(text);
+    if (w == null) { if (m.size > 500) m.clear(); ctx.font = font; w = ctx.measureText(text).width; m.set(text, w); }
     return w;
   }
+  const MARKER_FONT = ["700 8px Inter, system-ui, sans-serif", "700 6.6px Inter, system-ui, sans-serif"];
   app.addLayer({
     id: "bus-tags", z: 92,
+    fps: 0,   // markers and pills move with the buses (their layer asks for the frames); labels are still
     draw(ctx, f) {
       setCam();
       const s = cam.s;
@@ -2071,8 +2222,7 @@ export function init(app) {
     ctx.fillStyle = col; ctx.fill();
     ctx.lineWidth = 1.6; ctx.strokeStyle = "#fbf8f1"; ctx.stroke();
     const code = route ? route.code : "?";
-    const size = code.length <= 2 ? 8 : 6.6;
-    const font = `700 ${size}px Inter, system-ui, sans-serif`;
+    const font = MARKER_FONT[code.length <= 2 ? 0 : 1];
     ctx.font = font; ctx.fillStyle = route ? route.ink : "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
     const tw = measure(ctx, font, code), maxW = R * 2 - 3;
     if (tw > maxW) { ctx.save(); ctx.translate(x, y + 0.4); ctx.scale(maxW / tw, 1); ctx.fillText(code, 0, 0); ctx.restore(); }
