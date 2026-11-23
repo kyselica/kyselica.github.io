@@ -3,15 +3,18 @@
 // None of this is live data. Cars and people are a small agent simulation whose numbers follow the campus clock (rush
 // hours, class changes, quiet nights, lighter weekends). Only the neighbourhood of the view is simulated: the view plus a
 // margin that is kept populated off screen, so panning finds streets already busy instead of watching them fill. Whatever
-// has to appear inside the view (after a jump or a zoom) fades in rather than popping.
+// has to appear inside the view (after a jump or a zoom) fades in rather than popping. Cars live a few minutes each and
+// are replaced off screen, so the mix of busy and quiet streets keeps to the density table instead of drifting.
 //
 // Cars drive on the right in their lanes, respect one-ways, keep a gap to the car ahead (the Intelligent Driver Model),
 // slow for turns, stop at stop signs, yield at unsignalled junctions and obey signals (each cluster of signal nodes runs
-// two phases). People walk with a little sideways spread, a few cycle, and the Oval swells at class changes.
+// two phases). People walk with a little sideways spread, a few cycle, and the Oval swells at class changes. Both leave
+// the map only where the build cut the graph at the slab's edge, and go out of sight inside buildings.
 //
 // Drawing: little 3D cars back to front (strokes of paint from afar), tiny walkers, and at night beams and lamps in an
-// additive layer. Whatever stands in front of a car or a person is left showing by clipping its silhouette out of the
-// drawing (the tiles beneath already show it), which looks like app.occlude but costs a fraction of redrawing it.
+// additive layer. Whatever stands in front of a car or a person (a building, a tree, a lamp post, a bridge deck above) is
+// left showing by clipping its outline out of the drawing (the tiles beneath already show it), which looks like
+// app.occlude but costs a fraction of redrawing it. The outlines come from the renderer itself, so they match the art.
 
 // ------------------------------------------------------------------------------------------------ tables
 // road classes: [speed m/s, rank, cars per km per direction at the busiest hour, default width m]
@@ -94,10 +97,15 @@ const FAR_S = 2.2;           // …as strokes of paint below this, as little 3D 
 const PEOPLE_SIM_S = 1.6;    // people are simulated from here…
 const PEOPLE_MIN_S = 2;      // …and drawn from here (as a few batched fills)…
 const PEOPLE_DETAIL_S = 10;   // …one by one, shaded and cut round what stands in front, from here
+const CAR_LIFE = [60, 180];  // seconds a car is kept before it may be replaced (when out of sight)
+const EXIT = 8;              // graph node flag (build-data): where the graph was cut at the slab's edge
+// bridge decks as render.js draws them: the deck spreads this far past the road (path) on each side; its railings stand
+// about a metre above it and its edge shows a metre below
+const DECK_EDGE_ROAD = 1.3, DECK_EDGE_PATH = 0.5, DECK_UP = 1.05, DECK_DOWN = 1.1;
 
 // ------------------------------------------------------------------------------------------------ the module
 export function init(app) {
-  const { data, geo, view } = app;
+  const { data, geo, view, renderer } = app;
   if (!data || !data.drive || !data.drive.edges || !data.drive.edges.length) return;
   const { SIN_T, COS_T } = geo;
   const world = data.world;
@@ -128,6 +136,27 @@ export function init(app) {
   }) : null;
   const carSampler = makeSampler(carPieces), walkSampler = walkPieces ? makeSampler(walkPieces) : null;
 
+  // ---------------------------------------------------------------- the slab's edge, buildings, bridge decks
+  // how far a ground point lies outside the slab (≤ 0 on it); the graphs of older data run on past the edge
+  const offSlab = (x, y) => Math.max(world.x0 - x, x - world.x1, world.y0 - y, y - world.y1);
+  // a dead end on the slab's edge, where traffic comes onto the map and leaves it
+  const isExit = (net, n) => { const d = offSlab(net.nx[n], net.ny[n]); return net.nEdge[n] && net.deg[n] === 1 && d > -8 && d < 1; };
+  const solids = makeSolids(data.buildings);
+  const decks = makeDecks(data);
+  // How much of something at s along link l shows: 1 in the open, 0 inside a building, fading over `fade` metres before
+  // the wall (seen from behind, the building hides the approach anyway; from in front, it is a doorway).
+  function outdoors(net, l, s, fade) {
+    const rs = insideOf(net, l >> 1, solids);
+    if (!rs) return 1;
+    const se = l & 1 ? net.eLen[l >> 1] - s : s;
+    let v = 1;
+    for (let k = 0; k < rs.length; k += 2) {
+      const d = se < rs[k] ? rs[k] - se : se > rs[k + 1] ? se - rs[k + 1] : 0;
+      if (d < fade) v = Math.min(v, d / fade);
+    }
+    return v;
+  }
+
   // ---------------------------------------------------------------- per-frame camera (CSS px from ground metres)
   // px = PA·x + PB·y + PE,  py = PC·x + PD·y + PF − PK·z
   let PA = 0, PB = 0, PC = 0, PD = 0, PE = 0, PF = 0, PK = 0, VW = 1, VH = 1, SCALE = 1, ROT = 0;
@@ -136,12 +165,16 @@ export function init(app) {
   // whatever the rotation; x0…y1 is their bounding box on the ground, for the spawn grid.
   const newRegion = () => ({ u0: 0, u1: 0, v0: 0, v1: 0, x0: 0, y0: 0, x1: 0, y1: 0, U0: 0, U1: 0, D0: 0, D1: 0 });
   const region = newRegion();
+  // the same camera for renderer.silhouette (CSS px = X·k − ox), and the tiles' level of detail, so outlines match them
+  const CAM = { k: 1, lod: 1, ox: 0, oy: 0 };
   function setCamera() {
     const o = geo.ROTS[view.rot], s = view.s;
     ROT = view.rot; SCALE = s; VW = view.w; VH = view.h;
     U0 = o.R[0]; U1 = o.R[1]; D0 = o.D[0]; D1 = o.D[1];
     PA = s * U0; PB = s * U1; PC = -s * SIN_T * D0; PD = -s * SIN_T * D1;
     PE = VW / 2 - view.X * s; PF = VH / 2 - view.Y * s; PK = s * COS_T;
+    CAM.k = s; CAM.ox = -PE; CAM.oy = -PF;
+    CAM.lod = app.tiles && app.tiles.levelFor ? Math.pow(2, app.tiles.levelFor(view)) : s * view.dpr;
   }
   // the ground under the screen: u from the screen's left to right edge, v from its bottom to its top edge (plus a
   // strip beyond the top, where tall things standing past the edge still show)
@@ -198,8 +231,11 @@ export function init(app) {
     cyclistShare = wet || snowy || storm ? 0.25 : 1;
     const n = Number.isFinite(wx.night) ? wx.night : nightFromSun(sunAltitude(now, data.origin.lat, data.origin.lon));
     const murk = code === 45 || code === 48 || storm || code === 65 || code === 75 || code === 82 ? 0.35 : 0;
-    night = Math.max(0, Math.min(1, Math.max(n, murk)));
+    // with "Real sky & weather" off the map is drawn in daylight, where beams and lamps would only be white smudges
+    night = app.layerEnabled("sky") ? Math.max(0, Math.min(1, Math.max(n, murk))) : 0;
   }
+  // a switched layer (the sky) takes effect at once, not at the next once-a-second reading
+  app.on("layers", () => { clockAt = -1e9; });
 
   // ================================================================================================ cars
   const CAP = 1024;
@@ -209,11 +245,13 @@ export function init(app) {
   const cOff = new Float32Array(CAP), cPrevOff = new Float32Array(CAP);
   const cType = new Uint8Array(CAP), cCol = new Uint8Array(CAP), cCargo = new Uint8Array(CAP);
   const cStopT = new Float32Array(CAP), cStopDone = new Uint8Array(CAP), cGo = new Uint8Array(CAP), cWait = new Float32Array(CAP);
-  const cAlpha = new Float32Array(CAP), cFade = new Int8Array(CAP), cDead = new Uint8Array(CAP);
+  // cAlpha: fading in or out of the population; cShow: how much of the car is drawn (cAlpha, less where it goes into a
+  // building or off the slab); cLife: seconds left before it may be replaced
+  const cAlpha = new Float32Array(CAP), cFade = new Int8Array(CAP), cDead = new Uint8Array(CAP), cShow = new Float32Array(CAP), cLife = new Float32Array(CAP);
   const cX = new Float32Array(CAP), cY = new Float32Array(CAP), cHx = new Float32Array(CAP), cHy = new Float32Array(CAP);
   const cOccT = new Float32Array(CAP), cOcc = new Uint8Array(CAP), cBeamT = new Float32Array(CAP), cBeam = new Uint8Array(CAP), cKey = new Int32Array(CAP);
   const CAR_FIELDS = [cLink, cNext, cPrev, cLane, cNextLane, cWant, cS, cV, cA, cSpd, cOff, cPrevOff, cType, cCol, cCargo,
-    cStopT, cStopDone, cGo, cWait, cAlpha, cFade, cDead, cX, cY, cHx, cHy, cOccT, cOcc, cBeamT, cBeam];
+    cStopT, cStopDone, cGo, cWait, cAlpha, cFade, cDead, cShow, cLife, cX, cY, cHx, cHy, cOccT, cOcc, cBeamT, cBeam];
   let nCars = 0;
   const order = new Int32Array(CAP);
   const byKeyThenS = (a, b) => cKey[a] - cKey[b] || cS[a] - cS[b];
@@ -240,15 +278,12 @@ export function init(app) {
     carCand.copyWithin(i * CAND_STRIDE, j * CAND_STRIDE, (j + 1) * CAND_STRIDE);
   }
 
-  // a random car on link l at s, in lane (or a random lane); returns its index or -1 when the spot is taken
-  function spawnCar(l, s, fadeIn) {
+  // a car of type t on link l at s, in lane; returns its index or -1 when the spot is taken
+  function spawnCar(l, s, fadeIn, lane, t) {
     if (nCars >= CAP - 1) return -1;
-    const nl = R.lNl[l];
-    const lane = (Math.random() * nl) | 0;
     // keep clear of the cars already on this link (any lane: they may be changing lanes)
     for (let j = 0; j < nCars; j++) if (cLink[j] === l && Math.abs(cS[j] - s) < 11) return -1;
     const i = nCars++;
-    const t = pickCum(typeCum);
     cType[i] = t;
     // vans and trucks are mostly white; everything else follows the fleet
     cCol[i] = (t >= 4 && Math.random() < 0.55) ? WHITE : pickCum(paintCum);
@@ -257,7 +292,8 @@ export function init(app) {
     cSpd[i] = 0.88 + Math.random() * 0.22;
     cV[i] = ROAD_INFO[R.eCls[l >> 1]][0] * cSpd[i] * 0.7; cA[i] = 0;
     cStopT[i] = 0; cStopDone[i] = 0; cGo[i] = 0; cWait[i] = 0; cDead[i] = 0; cOccT[i] = 0; cOcc[i] = 0; cBeamT[i] = 0; cBeam[i] = 0;
-    cAlpha[i] = fadeIn ? 0 : 1; cFade[i] = fadeIn ? 1 : 0;
+    cAlpha[i] = fadeIn ? 0 : 1; cFade[i] = fadeIn ? 1 : 0; cShow[i] = cAlpha[i];
+    cLife[i] = CAR_LIFE[0] + Math.random() * (CAR_LIFE[1] - CAR_LIFE[0]);
     planAhead(i);
     carPose(i);
     cHx[i] = TX; cHy[i] = TY;
@@ -279,7 +315,7 @@ export function init(app) {
 
   function chooseNextCar(l) {
     const n = R.lTo[l], a0 = R.outStart[n], a1 = R.outStart[n + 1];
-    const hx = R.lHx1[l], hy = R.lHy1[l], rin = ROAD_INFO[R.eCls[l >> 1]][1];
+    const hx = R.lHx1[l], hy = R.lHy1[l], din = Math.max(0.1, ROAD_INFO[R.eCls[l >> 1]][2]);
     let tot = 0;
     for (let k = a0; k < a1; k++) {
       const m = R.outList[k];
@@ -287,10 +323,9 @@ export function init(app) {
       if (R.lOk[m] && (m >> 1) !== (l >> 1)) {
         const c = hx * R.lHx0[m] + hy * R.lHy0[m];
         w = c > 0.8 ? 1 : c > -0.3 ? 0.34 : 0.05;
-        const rout = ROAD_INFO[R.eCls[m >> 1]][1];
-        // stay on the bigger roads: side streets and parking lots take a small share
-        if (rout < rin) w *= rout <= 0 ? 0.04 : Math.pow(0.42, rin - rout);
-        else if (rout > rin) w *= 1.3;
+        // traffic shares out as the density table has the streets (the spawner's mix): busy roads draw more, side
+        // streets and service roads less. Leaning any harder toward the big roads piles every car onto High Street.
+        w *= Math.max(0.05, Math.min(1.5, ROAD_INFO[R.eCls[m >> 1]][2] / din));
       }
       WEIGHTS[k - a0] = w; tot += w;
     }
@@ -532,8 +567,14 @@ export function init(app) {
         if (left < 10) cAlpha[i] = Math.min(cAlpha[i], left / 10);
       }
       if (cDead[i]) continue;
+      cLife[i] -= dt;
       // where it is now; the heading follows the path over about a metre of travel, like a car
       carPose(i);
+      // off the slab (older data runs the streets on past its edge) it fades within a few metres and is gone; into a
+      // building (a garage, a drive under a block) it fades out over about its own length before the wall
+      const out = offSlab(PX, PY);
+      if (out >= 3) { cDead[i] = 1; continue; }
+      cShow[i] = cAlpha[i] * (out > 0 ? 1 - out / 3 : 1) * outdoors(R, l, cS[i], TYPE_HALF[cType[i]] + 1);
       cX[i] = PX; cY[i] = PY;
       const k = 1 - Math.exp(-(cV[i] * dt) / 1.1);
       let hx = cHx[i] + (TX - cHx[i]) * k, hy = cHy[i] + (TY - cHy[i]) * k;
@@ -548,23 +589,38 @@ export function init(app) {
   let carTarget = 0;
   // before the map is first shown, the streets fill at once; afterwards anything appearing in view fades in
   const instantFill = () => !app.status || !app.status.loaded;
+  // is ground point (x, y) on screen, or within m px of it (more above, where tall things stand up into view)?
   function onScreen(x, y, m) {
     const px = PA * x + PB * y + PE, py = PC * x + PD * y + PF;
     return px > -m && px < VW + m && py > -m - 30 && py < VH + m;
   }
+  // how far off screen a car of type t must be to be wholly out of sight: its half length and its height, in pixels
+  const carMargin = (t) => 30 + (TYPE_HALF[t] + TYPES[t].H) * SCALE;
   function manageCars() {
     // the region: what is on screen plus a margin that is kept busy off screen
     expandRegion(carRegion, region, marginFor(region, 0.25, 70, 320));
     carSampler.update(carRegion, 1, 0);
     carTarget = Math.min(CAR_CAP, Math.round(carSampler.total * carFactor));
-    // leave the region (with a little hysteresis) and you are gone
-    for (let i = 0; i < nCars; i++) if (cDead[i] || !inRegion(carRegion, cX[i], cY[i], 50)) cDead[i] = 1;
+    const far = SCALE < FAR_S;
+    for (let i = 0; i < nCars; i++) {
+      if (cDead[i]) continue;
+      // leave the region (with a little hysteresis) and you are gone
+      if (!inRegion(carRegion, cX[i], cY[i], 50)) { cDead[i] = 1; continue; }
+      // A car whose time is up is replaced by the spawner, which places cars by the density table: without this, the
+      // mix drifts to wherever routing gathers cars (the big roads, their queues) and the side streets empty. Out of
+      // sight it simply goes; in view it carries on until it leaves, except from afar, where a stroke of paint fading
+      // out goes unnoticed (else a view that holds most of the region would never be renewed).
+      if (cLife[i] < 0) {
+        if (!onScreen(cX[i], cY[i], carMargin(cType[i]))) cDead[i] = 1;
+        else if (far && cLife[i] < -60 && cFade[i] === 0) cFade[i] = -1;
+      }
+    }
     // too many (the clock moved on, or the view zoomed out): retire some, off screen first
     let excess = nCars - Math.round(carTarget * 1.15) - 2;
     for (let tries = 0; excess > 0 && tries < 12; tries++) {
       const i = (Math.random() * nCars) | 0;
       if (cDead[i]) continue;
-      if (!onScreen(cX[i], cY[i], 40)) { cDead[i] = 1; excess--; }
+      if (!onScreen(cX[i], cY[i], carMargin(cType[i]))) { cDead[i] = 1; excess--; }
       else if (cFade[i] === 0 && excess > nCars * 0.2) { cFade[i] = -1; excess--; }
     }
     for (let i = nCars - 1; i >= 0; i--) if (cDead[i]) removeCarAt(i);
@@ -581,13 +637,24 @@ export function init(app) {
       const se = carPieces.pS[p] + (Math.random() - 0.5) * carPieces.pLen[p];
       const fwd = R.lOk[2 * e], bwd = R.lOk[2 * e + 1];
       if (!fwd && !bwd) continue;
-      const dir = fwd && bwd ? (Math.random() < 0.5 ? 0 : 1) : fwd ? 0 : 1;
-      const l = 2 * e + dir, L = R.eLen[e];
-      const s = Math.max(0.5, Math.min(L - 0.5, dir ? L - se : se));
-      linkPoint(R, l, s, 0);
-      const vis = onScreen(PX, PY, 30);
-      if (vis && !jump) continue;
-      if (spawnCar(l, s, vis && !instant) >= 0) { made++; if (vis) stats.carsInView++; }
+      let dir = fwd && bwd ? (Math.random() < 0.5 ? 0 : 1) : fwd ? 0 : 1;
+      const L = R.eLen[e];
+      let s = Math.max(0.5, Math.min(L - 0.5, dir ? L - se : se));
+      // the car itself, chosen first, so the test below sees where it would really stand and how big it is
+      const t = pickCum(typeCum);
+      let lane = (Math.random() * R.lNl[2 * e + dir]) | 0;
+      linkPoint(R, 2 * e + dir, s, laneOff(2 * e + dir, lane));
+      if (offSlab(PX, PY) > -1) continue;
+      // seen: inside the view, and not inside a building
+      let vis = onScreen(PX, PY, carMargin(t)) && outdoors(R, 2 * e + dir, s, TYPE_HALF[t] + 1) > 0;
+      if (vis && !jump) {
+        // in plain view, cars only come in where the streets leave the map, driving onto it
+        if (fwd && isExit(R, R.eA[e])) { dir = 0; s = 0.5; }
+        else if (bwd && isExit(R, R.eB[e])) { dir = 1; s = 0.5; }
+        else continue;
+        lane = Math.min(lane, R.lNl[2 * e + dir] - 1);
+      }
+      if (spawnCar(2 * e + dir, s, vis && !instant, lane, t) >= 0) { made++; if (vis) stats.carsInView++; }
     }
   }
 
@@ -595,11 +662,12 @@ export function init(app) {
   const PCAP = 1200;
   const pLink = new Int32Array(PCAP), pNext = new Int32Array(PCAP);
   const pS = new Float32Array(PCAP), pV = new Float32Array(PCAP), pOff = new Float32Array(PCAP), pOffT = new Float32Array(PCAP), pWander = new Float32Array(PCAP);
-  const pPhase = new Float32Array(PCAP), pAlpha = new Float32Array(PCAP), pFade = new Int8Array(PCAP), pDead = new Uint8Array(PCAP);
+  // pAlpha: fading in or out of the population; pShow: how much is drawn (less going indoors or off the slab)
+  const pPhase = new Float32Array(PCAP), pAlpha = new Float32Array(PCAP), pFade = new Int8Array(PCAP), pDead = new Uint8Array(PCAP), pShow = new Float32Array(PCAP);
   const pJacket = new Uint8Array(PCAP), pLegs = new Uint8Array(PCAP), pSkin = new Uint8Array(PCAP), pHair = new Uint8Array(PCAP), pPack = new Int8Array(PCAP), pBike = new Uint8Array(PCAP);
   const pX = new Float32Array(PCAP), pY = new Float32Array(PCAP), pHx = new Float32Array(PCAP), pHy = new Float32Array(PCAP);
   const pBX = new Float32Array(PCAP), pBY = new Float32Array(PCAP), pOccT = new Float32Array(PCAP), pOcc = new Uint8Array(PCAP);
-  const P_FIELDS = [pLink, pNext, pS, pV, pOff, pOffT, pWander, pPhase, pAlpha, pFade, pDead, pJacket, pLegs, pSkin, pHair, pPack, pBike, pX, pY, pHx, pHy, pBX, pBY, pOccT, pOcc];
+  const P_FIELDS = [pLink, pNext, pS, pV, pOff, pOffT, pWander, pPhase, pAlpha, pFade, pDead, pShow, pJacket, pLegs, pSkin, pHair, pPack, pBike, pX, pY, pHx, pHy, pBX, pBY, pOccT, pOcc];
   let nPeople = 0, peopleTarget = 0;
   const jacketCum = cumulative(JACKETS.map((j) => j[1]));
   const peopleRegion = newRegion();
@@ -614,9 +682,16 @@ export function init(app) {
   function newOffset(i, l) {
     const h = pathHalf(l);
     // keep a little to the right, spread across the path so people do not walk single file
-    if (pBike[i]) return h * 0.45;
+    if (pBike[i]) return clearOfWalls(l, h * 0.45);
     const spread = Math.max(0.2, h - 0.35);
-    return Math.max(-spread, Math.min(spread, h * 0.22 + (Math.random() - 0.5) * 2 * spread * 0.85));
+    return clearOfWalls(l, Math.max(-spread, Math.min(spread, h * 0.22 + (Math.random() - 0.5) * 2 * spread * 0.85)));
+  }
+  // an offset (to the right of travel on link l) moved back out of any wall beside the path (see sideOf)
+  function clearOfWalls(l, off) {
+    const r = sideOf(Wk, l >> 1, solids, pathHalf(l));
+    if (!r) return off;
+    // sideOf measures along the edge's left normal: off = d going backwards along the edge, −d going forwards
+    return l & 1 ? Math.max(r[0], Math.min(r[1], off)) : Math.max(-r[1], Math.min(-r[0], off));
   }
   function spawnPerson(l, s, fadeIn, bike) {
     if (nPeople >= PCAP - 1) return -1;
@@ -632,6 +707,7 @@ export function init(app) {
     pNext[i] = chooseNextWalk(l, pBike[i]);
     linkPoint(Wk, l, s, pOff[i]);
     pX[i] = pBX[i] = PX; pY[i] = pBY[i] = PY; pHx[i] = TX; pHy[i] = TY;
+    pShow[i] = pAlpha[i] * outdoors(Wk, l, s, 1.2);
     return i;
   }
   function chooseNextWalk(l, bike) {
@@ -679,6 +755,7 @@ export function init(app) {
         pLink[i] = l = m;
         const h = pathHalf(l) - 0.25;
         if (Math.abs(pOff[i]) > h) pOff[i] = pOffT[i] = Math.sign(pOff[i]) * Math.max(0, h);
+        pOff[i] = clearOfWalls(l, pOff[i]); pOffT[i] = clearOfWalls(l, pOffT[i]);
         pNext[i] = chooseNextWalk(l, pBike[i]);
       }
       if (pFade[i] > 0) { pAlpha[i] += dt / 0.7; if (pAlpha[i] >= 1) { pAlpha[i] = 1; pFade[i] = 0; } }
@@ -688,6 +765,11 @@ export function init(app) {
       linkPoint(Wk, l, pS[i], pOff[i]);
       const b = Math.min(1, pS[i] / 1.6);
       if (b < 1) { const w = b * b * (3 - 2 * b); PX = pBX[i] + (PX - pBX[i]) * w; PY = pBY[i] + (PY - pBY[i]) * w; }
+      // Footways run on through buildings (corridors, arcades, a path mapped across a block): indoors nobody shows, and
+      // they fade out a step before the wall. Off the slab's edge (older data) they fade within a couple of metres.
+      const out = offSlab(PX, PY);
+      if (out >= 1.5) { pDead[i] = 1; continue; }
+      pShow[i] = pAlpha[i] * (out > 0 ? 1 - out / 1.5 : 1) * outdoors(Wk, l, pS[i], 1.2);
       pX[i] = PX; pY[i] = PY;
       const k = 1 - Math.exp(-ds / 0.6);
       let hx = pHx[i] + (TX - pHx[i]) * k, hy = pHy[i] + (TY - pHy[i]) * k;
@@ -701,11 +783,13 @@ export function init(app) {
     walkSampler.update(peopleRegion, 1, 0.5 + classChange);
     peopleTarget = Math.min(PEOPLE_CAP, Math.round(walkSampler.total * peopleFactor));
     for (let i = 0; i < nPeople; i++) if (!inRegion(peopleRegion, pX[i], pY[i], 25)) pDead[i] = 1;
+    // wholly out of sight: a little beyond the edge, and a person's height above it
+    const margin = 20 + 2 * PK;
     let excess = nPeople - Math.round(peopleTarget * 1.15) - 2;
     for (let tries = 0; excess > 0 && tries < 12; tries++) {
       const i = (Math.random() * nPeople) | 0;
       if (pDead[i]) continue;
-      if (!onScreen(pX[i], pY[i], 20)) { pDead[i] = 1; excess--; }
+      if (!onScreen(pX[i], pY[i], margin) || pShow[i] <= 0) { pDead[i] = 1; excess--; }
       else if (pFade[i] === 0 && excess > nPeople * 0.2) { pFade[i] = -1; excess--; }
     }
     for (let i = nPeople - 1; i >= 0; i--) if (pDead[i]) removePersonAt(i);
@@ -724,7 +808,9 @@ export function init(app) {
       let dir = Math.random() < 0.5 ? 0 : 1;
       let s = pieceS(walkPieces, p, L, dir);
       linkPoint(Wk, 2 * e + dir, s, 0);
-      let vis = onScreen(PX, PY, 20);
+      if (offSlab(PX, PY) > -0.5) continue;
+      // seen: inside the view and not indoors (someone appearing inside a building just walks out of its door)
+      let vis = onScreen(PX, PY, margin) && outdoors(Wk, 2 * e + dir, s, 1.2) > 0;
       if (vis && !jump) {
         // in plain view, people only come out of doors: the dead end of a path into a building
         if (Wk.deg[Wk.eA[e]] === 1) { dir = 0; s = 0.2; }
@@ -743,7 +829,7 @@ export function init(app) {
   // cached occluder candidates: CAND_N per object after a count slot
   const CAND_N = 7, CAND_STRIDE = CAND_N + 1;
   const carCand = new Int32Array(CAP * CAND_STRIDE).fill(-1), personCand = new Int32Array(PCAP * CAND_STRIDE).fill(-1);
-  const vis = new Int32Array(CAP), visDepth = new Float32Array(CAP);
+  const vis = new Int32Array(CAP), visDepth = new Float32Array(CAP), cUnder = new Uint8Array(CAP);   // per frame, for those in view
   let nVis = 0, lastFar = false;
   const byDepth = (a, b) => visDepth[b] - visDepth[a];
   const Q = new Float64Array(16);   // projected corners of one part
@@ -786,12 +872,11 @@ export function init(app) {
     const b = sc.pickBuilding(r, U, Y);
     if (b >= 0 && sc.inFront(r, b, x, y, 0)) return 2;
     const ids = sc.query(r, "objects", U - 0.5, Y - 0.5, U + 0.5, Y + 0.5), B = sc.B, T = sc.T, tr = data.trees;
-    const season = (app.tileStyle && app.tileStyle.season) || "summer";
     for (let k = 0; k < ids.length; k++) {
       const id = ids[k];
       if (id < B || id >= B + T) continue;
       const t = id - B, tx = tr[5 * t], ty = tr[5 * t + 1], rad = tr[5 * t + 2], th = tr[5 * t + 3];
-      if (!(tr[5 * t + 4] & 1) && (season === "winter" || (season === "late-autumn" && nHash(t * 2654435761) < 0.72))) continue;
+      if (renderer.treeBare(t, app.tileStyle)) continue;   // bare twigs hide nothing
       if (!sc.inFront(r, id, x, y, 0)) continue;
       const cu = tx * o.R[0] + ty * o.R[1], cv = -(tx * o.D[0] + ty * o.D[1]) * SIN_T - Math.max(th - rad, th * 0.55) * COS_T;
       if ((U - cu) ** 2 + (Y - cv) ** 2 < rad * rad) return 2;
@@ -801,13 +886,16 @@ export function init(app) {
 
   // Occlusion by clipping. app.occlude would redraw every building and tree in front of a car (whole buildings, windows
   // and all: costly, and once per car). The tiles under us already show those objects correctly, so instead the car is
-  // drawn through a clip that leaves out the silhouette of each thing standing in front of it: the map shows through
-  // there. Each silhouette piece (a roof, a wall, a canopy, a trunk) is a simple shape, so "the box minus this piece" is
-  // an even-odd path, and successive clips intersect. Same picture, a small fraction of the work.
+  // drawn through a clip that leaves out the outline of each thing standing in front of it: the map shows through
+  // there. The outlines are the renderer's own (renderer.silhouette: walls, roofs and rooftop plant, crowns, trunks,
+  // lamp posts, as the tiles paint them at this level of detail), plus the bridge decks overhead. Each piece of an outline
+  // is a simple shape, so "the box minus this piece" is an even-odd path, and successive clips intersect. Same picture,
+  // a small fraction of the work.
   const FRONT = new Int32Array(256);
-  let CL_X0 = 0, CL_Y0 = 0, CL_X1 = 0, CL_Y1 = 0;   // the clip box, CSS px
-  // cand/at: the object's cached candidates (see occlusionOf), re-checked against where it is now; else a fresh search
-  function drawClipped(ctx, x, y, halfW, rect, drawFn, arg, lamps = true, cand = null, at = 0) {
+  // The scene objects standing in front of ground point (x, y) (halfW metres across) that may cross rect, into FRONT;
+  // returns how many. cand/at: the object's cached candidates (see occlusionOf), re-checked against where it is now;
+  // else a fresh search.
+  function frontOf(x, y, halfW, rect, lamps = true, cand = null, at = 0) {
     const sc = app.scene, r = ROT, s = SCALE, firstLamp = sc.B + sc.T;
     let n = 0;
     if (cand && cand[at - 1] >= 0) {
@@ -816,76 +904,84 @@ export function init(app) {
       const ids = sc.query(r, "objects", (rect[0] - PE) / s, (rect[1] - PF) / s, (rect[2] - PE) / s, (rect[3] - PF) / s);
       for (let k = 0; k < ids.length && n < FRONT.length; k++) if ((lamps || ids[k] < firstLamp) && sc.inFront(r, ids[k], x, y, halfW)) FRONT[n++] = ids[k];
     }
-    if (!n) { drawFn(ctx, arg); return; }
-    CL_X0 = rect[0]; CL_Y0 = rect[1]; CL_X1 = rect[2]; CL_Y1 = rect[3];
+    return n;
+  }
+  // renderer.silhouette appends outlines as overlapping pieces, meant for one nonzero fill; a clip-out takes them one at a
+  // time, so it is handed this recorder in place of a path. Crowns of leafy trees are unions of circles, which no single
+  // even-odd cut can take away: without addPath the renderer gives their bounding circle instead. A conifer's outline is
+  // one polygon, so its recorder takes addPath and gets the exact shape.
+  const SIL = makeRecorder(), SIL_EXACT = SIL.withAddPath();
+  // Draw drawFn(ctx, arg) inside rect, less the outlines of the nF scene objects in FRONT and of the nD decks in
+  // DECK_HIT (their parts within reach metres of ground point (x, y)).
+  function drawCut(ctx, rect, nF, nD, x, y, reach, drawFn, arg) {
+    const X0 = rect[0], Y0 = rect[1], X1 = rect[2], Y1 = rect[3];
+    const B = app.scene.B, T = app.scene.T, tr = data.trees;
+    SIL.reset();
+    for (let q = 0; q < nD; q++) deckOutline(SIL, DECK_HIT[q], x, y, reach);
+    for (let q = 0; q < nF; q++) {
+      const id = FRONT[q], conifer = id >= B && id < B + T && (tr[5 * (id - B) + 4] & 1);
+      renderer.silhouette(conifer ? SIL_EXACT : SIL, ROT, CAM, id, app.tileStyle);
+    }
+    SIL.closePath();
+    let cuts = 0;
+    for (let p = 0; p < SIL.count; p++) if (SIL.meets(p, X0, Y0, X1, Y1)) cuts++;
+    if (!cuts) { drawFn(ctx, arg); return; }
     ctx.save();
-    ctx.beginPath(); ctx.rect(CL_X0, CL_Y0, CL_X1 - CL_X0, CL_Y1 - CL_Y0); ctx.clip();
-    clipOutSilhouettes(ctx, n);
+    ctx.beginPath(); ctx.rect(X0, Y0, X1 - X0, Y1 - Y0); ctx.clip();
+    // the box a little larger than the clip, so its own edges never show
+    for (let p = 0; p < SIL.count; p++) if (SIL.meets(p, X0, Y0, X1, Y1)) SIL.cut(ctx, p, X0 - 2, Y0 - 2, X1 + 2, Y1 + 2);
     drawFn(ctx, arg);
     ctx.restore();
   }
-  // begin "the clip box minus …": the caller adds one simple shape and calls endCut
-  function beginCut(c) { c.beginPath(); c.rect(CL_X0 - 2, CL_Y0 - 2, CL_X1 - CL_X0 + 4, CL_Y1 - CL_Y0 + 4); }
-  function endCut(c) { c.clip("evenodd"); }
-  const meets = (x0, y0, x1, y1) => x1 >= CL_X0 && x0 <= CL_X1 && y1 >= CL_Y0 && y0 <= CL_Y1;
-  // Roofs and camera-facing walls of buildings, canopies and trunks of trees (bare ones only hide their trunks), lamp
-  // posts: as the renderer draws them, in CSS px.
-  function clipOutSilhouettes(c, n) {
-    const sc = app.scene, Sr = sc.forRot(ROT), s = SCALE, k = PK, B = sc.B, T = sc.T, tr = data.trees, la = data.lamps;
-    const season = (app.tileStyle && app.tileStyle.season) || "summer";
-    for (let q = 0; q < n; q++) {
-      const id = FRONT[q];
-      if (id < B) {
-        const b = data.buildings[id], rings = Sr.objRings[id];
-        if (b.hidden || !rings) continue;
-        const f = rings[0], m = f.length / 2;
-        const top = (b.roof && b.roof !== "flat" && b.obb ? b.h - (b.rh || 0) * 0.45 : b.h) * k, bot = (b.mh || 0) * k;
-        // the roof
-        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-        for (let a = 0; a < m; a++) { const X = f[2 * a] * s + PE, Y = f[2 * a + 1] * s + PF - top; if (X < x0) x0 = X; if (X > x1) x1 = X; if (Y < y0) y0 = Y; if (Y > y1) y1 = Y; }
-        if (meets(x0, y0, x1, y1)) {
-          beginCut(c);
-          c.moveTo(f[0] * s + PE, f[1] * s + PF - top);
-          for (let a = 1; a < m; a++) c.lineTo(f[2 * a] * s + PE, f[2 * a + 1] * s + PF - top);
-          c.closePath();
-          endCut(c);
-        }
-        // the walls that face us (outer rings run counter-clockwise: a wall faces us when it runs rightward on screen)
-        for (let a = 0, p = m - 1; a < m; p = a++) {
-          if (f[2 * a] <= f[2 * p]) continue;
-          const ax = f[2 * p] * s + PE, ay = f[2 * p + 1] * s + PF, bx = f[2 * a] * s + PE, by = f[2 * a + 1] * s + PF;
-          if (!meets(ax, Math.min(ay, by) - top, bx, Math.max(ay, by) - bot)) continue;
-          beginCut(c);
-          c.moveTo(ax, ay - bot); c.lineTo(bx, by - bot); c.lineTo(bx, by - top); c.lineTo(ax, ay - top); c.closePath();
-          endCut(c);
-        }
-      } else if (id < B + T) {
-        const t = id - B, x = tr[5 * t], y = tr[5 * t + 1], rad = tr[5 * t + 2], h = tr[5 * t + 3], fl = tr[5 * t + 4];
-        const X = (x * U0 + y * U1) * s + PE, Yg = -(x * D0 + y * D1) * SIN_T * s + PF, rs = rad * s;
-        if (fl & 1) {
-          // a conifer: one triangle round its three tiers, and its trunk
-          const yb = Yg - h * 0.18 * k, yt = Yg - h * k;
-          beginCut(c); c.moveTo(X - rs, yb); c.lineTo(X, yt); c.lineTo(X + rs, yb); c.closePath(); endCut(c);
-          beginCut(c); c.rect(X - 0.18 * s, yb, 0.36 * s, Yg - yb); endCut(c);
-          continue;
-        }
-        const bare = season === "winter" || (season === "late-autumn" && nHash(t * 2654435761) < 0.72);
-        const cy = Yg - Math.max(h - rad, h * 0.55) * k, tw = Math.max(0.25, rad * 0.12) * s;
-        const trunkTop = bare ? Yg - h * 0.45 * k : cy;
-        if (meets(X - tw, trunkTop, X + tw, Yg)) { beginCut(c); c.rect(X - tw / 2, trunkTop, tw, Yg - trunkTop); endCut(c); }
-        if (!bare && meets(X - rs * 1.2, cy - rs * 1.2, X + rs * 1.2, cy + rs * 1.2)) {
-          beginCut(c); c.moveTo(X + rs * 1.14, cy + rs * 0.04); c.arc(X + rs * 0.06, cy + rs * 0.04, rs * 1.08, 0, Math.PI * 2); endCut(c);
-        }
-      } else {
-        const l = id - B - T, x = la[2 * l], y = la[2 * l + 1];
-        const X = (x * U0 + y * U1) * s + PE, Y = -(x * D0 + y * D1) * SIN_T * s + PF;
-        if (!meets(X - 0.3 * s, Y - 6 * k, X + 0.3 * s, Y)) continue;
-        // the post and its lantern as one outline
-        const pw = Math.max(0.5, 0.09 * s), hw = 0.25 * s, yh = Y - 5.9 * k, yl = yh + 0.32 * s;
-        beginCut(c);
-        c.moveTo(X - pw, Y); c.lineTo(X - pw, yl); c.lineTo(X - hw, yl); c.lineTo(X - hw, yh); c.lineTo(X + hw, yh); c.lineTo(X + hw, yl); c.lineTo(X + pw, yl); c.lineTo(X + pw, Y); c.closePath();
-        endCut(c);
+
+  // ---------------------------------------------------------------- bridge decks overhead
+  // A road under a bridge is drawn in the tiles beneath the deck, but cars and people are drawn over the tiles: under a
+  // deck they are cut round its outline, and from afar (a point test) they are simply hidden.
+  const DECK_HIT = new Int32Array(16);
+  // The decks over ground point (x, y), within reach metres of it, among those the edges of links l0…l2 pass under (the
+  // link it is on, and the ones before and after it: a crossing just past a junction is on the neighbouring edge). Fills
+  // DECK_HIT; returns how many.
+  function decksAbove(net, l0, l1, l2, x, y, reach) {
+    let n = 0;
+    for (let k = 0; k < 3; k++) {
+      const l = k === 0 ? l0 : k === 1 ? l1 : l2;
+      if (l < 0) continue;
+      const u = decksOver(net, l >> 1, decks);
+      if (!u) continue;
+      for (let j = 0; j < u.length && n < DECK_HIT.length; j++) {
+        const id = u[j];
+        let seen = false;
+        for (let q = 0; q < n && !seen; q++) seen = DECK_HIT[q] === id;
+        if (!seen && deckNear(id, x, y, reach)) DECK_HIT[n++] = id;
       }
+    }
+    return n;
+  }
+  function deckNear(id, x, y, reach) {
+    const it = decks.items[id], p = it.pts;
+    for (let s = 0; s + 3 < p.length; s += 2) if (segDist(x, y, p[s], p[s + 1], p[s + 2] - p[s], p[s + 3] - p[s + 1]) <= it.hw + reach) return true;
+    return false;
+  }
+  // The deck's outline near (x, y) as the renderer paints it, in CSS px: each segment's strip, from its edge a metre below
+  // up to its railings a metre above (a strip swept straight up the screen: the hull of its corners at both heights),
+  // half a metre longer at each end so the pieces overlap at the bends.
+  const HULL_IN = new Float64Array(16), HULL = new Float64Array(20);
+  function deckOutline(rec, id, x, y, reach) {
+    const it = decks.items[id], p = it.pts, hw = it.hw, up = DECK_UP * PK, dn = DECK_DOWN * PK;
+    for (let s = 0; s + 3 < p.length; s += 2) {
+      const ax = p[s], ay = p[s + 1], dx = p[s + 2] - ax, dy = p[s + 3] - ay, L = Math.hypot(dx, dy);
+      if (L < 1e-6 || segDist(x, y, ax, ay, dx, dy) > hw + reach) continue;
+      const ux = dx / L, uy = dy / L, nx = -uy * hw, ny = ux * hw;
+      const bx = ax - ux * 0.5, by = ay - uy * 0.5, ex = ax + dx + ux * 0.5, ey = ay + dy + uy * 0.5;
+      for (let c = 0; c < 4; c++) {
+        const gx = (c === 0 || c === 3 ? bx : ex) + (c < 2 ? -nx : nx), gy = (c === 0 || c === 3 ? by : ey) + (c < 2 ? -ny : ny);
+        const px = PA * gx + PB * gy + PE, py = PC * gx + PD * gy + PF;
+        HULL_IN[4 * c] = px; HULL_IN[4 * c + 1] = py - up; HULL_IN[4 * c + 2] = px; HULL_IN[4 * c + 3] = py + dn;
+      }
+      const m = hull(HULL_IN, 8, HULL);
+      rec.moveTo(HULL[0], HULL[1]);
+      for (let q = 1; q < m; q++) rec.lineTo(HULL[2 * q], HULL[2 * q + 1]);
+      rec.closePath();
     }
   }
 
@@ -895,12 +991,14 @@ export function init(app) {
     const t0 = performance.now();
     const m = Math.max(12, 8 * SCALE);
     for (let i = 0; i < nCars; i++) {
-      if (R.eTn[cLink[i] >> 1] || cAlpha[i] <= 0.01) continue;   // in a tunnel
+      if (R.eTn[cLink[i] >> 1] || cShow[i] <= 0.01) continue;   // in a tunnel, indoors, or not faded in yet
       const x = cX[i], y = cY[i];
       const px = PA * x + PB * y + PE, py = PC * x + PD * y + PF;
       if (px < -m || px > VW + m || py < -m - 4 * PK || py > VH + m) continue;
       vis[nVis++] = i;
       visDepth[i] = x * D0 + y * D1;
+      // right under a bridge deck (from afar a car is either seen or not: this hides it there)
+      cUnder[i] = decksAbove(R, cLink[i], cNext[i], cPrev[i], x, y, 0) > 0 ? 1 : 0;
     }
     vis.subarray(0, nVis).sort(byDepth);
     const s = SCALE;
@@ -917,7 +1015,10 @@ export function init(app) {
     for (let k = 0; k < nVis; k++) {
       const i = vis[k];
       if (occlude && cOcc[i] === 2) continue;   // behind a building: nothing of it shows
-      if (occlude && cOcc[i] === 1) drawClipped(ctx, cX[i], cY[i], TYPE_HALF[cType[i]], carRect(i), drawCarAlpha, i, true, carCand, i * CAND_STRIDE + 1);
+      const half = TYPE_HALF[cType[i]], rect = carRect(i);
+      const nD = decksAbove(R, cLink[i], cNext[i], cPrev[i], cX[i], cY[i], half + 1);
+      const nF = occlude && cOcc[i] === 1 ? frontOf(cX[i], cY[i], half, rect, true, carCand, i * CAND_STRIDE + 1) : 0;
+      if (nF || nD) drawCut(ctx, rect, nF, nD, cX[i], cY[i], half + 1, drawCarAlpha, i);
       else drawCarAlpha(ctx, i);
     }
     ctx.globalAlpha = 1;
@@ -925,25 +1026,28 @@ export function init(app) {
   }
 
   // From afar a car is a short stroke of its paint, a little larger than life so the streets read as busy; one path
-  // per paint for all of them (they are a few pixels long: their order does not show).
+  // per paint for all of them (they are a few pixels long: their order does not show). Cars fading in or out are drawn
+  // one by one after them, each at its own alpha.
   const farBucket = new Int32Array(CAP), farStart = new Int32Array(PAINT.length + 1), farFill = new Int32Array(PAINT.length);
+  const FAR_SOLID = 0.99;
+  const farSeen = (i) => cOcc[i] === 0 && !cUnder[i];
   function drawCarsFar(ctx, s) {
     farStart.fill(0);
-    // cars in plain view (and faded in far enough to count)
-    const inBatch = (i) => cAlpha[i] > 0.4 && cOcc[i] === 0;
+    const inBatch = (i) => cShow[i] >= FAR_SOLID && farSeen(i);
     for (let k = 0; k < nVis; k++) if (inBatch(vis[k])) farStart[cCol[vis[k]] + 1]++;
     for (let c = 0; c < PAINT.length; c++) farStart[c + 1] += farStart[c];
     for (let c = 0; c < PAINT.length; c++) farFill[c] = farStart[c];
     for (let k = 0; k < nVis; k++) { const i = vis[k]; if (inBatch(i)) farBucket[farFill[cCol[i]]++] = i; }
     const minLen = s < 0.6 ? 3 : 5.2;
+    const shadowW = Math.max(s < 0.6 ? 1.9 : 3, 2 * s), paintW = Math.max(s < 0.6 ? 1.5 : 2.4, 1.8 * s);
     ctx.lineCap = "butt";
     // a soft shadow line first, so pale cars still read against pale roads
-    ctx.lineWidth = Math.max(s < 0.6 ? 1.9 : 3, 2 * s);
+    ctx.lineWidth = shadowW;
     ctx.strokeStyle = "rgba(38,50,60,.28)";
     ctx.beginPath();
     for (let q = 0; q < farStart[PAINT.length]; q++) farSegment(ctx, farBucket[q], minLen, 0.6, 0.5);
     ctx.stroke();
-    ctx.lineWidth = Math.max(s < 0.6 ? 1.5 : 2.4, 1.8 * s);
+    ctx.lineWidth = paintW;
     for (let c = 0; c < PAINT.length; c++) {
       if (farStart[c + 1] === farStart[c]) continue;
       ctx.strokeStyle = PAINT_RAMPS[c][13];
@@ -951,6 +1055,16 @@ export function init(app) {
       for (let q = farStart[c]; q < farStart[c + 1]; q++) farSegment(ctx, farBucket[q], minLen, 0, -0.7);
       ctx.stroke();
     }
+    for (let k = 0; k < nVis; k++) {
+      const i = vis[k];
+      if (cShow[i] >= FAR_SOLID || !farSeen(i)) continue;
+      ctx.globalAlpha = cShow[i];
+      ctx.lineWidth = shadowW; ctx.strokeStyle = "rgba(38,50,60,.28)";
+      ctx.beginPath(); farSegment(ctx, i, minLen, 0.6, 0.5); ctx.stroke();
+      ctx.lineWidth = paintW; ctx.strokeStyle = PAINT_RAMPS[cCol[i]][13];
+      ctx.beginPath(); farSegment(ctx, i, minLen, 0, -0.7); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
   }
   function farSegment(ctx, i, minLen, dx, dz) {
     const T = TYPES[cType[i]];
@@ -961,7 +1075,7 @@ export function init(app) {
     ctx.moveTo(px - hx / 2, py - hy / 2); ctx.lineTo(px + hx / 2, py + hy / 2);
   }
 
-  function drawCarAlpha(c, i) { c.globalAlpha = cAlpha[i]; drawCar(c, i, SCALE); c.globalAlpha = 1; }
+  function drawCarAlpha(c, i) { c.globalAlpha = cShow[i]; drawCar(c, i, SCALE); c.globalAlpha = 1; }
 
   // the car's screen box (CSS px), for clipping the redraw of what stands in front of it
   function carRect(i) {
@@ -1093,45 +1207,58 @@ export function init(app) {
     ctx.globalCompositeOperation = "lighter";
     if (s < FAR_S) {
       // from afar: a warm point at the nose of each car and a red one at its tail, as a soft halo and a bright core;
-      // all cars in four fills
+      // all cars in four fills, then those fading in or out one by one at their own alpha
       for (let pass = 0; pass < 4; pass++) {
         const head = pass < 2, halo = !(pass & 1);
         if (halo && s < 0.8) continue;   // too far for a halo to read
-        const r = (halo ? 2.6 : 1.1) * Math.max(1, s * 0.9) * (head ? 1 : 0.75);
-        ctx.globalAlpha = k * (halo ? 0.28 : 0.85);
+        const r = (halo ? 2.6 : 1.1) * Math.max(1, s * 0.9) * (head ? 1 : 0.75), base = k * (halo ? 0.28 : 0.85);
+        ctx.globalAlpha = base;
         ctx.fillStyle = head ? "rgb(255,232,180)" : "rgb(255,70,55)";
         ctx.beginPath();
+        for (let q = 0; q < nVis; q++) { const i = vis[q]; if (cShow[i] >= FAR_SOLID && farSeen(i)) farLight(ctx, i, head, halo, r, s); }
+        ctx.fill();
         for (let q = 0; q < nVis; q++) {
           const i = vis[q];
-          if (cAlpha[i] < 0.4 || cOcc[i] !== 0) continue;
-          const T = TYPES[cType[i]], f = (head ? 0.5 : -0.5) * Math.max(T.L, 4.4 / Math.max(s, 0.3));
-          const px = PA * (cX[i] + cHx[i] * f) + PB * (cY[i] + cHy[i] * f) + PE, py = PC * (cX[i] + cHx[i] * f) + PD * (cY[i] + cHy[i] * f) + PF - 0.7;
-          // halos are soft discs; the bright cores are a pixel or two, where a square looks the same and costs less
-          if (halo) { ctx.moveTo(px + r, py); ctx.arc(px, py, r, 0, Math.PI * 2); } else ctx.rect(px - r, py - r, 2 * r, 2 * r);
+          if (cShow[i] >= FAR_SOLID || !farSeen(i)) continue;
+          ctx.globalAlpha = base * cShow[i];
+          ctx.beginPath(); farLight(ctx, i, head, halo, r, s); ctx.fill();
         }
-        ctx.fill();
       }
     } else {
-      // near: a beam on the road ahead and the lamps themselves, each cut round whatever stands in front of it
-      const clip = s > 1.5;
+      // near: a beam on the road ahead and the lamps themselves, each cut round whatever stands in front of it and
+      // the bridge decks above
       for (let q = 0; q < nVis; q++) {
         const i = vis[q];
-        if (clip && cOcc[i] === 2) continue;
+        if (cOcc[i] === 2) continue;
         const half = TYPE_HALF[cType[i]];
-        if (clip && simT >= cBeamT[i]) {
-          // the beam's middle, about ten metres ahead
-          cBeam[i] = occlusionOf(cX[i] + cHx[i] * (half + 9), cY[i] + cHy[i] * (half + 9), 10, 0.3, 1 + cV[i] * 0.5);
+        // the beam's middle, about ten metres ahead
+        const bx = cX[i] + cHx[i] * (half + 9), by = cY[i] + cHy[i] * (half + 9);
+        if (simT >= cBeamT[i]) {
+          cBeam[i] = occlusionOf(bx, by, 10, 0.3, 1 + cV[i] * 0.5);
           cBeamT[i] = simT + 0.35 + Math.random() * 0.1;
         }
-        if (!clip || cBeam[i] === 0) drawBeam(ctx, i);
-        else if (cBeam[i] === 1) drawClipped(ctx, cX[i] + cHx[i] * (half + 9), cY[i] + cHy[i] * (half + 9), 10, beamRect(i), drawBeam, i);
-        if (clip && cOcc[i] === 1) drawClipped(ctx, cX[i], cY[i], half, carRect(i), drawLamps, i, true, carCand, i * CAND_STRIDE + 1);
+        if (cBeam[i] !== 2) {
+          const nD = decksAbove(R, cLink[i], cNext[i], -1, bx, by, 10);
+          if (cBeam[i] === 0 && !nD) drawBeam(ctx, i);
+          else { const rect = beamRect(i); drawCut(ctx, rect, cBeam[i] === 1 ? frontOf(bx, by, 10, rect) : 0, nD, bx, by, 10, drawBeam, i); }
+        }
+        const rect = carRect(i);
+        const nD = decksAbove(R, cLink[i], cNext[i], cPrev[i], cX[i], cY[i], half + 1);
+        const nF = cOcc[i] === 1 ? frontOf(cX[i], cY[i], half, rect, true, carCand, i * CAND_STRIDE + 1) : 0;
+        if (nF || nD) drawCut(ctx, rect, nF, nD, cX[i], cY[i], half + 1, drawLamps, i);
         else drawLamps(ctx, i);
       }
     }
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = "source-over";
     perf.lightDraw += performance.now() - t0;
+  }
+  // a far car's head- or tail-light, added to the current path: halos are soft discs; the bright cores are a pixel or
+  // two, where a square looks the same and costs less
+  function farLight(ctx, i, head, halo, r, s) {
+    const T = TYPES[cType[i]], f = (head ? 0.5 : -0.5) * Math.max(T.L, 4.4 / Math.max(s, 0.3));
+    const px = PA * (cX[i] + cHx[i] * f) + PB * (cY[i] + cHy[i] * f) + PE, py = PC * (cX[i] + cHx[i] * f) + PD * (cY[i] + cHy[i] * f) + PF - 0.7;
+    if (halo) { ctx.moveTo(px + r, py); ctx.arc(px, py, r, 0, Math.PI * 2); } else ctx.rect(px - r, py - r, 2 * r, 2 * r);
   }
 
   // the beam, drawn in the car's own ground frame (x forward, y to the right, metres) so it lies flat on the road
@@ -1140,7 +1267,7 @@ export function init(app) {
     const m11 = PA * fx + PB * fy, m21 = PC * fx + PD * fy, m12 = PA * rx + PB * ry, m22 = PC * rx + PD * ry;
     const tx = PA * cX[i] + PB * cY[i] + PE, ty = PC * cX[i] + PD * cY[i] + PF;
     ctx.setTransform(dpr * m11, dpr * m21, dpr * m12, dpr * m22, dpr * tx, dpr * ty);
-    ctx.globalAlpha = cAlpha[i] * night * 0.9;
+    ctx.globalAlpha = cShow[i] * night * 0.9;
     ctx.drawImage(sprites.cone, half - 0.4, -4.5, 19, 9);
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
@@ -1163,7 +1290,7 @@ export function init(app) {
     const cx = PA * cX[i] + PB * cY[i] + PE, cy = PC * cX[i] + PD * cY[i] + PF;
     const Fx = PA * fx + PB * fy, Fy = PC * fx + PD * fy, Rx = PA * rx + PB * ry, Ry = PC * rx + PD * ry;
     const z = PK * 0.7, rh = Math.max(1.2, 0.55 * s), rt = Math.max(1, 0.42 * s);
-    const a = cAlpha[i] * night, braking = cA[i] < -0.6 || cV[i] < 0.3;
+    const a = cShow[i] * night, braking = cA[i] < -0.6 || cV[i] < 0.3;
     ctx.globalAlpha = a;
     for (let side = -1; side <= 1; side += 2) {
       const c = side * (hw - 0.3);
@@ -1177,7 +1304,7 @@ export function init(app) {
   }
 
   // ---------------------------------------------------------------- people
-  const pVis = new Int32Array(PCAP), pDepth = new Float32Array(PCAP);
+  const pVis = new Int32Array(PCAP), pDepth = new Float32Array(PCAP), pUnder = new Uint8Array(PCAP);   // per frame, for those in view
   let nPVis = 0, lastSmall = true;
   const byPDepth = (a, b) => pDepth[b] - pDepth[a];
   const bucket = new Int32Array(PCAP), bucketStart = new Int32Array(JACKETS.length + 1), bucketFill = new Int32Array(JACKETS.length);
@@ -1187,11 +1314,12 @@ export function init(app) {
     const t0 = performance.now();
     const s = SCALE, m = 6 * s;
     for (let i = 0; i < nPeople; i++) {
-      if (pAlpha[i] <= 0.01) continue;
+      if (pShow[i] <= 0.01) continue;   // indoors, or not faded in yet
       const px = PA * pX[i] + PB * pY[i] + PE, py = PC * pX[i] + PD * pY[i] + PF;
       if (px < -m || px > VW + m || py < -m || py > VH + m) continue;
       pVis[nPVis++] = i;
       pDepth[i] = pX[i] * D0 + pY[i] * D1;
+      pUnder[i] = decksAbove(Wk, pLink[i], pNext[i], -1, pX[i], pY[i], 0) > 0 ? 1 : 0;   // right under a bridge deck
     }
     // what stands in front of each person, every half second or so: small ones are seen or hidden by a point test,
     // close ones also get partial cut-outs
@@ -1208,7 +1336,7 @@ export function init(app) {
     if (small) {
       // the batches below draw whoever is in view and not hidden
       let n = 0;
-      for (let q = 0; q < nPVis; q++) { const i = pVis[q]; if (pOcc[i] !== 2 && pAlpha[i] > 0.35) pVis[n++] = i; }
+      for (let q = 0; q < nPVis; q++) { const i = pVis[q]; if (pOcc[i] !== 2 && !pUnder[i] && pShow[i] > 0.35) pVis[n++] = i; }
       nPVis = n;
       drawPeopleBatched(ctx, s, fadeS);
     }
@@ -1305,7 +1433,7 @@ export function init(app) {
     ctx.beginPath();
     for (let q = 0; q < nPVis; q++) {
       const i = pVis[q];
-      if (pOcc[i] === 2 || pAlpha[i] < 0.3) continue;
+      if (pOcc[i] === 2 || pUnder[i] || pShow[i] < 0.3) continue;
       const px = PA * pX[i] + PB * pY[i] + PE + 0.18 * s, py = PC * pX[i] + PD * pY[i] + PF + 0.02 * s, rx = (pBike[i] ? 0.75 : 0.32) * s;
       ctx.moveTo(px + rx, py); ctx.ellipse(px, py, rx, 0.16 * s, 0, 0, Math.PI * 2);
     }
@@ -1315,9 +1443,11 @@ export function init(app) {
       const px = PA * pX[i] + PB * pY[i] + PE, py = PC * pX[i] + PD * pY[i] + PF;
       const bike = pBike[i];
       if (occlude && pOcc[i] === 2) continue;
-      if (occlude && pOcc[i] === 1) {
+      const nD = decksAbove(Wk, pLink[i], pNext[i], -1, pX[i], pY[i], 1);
+      if ((occlude && pOcc[i] === 1) || nD) {
         OCC_RECT[0] = px - (bike ? 1.2 : 0.55) * s - 1; OCC_RECT[1] = py - 2 * k - 1; OCC_RECT[2] = px + (bike ? 1.2 : 0.55) * s + 1; OCC_RECT[3] = py + 0.4 * s + 1;
-        drawClipped(ctx, pX[i], pY[i], bike ? 0.9 : 0.35, OCC_RECT, drawPersonAt, i, s >= 12, personCand, i * CAND_STRIDE + 1);
+        const nF = occlude && pOcc[i] === 1 ? frontOf(pX[i], pY[i], bike ? 0.9 : 0.35, OCC_RECT, s >= 12, personCand, i * CAND_STRIDE + 1) : 0;
+        drawCut(ctx, OCC_RECT, nF, nD, pX[i], pY[i], 1, drawPersonAt, i);
       } else drawPersonAt(ctx, i);
     }
     ctx.globalAlpha = 1;
@@ -1331,7 +1461,7 @@ export function init(app) {
       const hsx = PA * hx + PB * hy, hsy = PC * hx + PD * hy;          // heading on screen, px per metre
       const away = hx * D0 + hy * D1 > 0;                              // walking away from the camera: we see the back
       const bike = pBike[i];
-      ctx.globalAlpha = pAlpha[i];
+      ctx.globalAlpha = pShow[i];
       const bw = 0.46 * s, lw = 0.16 * s;
       const jacket = JACKETS[pJacket[i]][0];
       if (bike) {
@@ -1409,6 +1539,8 @@ export function init(app) {
       }
       return out;
     },
+    // run the simulation on for sec seconds without drawing (for tests of how the traffic settles)
+    advance(sec, dt = 0.1) { for (let t = 0; t < sec; t += dt) stepFrame({ dt }); return this.state(); },
     // where a cyclist is (for tests: fly there and look)
     cyclist() { for (let i = 0; i < nPeople; i++) if (pBike[i]) return geo.toLatLon(pX[i], pY[i]); return null; },
     // every approach to the junctions near a lat/lon: its controls, and the cars on it
@@ -1586,10 +1718,191 @@ function buildNet(g, drive, world) {
   net.outList = new Int32Array(LK);
   const fill = net.outStart.slice(0, N);
   for (let l = 0; l < LK; l++) net.outList[fill[net.lFrom[l]]++] = l;
-  // nodes near the map's edge: traffic leaves there instead of turning round
+  // where traffic leaves the map instead of turning round: the nodes where the build cut the graph at the slab's edge
+  // (flag EXIT); data from before that mark has none, and then any node near the edge stands in
   net.nEdge = new Uint8Array(N);
-  for (let i = 0; i < N; i++) if (nx[i] - world.x0 < 70 || world.x1 - nx[i] < 70 || ny[i] - world.y0 < 70 || world.y1 - ny[i] < 70) net.nEdge[i] = 1;
+  let exits = 0;
+  for (let i = 0; i < N; i++) if (net.flags[i] & EXIT) { net.nEdge[i] = 1; exits++; }
+  if (!exits) for (let i = 0; i < N; i++) if (nx[i] - world.x0 < 70 || world.x1 - nx[i] < 70 || ny[i] - world.y0 < 70 || world.y1 - ny[i] < 70) net.nEdge[i] = 1;
+  net.exits = exits;
+  // filled lazily (see insideOf, decksOver, sideOf): per edge, the stretches inside buildings, the bridge decks above it,
+  // and how far to each side it is clear of walls
+  net.inside = new Array(E); net.under = new Array(E); net.side = new Array(E);
   return net;
+}
+
+// ------------------------------------------------------------------------------------------------ buildings and bridges
+// Buildings standing on the ground, binned by bounding box: a street or path running inside one is drawn under it, so
+// whoever is there is out of sight. (Raised ones, mh > 2.2, are canopies and bridges: app.scene.inFront deals with them.)
+function makeSolids(buildings) {
+  const CELL = 50, grid = new Map();
+  buildings.forEach((b, i) => {
+    if (b.hidden || (b.mh || 0) > 2.2 || !b.p || !b.p[0] || b.p[0].length < 6) return;
+    const f = b.p[0];
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (let k = 0; k < f.length; k += 2) { if (f[k] < x0) x0 = f[k]; if (f[k] > x1) x1 = f[k]; if (f[k + 1] < y0) y0 = f[k + 1]; if (f[k + 1] > y1) y1 = f[k + 1]; }
+    for (let gx = Math.floor(x0 / CELL); gx <= Math.floor(x1 / CELL); gx++) for (let gy = Math.floor(y0 / CELL); gy <= Math.floor(y1 / CELL); gy++) {
+      const key = gx * 65536 + gy;
+      let c = grid.get(key); if (!c) grid.set(key, (c = [])); c.push(i);
+    }
+  });
+  return { CELL, grid, buildings };
+}
+function insideSolid(S, x, y) {
+  const c = S.grid.get(Math.floor(x / S.CELL) * 65536 + Math.floor(y / S.CELL));
+  if (!c) return false;
+  for (const i of c) {
+    const p = S.buildings[i].p;
+    if (!ringHas(p[0], x, y)) continue;
+    let hole = false;
+    for (let h = 1; h < p.length && !hole; h++) hole = ringHas(p[h], x, y);   // a courtyard is outdoors
+    if (!hole) return true;
+  }
+  return false;
+}
+function ringHas(f, x, y) {
+  let inside = false;
+  for (let i = 0, n = f.length, j = n - 2; i < n; j = i, i += 2) {
+    const xi = f[i], yi = f[i + 1], xj = f[j], yj = f[j + 1];
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) inside = !inside;
+  }
+  return inside;
+}
+// The stretches of edge e that run inside a building, as [from, to, …] metres from its first node (null: none). Sampled
+// every metre, the first time anyone goes that way.
+function insideOf(net, e, S) {
+  let r = net.inside[e];
+  if (r !== undefined) return r;
+  r = null;
+  const pts = net.ePts[e], cum = net.eCum[e], L = net.eLen[e];
+  const n = Math.max(1, Math.ceil(L)), step = L / n;
+  let q = 1, from = -1;
+  for (let k = 0; k <= n; k++) {
+    const se = k < n ? (k + 0.5) * step : Infinity;
+    let inside = false;
+    if (k < n) {
+      while (q < cum.length - 1 && cum[q] < se) q++;
+      const seg = cum[q] - cum[q - 1], t = seg > 0 ? (se - cum[q - 1]) / seg : 0;
+      inside = insideSolid(S, pts[2 * q - 2] + (pts[2 * q] - pts[2 * q - 2]) * t, pts[2 * q - 1] + (pts[2 * q + 1] - pts[2 * q - 1]) * t);
+    }
+    if (inside && from < 0) from = k * step;
+    else if (!inside && from >= 0) { (r || (r = [])).push(from, Math.min(L, k * step)); from = -1; }
+  }
+  net.inside[e] = r ? Float32Array.from(r) : null;
+  return net.inside[e];
+}
+// How far to either side of edge e's line one can go without walking into a building (with room for a body): [lo, hi]
+// along the line's left normal, within ±reach, or null when nothing is in the way. Paths often hug a wall: without this
+// the spread across the path puts walkers inside it, where they show on the wall or roof. Sampled every two metres,
+// ends included, leaving out the stretches that run indoors.
+function sideOf(net, e, S, reach) {
+  let r = net.side[e];
+  if (r !== undefined) return r;
+  const pts = net.ePts[e], cum = net.eCum[e], nrm = net.eNrm[e], L = net.eLen[e], rs = insideOf(net, e, S);
+  const n = Math.max(1, Math.ceil(L / 2)), BODY = 0.3;
+  let lo = -reach, hi = reach, q = 1;
+  for (let k = 0; k <= n; k++) {
+    const se = k * (L / n);
+    let indoors = false;
+    if (rs) for (let j = 0; j < rs.length; j += 2) if (se > rs[j] - 1 && se < rs[j + 1] + 1) indoors = true;
+    if (indoors) continue;
+    while (q < cum.length - 1 && cum[q] < se) q++;
+    const seg = cum[q] - cum[q - 1], t = seg > 0 ? (se - cum[q - 1]) / seg : 0;
+    const x = pts[2 * q - 2] + (pts[2 * q] - pts[2 * q - 2]) * t, y = pts[2 * q - 1] + (pts[2 * q + 1] - pts[2 * q - 1]) * t;
+    const nx = nrm[2 * q - 2] + (nrm[2 * q] - nrm[2 * q - 2]) * t, ny = nrm[2 * q - 1] + (nrm[2 * q + 1] - nrm[2 * q - 1]) * t;
+    while (hi > -reach && insideSolid(S, x + nx * (hi + BODY), y + ny * (hi + BODY))) hi -= 0.25;
+    while (lo < reach && insideSolid(S, x + nx * (lo - BODY), y + ny * (lo - BODY))) lo += 0.25;
+  }
+  if (lo > hi) lo = hi = (lo + hi) / 2;
+  r = lo > -reach || hi < reach ? Float32Array.of(lo, hi) : null;
+  net.side[e] = r;
+  return r;
+}
+
+// Bridge decks (roads and paths on bridges), as the renderer draws them, with their segments binned on the ground.
+function makeDecks(data) {
+  const items = [], CELL = 50, grid = new Map();
+  const add = (f, hw) => {
+    if (!f.br || f.tn || !f.pts || f.pts.length < 4) return;
+    const it = items.length, pts = f.pts;
+    items.push({ pts, hw, ly: f.ly != null ? f.ly : 1 });   // a bridge without a layer is taken to be on layer 1
+    for (let s = 0; s + 3 < pts.length; s += 2) {
+      const x0 = Math.min(pts[s], pts[s + 2]) - hw, x1 = Math.max(pts[s], pts[s + 2]) + hw;
+      const y0 = Math.min(pts[s + 1], pts[s + 3]) - hw, y1 = Math.max(pts[s + 1], pts[s + 3]) + hw;
+      for (let gx = Math.floor(x0 / CELL); gx <= Math.floor(x1 / CELL); gx++) for (let gy = Math.floor(y0 / CELL); gy <= Math.floor(y1 / CELL); gy++) {
+        const key = gx * 65536 + gy;
+        let c = grid.get(key); if (!c) grid.set(key, (c = [])); c.push(it, s >> 1);
+      }
+    }
+  };
+  for (const r of data.roads || []) add(r, r.w / 2 + DECK_EDGE_ROAD);
+  for (const p of data.paths || []) add(p, p.w / 2 + DECK_EDGE_PATH);
+  return { items, CELL, grid };
+}
+// The highest layer among the decks (other than skip) that run along direction (ux, uy) through ground point (x, y):
+// the bridge, if any, that something going that way there is on. -Infinity when none.
+function deckAlong(D, x, y, ux, uy, skip) {
+  const c = D.grid.get(Math.floor(x / D.CELL) * 65536 + Math.floor(y / D.CELL));
+  let best = -Infinity;
+  if (c) for (let k = 0; k < c.length; k += 2) {
+    const it = D.items[c[k]];
+    if (c[k] === skip || it.ly <= best) continue;
+    const p = it.pts, s = 2 * c[k + 1], ax = p[s], ay = p[s + 1], dx = p[s + 2] - ax, dy = p[s + 3] - ay, L = Math.hypot(dx, dy);
+    if (L < 1e-6 || Math.abs(dx * uy - dy * ux) > 0.35 * L) continue;   // not running the same way
+    if (segDist(x, y, ax, ay, dx, dy) <= it.hw) best = it.ly;
+  }
+  return best;
+}
+function segDist(x, y, ax, ay, dx, dy) {
+  const L2 = dx * dx + dy * dy, t = L2 > 0 ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / L2)) : 0;
+  return Math.hypot(ax + dx * t - x, ay + dy * t - y);
+}
+// The decks edge e passes under (indices into D.items), or null: decks it crosses on the ground, unless it is on a bridge
+// itself there (a deck running along it) on the same layer or higher. Where it ends on the deck's line it joins that
+// bridge rather than passing under it: so when another edge at that node runs along the deck.
+function decksOver(net, e, D) {
+  let u = net.under[e];
+  if (u !== undefined) return u;
+  u = null;
+  const pts = net.ePts[e], np = pts.length / 2, CELL = D.CELL;
+  for (let k = 1; k < np && D.items.length; k++) {
+    const ax = pts[2 * k - 2], ay = pts[2 * k - 1], dx = pts[2 * k] - ax, dy = pts[2 * k + 1] - ay, len = Math.hypot(dx, dy);
+    if (len < 1e-6) continue;
+    for (let gx = Math.floor(Math.min(ax, ax + dx) / CELL); gx <= Math.floor(Math.max(ax, ax + dx) / CELL); gx++) {
+      for (let gy = Math.floor(Math.min(ay, ay + dy) / CELL); gy <= Math.floor(Math.max(ay, ay + dy) / CELL); gy++) {
+        const c = D.grid.get(gx * 65536 + gy);
+        if (!c) continue;
+        for (let j = 0; j < c.length; j += 2) {
+          const id = c[j];
+          if (u && u.includes(id)) continue;
+          const it = D.items[id], p = it.pts, s = 2 * c[j + 1];
+          const cx = p[s], cy = p[s + 1], fx = p[s + 2] - cx, fy = p[s + 3] - cy, flen = Math.hypot(fx, fy);
+          const den = dx * fy - dy * fx;
+          if (Math.abs(den) < 0.3 * len * flen) continue;            // (nearly) parallel: no crossing
+          const t = ((cx - ax) * fy - (cy - ay) * fx) / den, w = ((cx - ax) * dy - (cy - ay) * dx) / den;
+          if (t < 0 || t > 1 || w < 0 || w > 1) continue;
+          const px = ax + dx * t, py = ay + dy * t;
+          if (deckAlong(D, px, py, dx / len, dy / len, id) >= it.ly) continue;   // on a bridge as high or higher
+          const atEnd = (k === 1 && t * len < 1) ? net.eA[e] : (k === np - 1 && (1 - t) * len < 1) ? net.eB[e] : -1;
+          if (atEnd >= 0 && joinsDeck(net, atEnd, D, id, px, py)) continue;
+          (u || (u = [])).push(id);
+        }
+      }
+    }
+  }
+  net.under[e] = u;
+  return u;
+}
+function joinsDeck(net, n, D, id, x, y) {
+  const it = D.items[id], p = it.pts;
+  for (let k = net.outStart[n]; k < net.outStart[n + 1]; k++) {
+    const m = net.outList[k], ux = net.lHx0[m], uy = net.lHy0[m];
+    for (let s = 0; s + 3 < p.length; s += 2) {
+      const ax = p[s], ay = p[s + 1], dx = p[s + 2] - ax, dy = p[s + 3] - ay, L = Math.hypot(dx, dy);
+      if (L > 1e-6 && Math.abs(dx * uy - dy * ux) <= 0.35 * L && segDist(x, y, ax, ay, dx, dy) <= it.hw) return true;
+    }
+  }
+  return false;
 }
 
 // Stop lines, junction curve radii, right of way and stop signs, from the shape of each junction.
@@ -1714,6 +2027,8 @@ function buildPieces(net, step, world, weigh) {
       while (q < cum.length - 1 && cum[q] < se) q++;
       const seg = cum[q] - cum[q - 1], t = seg > 0 ? (se - cum[q - 1]) / seg : 0;
       const x = pts[2 * q - 2] + (pts[2 * q] - pts[2 * q - 2]) * t, y = pts[2 * q - 1] + (pts[2 * q + 1] - pts[2 * q - 1]) * t;
+      // only on the slab (older data runs the graphs on past its edge)
+      if (x < world.x0 + 2 || x > world.x1 - 2 || y < world.y0 + 2 || y > world.y1 - 2) continue;
       const w = weigh(e, x, y);
       if (!w || w[0] + w[1] <= 0) continue;
       const gx = Math.max(0, Math.min(GW - 1, Math.floor((x - world.x0) / CELL))), gy = Math.max(0, Math.min(GH - 1, Math.floor((y - world.y0) / CELL)));
@@ -1768,8 +2083,87 @@ function makeSampler(P) {
 }
 
 // ------------------------------------------------------------------------------------------------ helpers
-// the renderer's integer hash (render.js), to know which trees it draws bare
-function nHash(n) { n = (n ^ 61) ^ (n >>> 16); n = n + (n << 3); n = n ^ (n >>> 4); n = Math.imul(n, 0x27d4eb2d); n = n ^ (n >>> 15); return (n >>> 0) / 4294967296; }
+// A stand-in for a path (see drawCut) that keeps each closed piece apart: its commands (code and four numbers: 0 move,
+// 1 line, 2 circle, 3 ellipse) and its bounds, so that one piece can be replayed as "a box minus this shape". Only what
+// renderer.silhouette uses is implemented: full circles and unrotated ellipses.
+function makeRecorder() {
+  let ops = new Float64Array(2048), n = 0, info = new Float64Array(6 * 64);   // per piece: first op, end, x0, y0, x1, y1
+  const paths = [], mats = [];      // pieces added whole with addPath (their first op is -1 - their index here)
+  let open = false;
+  const rec = { count: 0 };
+  function start(first) {
+    if (6 * (rec.count + 1) > info.length) { const o = new Float64Array(info.length * 2); o.set(info); info = o; }
+    const b = 6 * rec.count++;
+    info[b] = first; info[b + 1] = n; info[b + 2] = info[b + 3] = Infinity; info[b + 4] = info[b + 5] = -Infinity;
+  }
+  function grow(x0, y0, x1, y1) {
+    const b = 6 * (rec.count - 1);
+    if (x0 < info[b + 2]) info[b + 2] = x0; if (y0 < info[b + 3]) info[b + 3] = y0;
+    if (x1 > info[b + 4]) info[b + 4] = x1; if (y1 > info[b + 5]) info[b + 5] = y1;
+  }
+  function op(code, a, b, c, d) {
+    if (!open) { start(n); open = true; }
+    if (n + 5 > ops.length) { const o = new Float64Array(ops.length * 2); o.set(ops); ops = o; }
+    ops[n++] = code; ops[n++] = a; ops[n++] = b; ops[n++] = c; ops[n++] = d;
+    info[6 * (rec.count - 1) + 1] = n;
+  }
+  rec.reset = () => { n = 0; rec.count = 0; open = false; paths.length = 0; mats.length = 0; };
+  rec.moveTo = (x, y) => { open = false; op(0, x, y, 0, 0); grow(x, y, x, y); };
+  rec.lineTo = (x, y) => { op(1, x, y, 0, 0); grow(x, y, x, y); };
+  rec.closePath = () => { open = false; };
+  rec.arc = (x, y, r) => { op(2, x, y, r, r); grow(x - r, y - r, x + r, y + r); };
+  rec.ellipse = (x, y, rx, ry) => { op(3, x, y, rx, ry); grow(x - rx, y - ry, x + rx, y + ry); };
+  rec.meets = (p, X0, Y0, X1, Y1) => { const b = 6 * p; return info[b + 4] >= X0 && info[b + 2] <= X1 && info[b + 5] >= Y0 && info[b + 3] <= Y1; };
+  // clip ctx to the box [X0, Y0, X1, Y1] minus piece p
+  rec.cut = (ctx, p, X0, Y0, X1, Y1) => {
+    const b = 6 * p, first = info[b];
+    if (first < 0) {
+      const path = new Path2D();
+      path.rect(X0, Y0, X1 - X0, Y1 - Y0); path.addPath(paths[-1 - first], mats[-1 - first]);
+      ctx.clip(path, "evenodd");
+      return;
+    }
+    ctx.beginPath(); ctx.rect(X0, Y0, X1 - X0, Y1 - Y0);
+    for (let k = first, end = info[b + 1]; k < end; k += 5) {
+      const c = ops[k], x = ops[k + 1], y = ops[k + 2];
+      if (c === 0) ctx.moveTo(x, y);
+      else if (c === 1) ctx.lineTo(x, y);
+      else if (c === 2) { ctx.moveTo(x + ops[k + 3], y); ctx.arc(x, y, ops[k + 3], 0, Math.PI * 2); }
+      else { ctx.moveTo(x + ops[k + 3], y); ctx.ellipse(x, y, ops[k + 3], ops[k + 4], 0, 0, Math.PI * 2); }
+    }
+    ctx.closePath();
+    ctx.clip("evenodd");
+  };
+  // the same recorder, also taking addPath: the whole path (under matrix m) as one piece, bounded by its unit box mapped
+  // through m with some room to spare (the renderer's templates lie within ±1.2)
+  rec.withAddPath = () => Object.assign(Object.create(rec), {
+    addPath(path, m) {
+      open = false;
+      start(-1 - paths.length); paths.push(path); mats.push(m);
+      for (let c = 0; c < 4; c++) {
+        const u = c & 1 ? 1.2 : -1.2, v = c & 2 ? 1.2 : -1.2, x = m.a * u + m.c * v + m.e, y = m.b * u + m.d * v + m.f;
+        grow(x, y, x, y);
+      }
+    },
+  });
+  return rec;
+}
+// the convex hull of the first n points (flat x, y pairs) of P, into out; returns its number of points
+const HULL_IDX = new Int32Array(16), HULL_CH = new Int32Array(32);
+function hull(P, n, out) {
+  for (let i = 0; i < n; i++) {
+    let j = i;
+    while (j > 0 && (P[2 * HULL_IDX[j - 1]] > P[2 * i] || (P[2 * HULL_IDX[j - 1]] === P[2 * i] && P[2 * HULL_IDX[j - 1] + 1] > P[2 * i + 1]))) { HULL_IDX[j] = HULL_IDX[j - 1]; j--; }
+    HULL_IDX[j] = i;
+  }
+  const cross = (o, a, b) => (P[2 * a] - P[2 * o]) * (P[2 * b + 1] - P[2 * o + 1]) - (P[2 * a + 1] - P[2 * o + 1]) * (P[2 * b] - P[2 * o]);
+  let k = 0;
+  for (let i = 0; i < n; i++) { const q = HULL_IDX[i]; while (k >= 2 && cross(HULL_CH[k - 2], HULL_CH[k - 1], q) <= 0) k--; HULL_CH[k++] = q; }
+  for (let i = n - 2, lo = k + 1; i >= 0; i--) { const q = HULL_IDX[i]; while (k >= lo && cross(HULL_CH[k - 2], HULL_CH[k - 1], q) <= 0) k--; HULL_CH[k++] = q; }
+  k--;   // the first point comes round again at the end
+  for (let i = 0; i < k; i++) { out[2 * i] = P[2 * HULL_CH[i]]; out[2 * i + 1] = P[2 * HULL_CH[i] + 1]; }
+  return k;
+}
 function hash2(x, y) {
   let h = Math.imul((x * 100) | 0, 374761393) ^ Math.imul((y * 100) | 0, 668265263);
   h = Math.imul(h ^ (h >>> 13), 1274126177);

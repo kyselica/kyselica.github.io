@@ -1,14 +1,21 @@
 // Map labels and the building highlight.
 //
 //   "labels" (z 90): building names over their roofs, big italic names for the campus areas and the neighbourhoods round
-//   them, the river's name along its course, street names along the streets up close and shop and café names closer still.
-//   Every frame the candidates near the view are placed greedily by priority in screen space (boxes bucketed in a grid);
-//   more fit as you zoom in, and each one fades in and out instead of popping. Text is drawn once into a small sprite with
-//   its halo and stamped from then on, so a frame costs a few dozen drawImage calls rather than hundreds of strokeTexts.
-//   "building-highlight" (z 60): a soft scarlet outline round the building under the pointer and the one whose card is open.
+//   them, the river's name along its course, street names along the streets up close (drawn by "street-labels", below)
+//   and shop and café names closer still.
+//   Whenever the view changes the candidates near it are placed greedily by priority in screen space (boxes bucketed in a
+//   grid); more fit as you zoom in, and each one fades in and out instead of popping. A name whose roof is hidden behind a
+//   taller building stays off (it would read as that building's), and the building the pointer rests on, or whose card is
+//   open, gets its name shown first. Text is drawn once into a small sprite with its halo and stamped from then on, so a
+//   frame costs a few dozen drawImage calls rather than hundreds of strokeTexts.
+//   "street-labels" (z 15): the street names, placed with the others but drawn low, like paint on the road, so the
+//   traffic on a street drives over its name (the "Labels" toggle switches both layers).
+//   "building-highlight" (z 60): a soft scarlet outline round the building under the pointer and the one whose card is
+//   open, cut where nearer buildings stand in front of it.
 //
 // Also: clicking a building label picks the building, a search provider for named buildings, and the "Labels" toggle.
-// app.labels exposes a little state for tests (?: app.labels.highlight(i), app.labels.stats).
+// app.labels exposes a little state for tests and the console (stats, shown(), states(), boxes(), highlight(i), hover(i),
+// bench(), placeOnce(), trace()).
 
 const SERIF = '"Fraunces", Georgia, "Times New Roman", serif';
 const SANS = '"Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
@@ -280,6 +287,7 @@ export function init(app) {
       lines: null, w: 0, h: 0, mGen: -1, gw: null,
       ox: 0, oy: 0, bx0: 0, by0: 0, bx1: 0, by1: 0, gX: null, gY: null, gA: null, gn: 0,
       spr: null, sprN: null, gD: -1, gN: -1, used: 0,
+      root: -1, seen: null, focus: 0,
     };
     cands.push(c);
     return c;
@@ -287,6 +295,7 @@ export function init(app) {
 
   // buildings: one label per name and place (a hospital's two wings share one), the biggest footprint carrying it
   const buildingCand = new Map();     // building index → its label
+  const candByRoot = new Map();       // the building a hover or a card stands for (see rootOf) → the label naming it
   const searchIndex = [];
   {
     const groups = new Map();
@@ -300,9 +309,12 @@ export function init(app) {
       let list = groups.get(key);
       if (!list) groups.set(key, (list = []));
       const near = list.find((e) => Math.hypot(e.x - ix, e.y - iy) < 250);
-      const e = { i, name, x: ix, y: iy, h, A: absArea[i] };
-      if (near) { if (e.A > near.A) Object.assign(near, e); return; }
-      list.push(e);
+      if (near) {
+        near.all.push(i);
+        if (absArea[i] > near.A) Object.assign(near, { i, x: ix, y: iy, h, A: absArea[i] });
+        return;
+      }
+      list.push({ i, name, x: ix, y: iy, h, A: absArea[i], all: [i] });
     };
     for (let i = 0; i < B.length; i++) {
       const b = B[i];
@@ -336,8 +348,11 @@ export function init(app) {
         const label = SHORT[e.name] || e.name;
         const c = cand(K_BUILDING, label, e.x, e.y, e.h, boost >= 4 ? "landmark" : "building", imp, minS, Infinity);
         c.bi = e.i;
+        c.root = rootOf(e.i);
         statics.push(c);
         buildingCand.set(e.i, c);
+        for (const k of e.all) if (!candByRoot.has(rootOf(k))) candByRoot.set(rootOf(k), c);
+        candByRoot.set(c.root, c);
         const kind = KIND_NAME[b.k] || (b.k === "yes" ? "Building" : String(b.k || "building").replace(/_/g, " ").replace(/^./, (m) => m.toUpperCase()));
         const n = norm(e.name), sn = SHORT[e.name] ? norm(SHORT[e.name]) : null;
         searchIndex.push({
@@ -569,6 +584,36 @@ export function init(app) {
     return hidden > Math.max(0, (k1 - k0 + 1) * 0.25);
   }
 
+  // Can the spot a building's (or a shop's) label hangs from be seen at rotation r? Among the towers of the medical
+  // centre a lower roof's middle is often behind a taller neighbour, and its name hung there would read as the
+  // neighbour's. Worked out once per label and rotation (it doesn't change with zoom), a few each placement.
+  /** 1 seen, 0 hidden, -1 not known yet */
+  function anchorSeen(c, r) {
+    if (!c.seen) c.seen = new Int8Array(4).fill(-1);
+    if (c.seen[r] >= 0) return c.seen[r];
+    if (sceneState[r] !== 2) { readyScene(r); return -1; }
+    if (visBudget <= 0) { visDeferred = true; return -1; }
+    visBudget--;
+    const S = app.scene.forRot(r);
+    // a hair below the anchor, so it lands on the roof rather than its back edge
+    const j = app.scene.pickBuilding(r, projX[r][c.id], projY[r][c.id] + 0.3);
+    let seen = 1;
+    if (j >= 0) {
+      const bj = B[j];
+      if (c.kind === K_POI) {
+        // a shop sits on the roof of the building it is in (or on the ground): any other building there stands over it
+        seen = pointInRing(bj.p[0], c.x, c.y) ? 1 : 0;
+      } else if (rootOf(j) !== c.root && !pointInRing(bj.p[0], c.x, c.y)) {
+        // someone else's roof or wall: hidden if the tiles paint it after this building (over it), fine if it is
+        // behind (the anchor is in the air above a low wing, in front of a taller building further back)
+        let own = Infinity;
+        for (const i of B[c.bi].hidden ? (members.get(c.bi) || []) : [c.bi]) if (S.rank[i] < own) own = S.rank[i];
+        seen = own === Infinity || S.rank[j] < own ? 1 : 0;
+      }
+    }
+    return (c.seen[r] = seen);
+  }
+
   // ---------------------------------------------------------------- text: measuring, sprites
   const LS_OK = typeof CanvasRenderingContext2D !== "undefined" && "letterSpacing" in CanvasRenderingContext2D.prototype;
   const mctx = document.createElement("canvas").getContext("2d");
@@ -742,7 +787,7 @@ export function init(app) {
   const tbPush = (x0, y0, x1, y1) => { if (tbN < 96) { const o = 4 * tbN++; TB[o] = x0; TB[o + 1] = y0; TB[o + 2] = x1; TB[o + 3] = y1; } };
 
   // ---------------------------------------------------------------- layout of one candidate (fills TB with its boxes)
-  const placedStreets = [];          // { name, x, y } this placement, to keep one label per street per stretch of screen
+  const placedStreets = [];          // { name, x, y } this placement: one label per street (or building name) per stretch of screen
   let placedN = 0;
   function streetClash(name, x, y, minD) {
     for (let i = 0; i < placedN; i++) {
@@ -771,11 +816,14 @@ export function init(app) {
         c.X = projX[r][c.id]; c.Y = projY[r][c.id];
       }
     }
+    if ((c.kind === K_BUILDING || c.kind === K_POI) && anchorSeen(c, r) !== 1) return false;
     const px = (c.X - vX) * s + W2, py = (c.Y - vY) * s + H2;
     const pad = Math.ceil(c.st.halo + 3);
     if (c.kind === K_BUILDING) {
+      // a name OpenStreetMap gives to two wings far apart (University Hospital) is shown once in most of a screen
+      if (streetClash(c.name, px, py, Math.max(480, 0.6 * Math.max(W2, H2) * 2))) return false;
       let lift = GAP;
-      if (c.bi === selRoot) lift += 13;    // clear of the card's marker on the roof
+      if (c === selCand) lift += 13;       // clear of the card's marker on the roof
       c.bx0 = -c.w / 2; c.bx1 = c.w / 2; c.by1 = -lift; c.by0 = -lift - c.h;
       c.ox = c.bx0 - pad; c.oy = c.by0 - pad;
       tbPush(px + c.bx0 - 3, py + c.by0 - 1, px + c.bx1 + 3, py + c.by1 + 1);
@@ -874,12 +922,29 @@ export function init(app) {
     return true;
   }
 
+  // ---------------------------------------------------------------- focus: the hovered building's name, the open card's
+  // The label of the building whose card is open, and of the one the pointer rests on (after a moment, so sweeping
+  // across the map doesn't shuffle the labels round it; and only from a middling zoom in, where the pointer is on one
+  // building rather than a crowd of them), is placed first, even where it is too small to have a label at this zoom.
+  const HOVER_LABEL_S = 1, HOVER_DWELL_MS = 320;
+  let hoverCand = null, hoverSince = 0, selCand = null;
+  const focused = [];
+  function updateFocus(now) {
+    const h = hoverCand && hoverCand !== selCand && view.s >= HOVER_LABEL_S && now - hoverSince >= HOVER_DWELL_MS ? hoverCand : null;
+    if (focused.length === (selCand ? 1 : 0) + (h ? 1 : 0) && (!selCand || selCand.focus === 2) && (!h || h.focus === 1)) return;
+    for (const c of focused) c.focus = 0;
+    focused.length = 0;
+    if (selCand) { selCand.focus = 2; focused.push(selCand); }
+    if (h) { h.focus = 1; focused.push(h); }
+    dirty = true;
+  }
+
   // ---------------------------------------------------------------- placement
   let vis = [], visPrev = [];
   let stamp = 0, dirty = true;
   let lastX = NaN, lastY = NaN, lastS = NaN, lastR = -1, lastW = 0, lastH = 0, lastPlace = -1e9;
   const byK = (a, b) => b.k - a.k;
-  let trace = null;
+  let trace = null, prof = null;
   const stats = { placeMs: 0, drawMs: 0, hlMs: 0, shown: 0, considered: 0, sprites: 0, frames: 0 };
 
   const chrome = [];
@@ -901,7 +966,7 @@ export function init(app) {
     const PX = projX[r], PY = projY[r];
     for (let i = 0; i < list.length; i++) {
       const c = list[i];
-      if (s < c.minS * 0.8 || s > c.maxS * 1.25) continue;
+      if (!c.focus && (s < c.minS * 0.8 || s > c.maxS * 1.25)) continue;
       if (stepFor && !c.on && c.a <= 0 && c.ai % stepFor(c) !== 0) continue;
       const X = PX[c.id], Y = PY[c.id];
       if (X < X0 || X > X1 || Y < Y0 || Y > Y1) continue;
@@ -936,7 +1001,7 @@ export function init(app) {
     const cx = W2, cy = H2;
     for (let i = 0; i < vis.length; i++) {
       const c = vis[i];
-      let k = c.pri * (c.on ? 1.35 : 1);
+      let k = c.pri * (c.on ? 1.35 : 1) + c.focus * 1e7;
       if (c.kind === K_STREET || c.kind === K_CURVE || c.kind === K_POI) {
         // among equals, the ones nearer the middle of the screen first
         const px = (projX[r][c.id] - view.X) * s + cx, py = (projY[r][c.id] - view.Y) * s + cy;
@@ -944,7 +1009,9 @@ export function init(app) {
       }
       c.k = k;
     }
+    const tg = prof ? performance.now() : 0;
     vis.sort(byK);
+    if (prof) { prof[0] = tg - t0; prof[1] = performance.now() - tg; }
     gridReset(W, H);
     // the bar, the map buttons, the status line and open cards sit over the map: no labels under them
     if (t - chromeT > 1000) readChrome(t);
@@ -954,17 +1021,18 @@ export function init(app) {
     let shown = 0;
     for (let i = 0; i < vis.length; i++) {
       const c = vis[i];
-      if (s < c.minS || s > c.maxS || !layout(c, s, r, W2, H2)) { c.on = false; continue; }
+      if ((!c.focus && (s < c.minS || s > c.maxS)) || !layout(c, s, r, W2, H2)) { c.on = false; continue; }
       let hit = false;
       // whole labels only: one cut by the screen's edge waits until it is all in view
       for (let b = 0; b < tbN && !hit; b++) { const o = 4 * b; hit = TB[o] < -2 || TB[o + 1] < -2 || TB[o + 2] > W + 2 || TB[o + 3] > H + 2; }
       for (let b = 0; b < tbN && !hit; b++) { const o = 4 * b; hit = gridHit(TB[o], TB[o + 1], TB[o + 2], TB[o + 3]); }
       if (hit) { c.on = false; continue; }
       for (let b = 0; b < tbN; b++) { const o = 4 * b; gridAdd(TB[o], TB[o + 1], TB[o + 2], TB[o + 3]); }
-      if (c.kind === K_STREET || c.kind === K_CURVE) notePlaced(c.name, (c.X - view.X) * s + W2, (c.Y - view.Y) * s + H2);
+      if (c.kind !== K_AREA && c.kind !== K_POI) notePlaced(c.name, (c.X - view.X) * s + W2, (c.Y - view.Y) * s + H2);
       c.on = true;
       shown++;
     }
+    if (prof) prof[2] = performance.now() - t0 - prof[0] - prof[1];
     lastX = view.X; lastY = view.Y; lastS = s; lastR = r; lastW = W; lastH = H; lastPlace = t;
     dirty = visDeferred;             // some streets wait on their visibility: place again next frame
     stats.shown = shown; stats.considered = vis.length;
@@ -1014,29 +1082,45 @@ export function init(app) {
     return true;
   }
 
-  function drawLabels(ctx, f) {
+  // Street names lie on the road like paint: they are drawn low in the stack ("street-labels", z 15: over the route
+  // lines, under the stops and everything that moves), so a bus or a car on a named street drives over its name rather
+  // than under it. Every other name stands above it all at z 90. One placement serves both: whichever layer draws first
+  // in a frame advances the labels (placement, focus, palette, the sprite budget), then each draws its own kinds.
+  let advFrame = -1, placeMs = 0, passMs = 0, made0 = 0, fadeStep = 0, budgetLeft = 0;
+  function advance(f) {
+    if (advFrame === f.frame) return;
+    advFrame = f.frame;
     const t0 = performance.now();
+    passMs = 0;
     if (view.dpr !== sprDpr) { sprDpr = view.dpr; gen++; dirty = true; }
+    updateFocus(t0);
     const moved = view.X !== lastX || view.Y !== lastY;
     const zoomed = view.s !== lastS || view.rot !== lastR || view.w !== lastW || view.h !== lastH;
     // a pan keeps every label's place relative to the others: re-place now and then (for labels coming in at the edges)
     if (dirty || zoomed || (moved && f.t - lastPlace > 110)) place(f.t);
-    const t1 = performance.now();
-    budgetEnd = t0 + 2.5;            // new sprites per frame: a zoom that reveals many labels spreads them over frames
-    const made0 = sprites;
-    const step = motionMQ.matches ? 1 : f.dt / FADE_S;
+    placeMs = performance.now() - t0;
+    // new sprites per frame: a zoom that reveals many labels spreads them over frames. 2.5 ms in all, placement
+    // included, shared by the two passes (each starts its own clock: other layers draw in between)
+    budgetLeft = Math.max(0, 2.5 - placeMs);
+    made0 = sprites;
+    fadeStep = motionMQ.matches ? 1 : f.dt / FADE_S;
     const want = nightTarget();
     if (paletteMix < 0) paletteMix = want;
     paletteMix = want > paletteMix ? Math.min(want, paletteMix + f.dt / 0.6) : Math.max(want, paletteMix - f.dt / 0.6);
-    const s = view.s, W2 = view.w / 2, H2 = view.h / 2, dpr = view.dpr;
+  }
+
+  /** draw this frame's street names (streets = true) or all the other labels, fading each toward its state */
+  function drawPass(ctx, f, streets) {
+    const t0 = performance.now();
+    budgetEnd = t0 + budgetLeft;
+    const s = view.s, W2 = view.w / 2, H2 = view.h / 2, dpr = view.dpr, step = fadeStep;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.imageSmoothingEnabled = true;
     // lowest priority first, so the important ones sit on top while others fade
     for (let i = vis.length - 1; i >= 0; i--) {
       const c = vis[i];
-      if (!c.on && c.a <= 0) continue;
-      const target = c.on ? 1 : 0;
-      const a1 = target > c.a ? Math.min(1, c.a + step) : Math.max(0, c.a - step);
+      if ((c.kind === K_STREET) !== streets || (!c.on && c.a <= 0)) continue;
+      const a1 = c.on ? Math.min(1, c.a + step) : Math.max(0, c.a - step);
       if (a1 <= 0) { c.a = 0; continue; }
       const e = a1 * a1 * (3 - 2 * a1);
       let ok = true;
@@ -1047,12 +1131,26 @@ export function init(app) {
       c.used = f.frame;
     }
     ctx.globalAlpha = 1;
+    const ms = performance.now() - t0;
+    passMs += ms;
+    budgetLeft = Math.max(0, budgetLeft - ms);
+  }
+
+  function drawStreetLabels(ctx, f) {
+    if (!app.layerEnabled("labels")) return;   // one "Labels" switch for both layers
+    advance(f);
+    drawPass(ctx, f, true);
+  }
+
+  function drawLabels(ctx, f) {
+    advance(f);
+    drawPass(ctx, f, false);
     if ((f.frame & 255) === 0) trimSprites(f.frame);
     stats.sprites = live.size; stats.palette = paletteMix;
-    const t2 = performance.now();
-    stats.drawMs = stats.drawMs * 0.9 + (t2 - t0) * 0.1;
+    // the frame's labels in all: the placement, then both passes (the street names' at z 15 and this one)
+    stats.drawMs = stats.drawMs * 0.9 + (placeMs + passMs) * 0.1;
     stats.frames++;
-    if (trace) trace.push([+(t1 - t0).toFixed(3), +(t2 - t1).toFixed(3), sprites - made0, vis.length]);
+    if (trace) trace.push([+placeMs.toFixed(3), +passMs.toFixed(3), sprites - made0, vis.length]);
   }
 
   function labelAt(px, py) {
@@ -1066,6 +1164,7 @@ export function init(app) {
     return null;
   }
 
+  app.addLayer({ id: "street-labels", z: 15, draw: drawStreetLabels });
   const labelLayer = app.addLayer({
     id: "labels", z: 90,
     draw: drawLabels,
@@ -1091,6 +1190,7 @@ export function init(app) {
     const root = rootOf(i);
     if (root === selRoot) return;
     selRoot = root;
+    selCand = root >= 0 ? candByRoot.get(root) || null : null;
     setMark(true, root);
     dirty = true;
   }
@@ -1103,22 +1203,23 @@ export function init(app) {
     if (sh) return sh;
     const S = app.scene.forRot(r);
     const ids = B[root].hidden ? (members.get(root) || []) : [root];
-    const path = new Path2D();
+    const path = new Path2D();       // the silhouette: roofs and the walls that face the camera
+    const roofs = new Path2D();      // the roof edges and ridges alone, traced lightly inside the silhouette
     const bb = [Infinity, Infinity, -Infinity, -Infinity];
     const ext = (X, Y) => { if (X < bb[0]) bb[0] = X; if (X > bb[2]) bb[2] = X; if (Y < bb[1]) bb[1] = Y; if (Y > bb[3]) bb[3] = Y; };
     const o = geo.ROTS[r];
     // every subpath wound the same way, so the soft fill covers overlaps once (nonzero)
-    const poly = (pts, hole) => {
+    const poly = (pts, hole, into = path) => {
       let a = 0;
       for (let i = 0, n = pts.length, j = n - 2; i < n; j = i, i += 2) a += pts[j] * pts[i + 1] - pts[i] * pts[j + 1];
       const rev = (a < 0) !== !!hole;
       const n = pts.length / 2;
       for (let k = 0; k < n; k++) {
         const q = rev ? n - 1 - k : k, X = pts[2 * q], Y = pts[2 * q + 1];
-        if (k) path.lineTo(X, Y); else path.moveTo(X, Y);
+        if (k) into.lineTo(X, Y); else into.moveTo(X, Y);
         ext(X, Y);
       }
-      path.closePath();
+      into.closePath();
     };
     for (const i of ids) {
       const b = B[i], rings = S.objRings[i];
@@ -1140,7 +1241,7 @@ export function init(app) {
         for (const p of hull) flat.push(p[0], p[1]);
         if (flat.length >= 6) poly(flat, false);
         const r0 = geo.proj(cx - lx * rh, cy - ly * rh, b.h, r), r1 = geo.proj(cx + lx * rh, cy + ly * rh, b.h, r);
-        if (rh > 0.2) { path.moveTo(r0[0], r0[1]); path.lineTo(r1[0], r1[1]); }
+        if (rh > 0.2) { roofs.moveTo(r0[0], r0[1]); roofs.lineTo(r1[0], r1[1]); }
         continue;
       }
       // the roof, then each wall that faces the camera
@@ -1148,6 +1249,7 @@ export function init(app) {
         const roof = new Float32Array(f.length);
         for (let k = 0; k < f.length; k += 2) { roof[k] = f[k]; roof[k + 1] = f[k + 1] - top; }
         poly(roof, ri > 0);
+        poly(roof, ri > 0, roofs);
         const g = b.p[ri], n = g.length / 2;
         for (let a = 0, c = n - 1; a < n; c = a++) {
           const dx = g[2 * a] - g[2 * c], dy = g[2 * a + 1] - g[2 * c + 1], L = Math.hypot(dx, dy);
@@ -1158,10 +1260,29 @@ export function init(app) {
         }
       });
     }
-    sh = { path, bb };
-    if (hlCache.size > 160) hlCache.clear();
+    sh = { path, roofs, bb, ids, front: null, frontPad: 0 };
+    if (hlCache.size > 400) hlCache.clear();
     hlCache.set(key, sh);
     return sh;
+  }
+  /**
+   * The buildings the tiles paint over this one (later in the draw order, overlapping it or its glow): their silhouettes
+   * are cut out of the mark, so the outline of a building behind a tower goes behind the tower too. Trees are left be:
+   * most stand bare in the cold months and the building shows through their twigs.
+   */
+  function frontOf(sh, r, pad) {
+    // kept for the widest glow asked for so far (the glow is a fixed width in px, so wider in metres zoomed out)
+    if (sh.front && pad <= sh.frontPad) return sh.front;
+    pad = Math.max(pad, 4);
+    const S = app.scene.forRot(r), rank = S.rank, nB = app.scene.B;
+    let first = Infinity;
+    for (const i of sh.ids) if (rank[i] < first) first = rank[i];
+    const own = new Set(sh.ids), out = [];
+    for (const j of app.scene.query(r, "objects", sh.bb[0] - pad, sh.bb[1] - pad, sh.bb[2] + pad, sh.bb[3] + pad)) {
+      if (j < nB && rank[j] > first && !own.has(j) && !B[j].hidden && S.objRings[j]) out.push(j);
+    }
+    sh.frontPad = pad;
+    return (sh.front = out);
   }
 
   // A mark is drawn into its own small canvas at the current scale: the outline can then be the shape's outer edge only,
@@ -1194,13 +1315,22 @@ export function init(app) {
     g.globalAlpha = 1; g.lineWidth = (m.sel ? 4.2 : 3.4) / s; g.stroke(sh.path);
     g.globalCompositeOperation = "destination-out";
     g.fill(sh.path);
-    // a faint scarlet wash over the building, its own edges traced lightly
+    // a faint scarlet wash over the building, its roof edges traced lightly (not every wall: some hide behind the roof)
     g.globalCompositeOperation = "source-over";
     g.globalAlpha = (m.sel ? 0.15 : 0.1) * (1 + nk);
     g.fill(sh.path);
     g.globalAlpha = m.sel ? 0.4 : 0.3;
     g.lineWidth = 1 / s;
-    g.stroke(sh.path);
+    g.stroke(sh.roofs);
+    // what stands in front hides it (a hairline wider than the shape, over the anti-aliased seam at its edge)
+    const front = frontOf(sh, view.rot, 20 / s);
+    if (front.length) {
+      g.globalCompositeOperation = "destination-out";
+      g.globalAlpha = 1;
+      g.lineWidth = 1.2 / s;
+      for (const j of front) { const p = hlShape(j, view.rot).path; g.fill(p); g.stroke(p); }
+      g.globalCompositeOperation = "source-over";
+    }
     m.img = { X0: need[0], Y0: need[1], X1: need[2], Y1: need[3], s, rot: view.rot, root: m.root, nk };
   }
   const NEED = [0, 0, 0, 0];
@@ -1259,7 +1389,12 @@ export function init(app) {
       if (lb) root = rootOf(lb.bi);
       else if (!(other = otherLayerHit(ptr.x, ptr.y))) root = rootOf(app.pickBuilding(ptr.x, ptr.y));
     }
-    if (root !== hoverRoot) { hoverRoot = root; setMark(false, root); }
+    if (root !== hoverRoot) {
+      hoverRoot = root;
+      setMark(false, root);
+      hoverCand = root >= 0 ? candByRoot.get(root) || null : null;
+      hoverSince = performance.now();
+    }
     // the app clears the cursor on every move that finds nothing of a layer's under it: buildings are clickable too
     if (root >= 0) { canvas.style.cursor = "pointer"; cursorSet = true; }
     else if (cursorSet) { if (!other) canvas.style.cursor = ""; cursorSet = false; }
@@ -1349,8 +1484,16 @@ export function init(app) {
     stats,
     counts: { buildings: buildingCand.size, areas: statics.length - buildingCand.size, streets: streets.length, curves: curves.length, pois: pois.length },
     highlight(i) { select(i); },
-    hover(i) { hoverRoot = rootOf(i); setMark(false, hoverRoot); },
+    hover(i) { hoverRoot = rootOf(i); setMark(false, hoverRoot); hoverCand = candByRoot.get(hoverRoot) || null; hoverSince = performance.now(); },
+    /** the buildings cut out of building i's highlight at this rotation */
+    front(i) { const root = rootOf(i); return root < 0 ? [] : frontOf(hlShape(root, view.rot), view.rot, 20 / view.s); },
     shown() { return vis.filter((c) => c.on).map((c) => c.text); },
+    /** every candidate considered at this view: [{ text, kind, on, a, px, py }] (anchor, CSS px) */
+    states() {
+      const r = view.rot, s = view.s, W2 = view.w / 2, H2 = view.h / 2;
+      if (!projX[r]) return [];
+      return vis.map((c) => ({ text: c.text, kind: c.kind, bi: c.bi, on: c.on, a: +c.a.toFixed(2), px: Math.round((projX[r][c.id] - view.X) * s + W2), py: Math.round((projY[r][c.id] - view.Y) * s + H2) }));
+    },
     /** on-screen building labels: [{ text, index, x, y }] (box centres, CSS px) */
     boxes() {
       const s = view.s, W2 = view.w / 2, H2 = view.h / 2;
@@ -1368,5 +1511,7 @@ export function init(app) {
       for (let b = 0; b < 5; b++) { const t = performance.now(); for (let i = 0; i < n; i++) place(lastPlace); best = Math.min(best, (performance.now() - t) / n); }
       return best;
     },
+    /** one placement, timed by phase: [gather, sort, layout+collide] ms */
+    placeOnce() { prof = [0, 0, 0]; place(lastPlace); const p = prof; prof = null; return p.map((x) => +x.toFixed(2)); },
   };
 }

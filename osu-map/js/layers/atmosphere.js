@@ -192,10 +192,15 @@ export function init(app) {
 
   // ---------------------------------------------------------------- weather data
   function applyWeather(c, source) {
-    const code = Math.round(num(c.weather_code, 0)), tf = num(c.temperature_2m, NaN);
-    W.code = WMO[code] ? code : code >= 0 && code < 100 ? code : 0;
+    const raw = num(c.weather_code, NaN), tf = num(c.temperature_2m, NaN), cover = num(c.cloud_cover, NaN);
+    const coverOk = cover >= 0 && cover <= 100;
+    // A code Open-Meteo doesn't use (or none at all) says nothing about the sky: name it by its cloud cover instead, or
+    // not at all (code null, no text). Calling it "Sunny" would be a guess passed off as live weather.
+    let code = Number.isFinite(raw) ? Math.round(raw) : NaN;
+    if (!WMO[code]) code = coverOk ? (cover < 12.5 ? 0 : cover < 37.5 ? 1 : cover < 87.5 ? 2 : 3) : null;
+    W.code = code;
     W.tempF = Number.isFinite(tf) && tf > -80 && tf < 140 ? tf : null;
-    W.cloud = Math.max(0, Math.min(100, num(c.cloud_cover, W.code >= 3 ? 100 : W.code * 30)));   // percent
+    W.cloud = coverOk ? cover : code == null ? 0 : code >= 3 ? 100 : code * 30;   // percent
     W.windMph = Math.max(0, Math.min(120, num(c.wind_speed_10m, 0)));
     W.windDir = ((num(c.wind_direction_10m, 0) % 360) + 360) % 360;
     W.precipMm = Math.max(0, num(c.precipitation, 0));
@@ -216,12 +221,12 @@ export function init(app) {
     W.updated = new Date();
     updateText();
     updateStatus();   // the "updated" time and tooltip may move even when the weather doesn't
+    updateTileSnow(); // every reading counts toward its hysteresis, a repeated one too
     // only a real change re-grades the light and tells the other modules
     const sig = `${W.code}|${W.tempF == null ? "" : Math.round(W.tempF)}|${Math.round(W.cloud / 4)}|${Math.round(W.windMph)}|${Math.round(W.windDir / 10)}|${W.rain}|${W.snow}|${W.fog.toFixed(2)}|${W.snowDepthM.toFixed(3)}|${source}`;
     if (sig === wxSig) return;
     wxSig = sig;
     wxVer++;
-    updateTileSnow();
     app.emit("weather", W);
   }
 
@@ -237,8 +242,11 @@ export function init(app) {
       const r = await fetch(WX_URL, { signal: ctl ? ctl.signal : undefined, cache: "no-store" });
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       const j = await r.json();
-      if (!j || typeof j.current !== "object" || !j.current) throw new Error("no current conditions");
-      applyWeather(j.current, "live");
+      const cur = j && j.current;
+      // an answer without a usable weather code is a failed reading, not a clear sky: keep what we had and retry
+      if (!cur || typeof cur !== "object" || Array.isArray(cur)) throw new Error("no current conditions");
+      if (!Number.isFinite(num(cur.weather_code, NaN))) throw new Error("no weather code");
+      applyWeather(cur, "live");
       lastOk = Date.now(); failures = 0;
       schedule(WX_EVERY);
     } catch (e) {
@@ -250,22 +258,36 @@ export function init(app) {
       inflight = false;
     }
   }
-  // snow on the tiles: coarse levels with a little hysteresis, because every change redraws every tile
+  // Snow on the tiles, in coarse levels, because every change re-renders every tile. Readings are noisy: Open-Meteo's
+  // snow depth comes in whole centimetres that flick between 0 and 1, and a flurry's code comes and goes from one
+  // reading to the next. So a level goes up at once but comes down only after the lower one has held for LOWER_AFTER
+  // readings in a row, each warm enough to melt snow or showing bare ground (cold snow the gauge still sees stays).
+  // Falling snow with none yet on the ground settles only once it has kept on for two readings or laid down SETTLE_CM.
+  const LOWER_AFTER = 2, SETTLE_CM = 0.2;
   let tileSnow = num(app.tileStyle && app.tileStyle.snow, 0);
+  let snowRun = 0, fallenCm = 0, lowerRun = 0, lowerTo = 0;
   function updateTileSnow() {
     if (tileSnowFixed) return;
-    const depth = W.snowDepthM;
-    const settling = W.snow > 0 && (W.tempF == null || W.tempF < 36);
-    let lvl = 0;
-    if (depth >= 0.025 || (tileSnow >= 0.8 && depth >= 0.015)) lvl = 0.8;
-    else if (depth >= 0.005 || settling || (tileSnow >= 0.4 && depth >= 0.002)) lvl = 0.4;
-    if (lvl !== tileSnow) { tileSnow = lvl; app.setTileStyle({ snow: lvl }); }
+    const depth = W.snowDepthM, warm = W.tempF != null && W.tempF > 33;
+    const snowing = W.snow > 0 && (W.tempF == null || W.tempF < 36);
+    snowRun = snowing ? snowRun + 1 : 0;
+    fallenCm = snowing ? fallenCm + W.snowfallCm : 0;
+    const settling = snowing && (snowRun >= 2 || fallenCm >= SETTLE_CM);
+    const want = depth >= 0.025 ? 0.8 : depth >= 0.005 || settling ? 0.4 : 0;
+    if (want > tileSnow) { lowerRun = 0; setTileSnow(want); return; }
+    if (want === tileSnow || !(warm || depth === 0)) { lowerRun = 0; return; }
+    // down only as far as every reading of the run agrees
+    lowerTo = lowerRun ? Math.max(lowerTo, want) : want;
+    if (++lowerRun >= LOWER_AFTER) { lowerRun = 0; setTileSnow(lowerTo); }
   }
+  function setTileSnow(lvl) { tileSnow = lvl; app.setTileStyle({ snow: lvl }); }
 
   function updateText() {
     const t = WMO[W.code];
     W.text = W.code == null ? "" : t ? (t[1] && !W.isDay ? t[1] : t[0]) : "";
   }
+  /** "40°F · Light rain", "40°F" or "Light rain": no dangling separator when a part is missing */
+  const wxLabel = () => [W.tempF != null ? `${Math.round(W.tempF)}°F` : "", W.text].filter(Boolean).join(" · ");
 
   // ---------------------------------------------------------------- status line (and a small card from it or from search)
   let statusHtml = "";
@@ -278,8 +300,8 @@ export function init(app) {
   }
   function updateStatus() {
     if (!app.ui || !app.ui.status) return;
-    if (W.code == null) { if (statusHtml) app.ui.status("weather", ""); statusHtml = ""; return; }
-    const label = (W.tempF != null ? `${Math.round(W.tempF)}°F · ` : "") + W.text;
+    const label = wxLabel();
+    if (!label) { if (statusHtml) app.ui.status("weather", ""); statusHtml = ""; return; }
     const html = `<span class="wx-st" role="button" tabindex="0" title="${esc(statusTitle())}">${esc(label)}</span>`;
     if (html !== statusHtml) { statusHtml = html; app.ui.status("weather", html); }
     updateCount();
@@ -311,15 +333,15 @@ export function init(app) {
     const el = document.createElement("div");
     el.className = "wx-card";
     const ev = nextSunEvent(app.now().getTime());
-    const rows = [];
-    if (W.code != null) rows.push(["Wind", W.windMph >= 1 ? `${Math.round(W.windMph)} mph from the ${COMPASS[Math.round(W.windDir / 22.5) % 16]}` : "Calm"]);
-    if (W.code != null) rows.push(["Clouds", `${Math.round(W.cloud)} %`]);
+    const rows = [], have = W.source !== "none";
+    if (have) rows.push(["Wind", W.windMph >= 1 ? `${Math.round(W.windMph)} mph from the ${COMPASS[Math.round(W.windDir / 22.5) % 16]}` : "Calm"]);
+    if (have) rows.push(["Clouds", `${Math.round(W.cloud)} %`]);
     if (W.visibilityM != null && W.visibilityM < 10000) rows.push(["Visibility", `${(W.visibilityM / 1609).toFixed(W.visibilityM < 1609 ? 1 : 0)} mi`]);
     if (W.snowDepthM > 0.004) rows.push(["Snow on the ground", `${Math.max(1, Math.round(W.snowDepthM * 39.37))} in`]);
     if (ev) rows.push([ev.rise ? "Sunrise" : "Sunset", fmtTime(ev.ms)]);
     rows.push(["Sun", `${Math.abs(W.sunAlt).toFixed(0)}° ${W.sunAlt >= 0 ? "high" : "below the horizon"}, ${COMPASS[Math.round(W.sunAz / 22.5) % 16]} · ${W.phase}`]);
     rows.push(["Moon", `${W.moon.name}, ${Math.round(W.moon.fraction * 100)} % lit${W.moon.alt > 0 ? "" : " (down)"}`]);
-    const now = W.code == null ? "" : `<div class="wx-now"><span class="wx-temp">${W.tempF != null ? esc(Math.round(W.tempF)) + "°" : ""}</span><span class="wx-cond">${esc(W.text)}</span></div>`;
+    const now = W.tempF == null && !W.text ? "" : `<div class="wx-now"><span class="wx-temp">${W.tempF != null ? esc(Math.round(W.tempF)) + "°" : ""}</span><span class="wx-cond">${esc(W.text)}</span></div>`;
     el.innerHTML = now + `<dl class="wx-grid">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` +
       `<div class="wx-src">${W.source === "live" ? `Weather: Open-Meteo, ${esc(fmtTime(W.updated.getTime()))}` : W.source === "test" ? "Test weather (?weather=)" : "Live weather unavailable"}</div>`;
     return el;
@@ -333,7 +355,7 @@ export function init(app) {
     const words = /^(weather|sky|sun|sunset|sunrise|moon|forecast|rain|snow|temp|temperature|fog|wind|clouds?)\b/i;
     app.ui.addSearchProvider((q) => {
       if (!words.test(String(q || "").trim())) return [];
-      return [{ label: "Weather and sky", sub: W.code != null ? `${W.tempF != null ? Math.round(W.tempF) + "°F · " : ""}${W.text}` : "Sun, moon and light", kind: "weather", score: 0.8, go: openCard }];
+      return [{ label: "Weather and sky", sub: wxLabel() || "Sun, moon and light", kind: "weather", score: 0.8, go: openCard }];
     });
   }
   if (app.ui && app.ui.registerToggle) app.ui.registerToggle({ id: "sky", label: "Real sky & weather" });
@@ -342,7 +364,7 @@ export function init(app) {
   // ---------------------------------------------------------------- the sky over time
   const L = {
     mr: 1, mg: 1, mb: 1, mulOn: false, mulVer: 0, vig: 0, tw: 0,
-    gr: 255, gg: 200, gb: 140, ga: 0, glowAz: 0, glowVer: 0,
+    gr: 255, gg: 200, gb: 140, ga: 0, glowAz: 0, glowVer: 0, moonLift: 0, moonAz: 0,
     bg: null, stars: 0, moonA: 0, cloudA: 0, cloudCov: 0, daylight: 1,
     haze: [236, 236, 233], hazeVer: 0,
   };
@@ -425,12 +447,13 @@ export function init(app) {
     L.tw = smooth(3, -0.5, W.sunAlt) * (1 - smooth(-4.5, -8.5, W.sunAlt)) * (1 - 0.6 * over);
     L.vig = 0.16 * night;
     L.mulOn = L.mr < 0.996 || L.mg < 0.996 || L.mb < 0.996 || L.vig > 0.004 || L.tw > 0.01;
-    L.mulVer++;
-    // the glow: the low sun's warmth, or at night a faint cool wash from a bright moon
-    const moonGlow = 0.07 * moon;
-    if (ga >= moonGlow) { L.gr = G[4]; L.gg = lerp(G[5], G[5] + 12, dawn); L.gb = lerp(G[6], G[6] + 30, dawn); L.ga = ga; L.glowAz = W.sunAz; }
-    else { L.gr = 190; L.gg = 205; L.gb = 240; L.ga = moonGlow; L.glowAz = W.moon.az; }
+    L.mulVer++;   // (the moon's wash, set below, is part of the multiply too)
+    // The glow: the low sun's warmth, screened in from its side of the map (none once the sun is 9° down). A bright
+    // moon's faint cool wash is folded into the multiply instead (getMulFill): a second full-screen pass all night for
+    // a few percent of light isn't worth its cost, and the two fade independently rather than swapping in one frame.
+    L.gr = G[4]; L.gg = lerp(G[5], G[5] + 12, dawn); L.gb = lerp(G[6], G[6] + 30, dawn); L.ga = ga; L.glowAz = W.sunAz;
     L.glowVer++;
+    L.moonLift = 0.07 * moon; L.moonAz = W.moon.az;
     // the multiply darkens the paper too, so ask for the paper colour that comes out right after it
     L.bg = hex(Math.min(255, sr / L.mr), Math.min(255, sg / L.mg), Math.min(255, sb / L.mb));
     L.stars = smooth(0.45, 0.95, night) * (1 - smooth(0.35, 0.9, cloud)) * (1 - W.fog);
@@ -532,25 +555,33 @@ export function init(app) {
   const _wg = [0, 0];
 
   // ---------------------------------------------------------------- fills for the light (rebuilt only when they change)
-  let mulFill = null, mulVer = -1, mulW = 0, mulH = 0;
+  let mulFill = null, mulVer = -1, mulW = 0, mulH = 0, mulR = -1;
+  // the moon's wash, per unit of L.moonLift: its pale blue (190, 205, 240), scaled so that over mid-tones the lift
+  // matches the screen glow it replaces
+  const MOON_WASH = [1.1, 1.2, 1.4];
   function getMulFill(ctx, w, h) {
-    if (L.mulVer === mulVer && w === mulW && h === mulH) return mulFill;
-    mulVer = L.mulVer; mulW = w; mulH = h;
-    const { mr, mg, mb, tw, vig } = L;
+    const rot = view.rot;
+    if (L.mulVer === mulVer && w === mulW && h === mulH && rot === mulR) return mulFill;
+    mulVer = L.mulVer; mulW = w; mulH = h; mulR = rot;
+    const { mr, mg, mb, tw, vig, moonLift } = L;
     const c = hex(mr * 255, mg * 255, mb * 255);
-    if (tw < 0.01 && vig < 0.004) return (mulFill = c);
+    // the moon lifts the screen edge on its side: the top (the far side) when it is ahead of the camera, the bottom
+    // when behind, half of each when it stands off to one side (the vignette eases there); the middle stays as it is
+    let up = 0, dn = 0;
+    if (moonLift > 0.002) { const dy = Math.sin(geo.headingToScreen(L.moonAz, rot)); up = moonLift * (1 - dy) / 2; dn = moonLift * (1 + dy) / 2; }
+    if (tw < 0.01 && vig < 0.004 && up + dn < 0.002) return (mulFill = c);
     // one vertical sweep: at twilight the horizon (top) glows warmer and the near edge sinks into blue; at night both
     // edges sink a little, a soft vignette that keeps the eye on the middle
     const g = ctx.createLinearGradient(0, 0, 0, h);
     const tv = 1 - 0.55 * vig, bv = 1 - vig;
-    g.addColorStop(0, hex(255 * Math.min(1, mr * (1 + 0.2 * tw)) * tv, 255 * Math.min(1, mg * (1 + 0.1 * tw)) * tv, 255 * Math.min(1, mb * (1 + 0.01 * tw)) * tv));
+    g.addColorStop(0, hex(255 * (Math.min(1, mr * (1 + 0.2 * tw)) * tv + up * MOON_WASH[0]), 255 * (Math.min(1, mg * (1 + 0.1 * tw)) * tv + up * MOON_WASH[1]), 255 * (Math.min(1, mb * (1 + 0.01 * tw)) * tv + up * MOON_WASH[2])));
     g.addColorStop(0.45, c);
-    g.addColorStop(1, hex(255 * mr * (1 - 0.16 * tw) * bv, 255 * mg * (1 - 0.12 * tw) * bv, 255 * mb * (1 - 0.03 * tw) * (1 - vig * 0.6)));
+    g.addColorStop(1, hex(255 * (mr * (1 - 0.16 * tw) * bv + dn * MOON_WASH[0]), 255 * (mg * (1 - 0.12 * tw) * bv + dn * MOON_WASH[1]), 255 * (mb * (1 - 0.03 * tw) * (1 - vig * 0.6) + dn * MOON_WASH[2])));
     return (mulFill = g);
   }
   let glowFill = null, glowVer = -1, glowW = 0, glowH = 0, glowA = NaN;
   function getGlowFill(ctx, w, h) {
-    // the glow comes in from the screen edge that faces the sun (or moon) on the ground
+    // the glow comes in from the screen edge that faces the sun on the ground
     const a = geo.headingToScreen(L.glowAz, view.rot);
     if (L.glowVer === glowVer && w === glowW && h === glowH && Math.abs(a - glowA) < 0.02) return glowFill;
     glowVer = L.glowVer; glowW = w; glowH = h; glowA = a;
@@ -594,17 +625,51 @@ export function init(app) {
     }
     ctx.globalAlpha = 1;
   }
+  // The page's chrome over the top of the map (the bar, the map buttons), CSS px relative to the canvas: the moon keeps
+  // clear of it. Read at most once a second (it moves only on resize or when the bar wraps).
+  const chrome = [];
+  let chromeAt = -1e9;
+  function readChrome() {
+    const now = performance.now();
+    if (now - chromeAt < 1000) return chrome;
+    chromeAt = now;
+    chrome.length = 0;
+    const rc = app.canvas.getBoundingClientRect();
+    for (const el of document.querySelectorAll("#bar, #map-btns")) {
+      const q = el.getBoundingClientRect();
+      if (q.width >= 1 && q.height >= 1) chrome.push([q.left - rc.left, q.top - rc.top, q.right - rc.left, q.bottom - rc.top]);
+    }
+    return chrome;
+  }
+  // Where the moon goes: in the sky beyond the far edge, left or right by its bearing d from where the camera looks, and
+  // higher the higher it stands. When that spot falls on the diorama (looking straight toward the moon from far off,
+  // the slab's far corner is right there), slide it: up toward the top of the screen first, then step by step away
+  // from the middle, until it is on open paper clear of the chrome. Writes [x, y] to out; false if nowhere fits.
+  function moonSpot(w, h, r, d, alt, out) {
+    const x0 = w / 2 + Math.sin(d * RAD) * w * 0.36, y0 = h * (0.3 - 0.2 * clamp01(alt / 60)) + r;
+    // the disc keeps 1.5 radii of paper round it: to the screen's edges, and to the chrome
+    const marg = (r * 3) / view.s, pad = r * 1.5, cp = r * 2.5, ui = readChrome();
+    const free = (x, y) => {
+      for (const q of ui) if (x + cp > q[0] && x - cp < q[2] && y + cp > q[1] && y - cp < q[3]) return false;
+      return !onSlab(x, y, -SLAB_DEPTH, 120, marg);
+    };
+    const dir = x0 >= w / 2 ? 1 : -1;
+    for (let x = x0; x >= pad && x <= w - pad; x += dir * r * 2) {
+      for (let y = y0; y >= pad; y -= r) if (free(x, y)) { out[0] = x; out[1] = y; return true; }
+    }
+    return false;
+  }
+  const _moonXY = [0, 0];
   let halo = null;
   function drawMoon(ctx, f) {
     const m = W.moon;
     if (m.alt < 1 || L.moonA < 0.02) return;
-    // in the sky beyond the far edge, left or right by its bearing from where the camera looks
     const looking = (315 + 90 * view.rot) % 360;
     const d = ((m.az - looking + 540) % 360) - 180;
-    if (Math.abs(d) > 105) return;
+    if (Math.abs(d) > 105) return;   // behind the camera
     const w = f.w, h = f.h, r = Math.max(7, Math.min(13, Math.min(w, h) * 0.014));
-    const x = w / 2 + Math.sin(d * RAD) * w * 0.36, y = h * (0.3 - 0.2 * clamp01(m.alt / 60)) + r;
-    if (onSlab(x, y, -SLAB_DEPTH, 120, (r * 3) / view.s)) return;
+    if (!moonSpot(w, h, r, d, m.alt, _moonXY)) return;
+    const x = _moonXY[0], y = _moonXY[1];
     if (!halo) {
       halo = makeCanvas(64, 64);
       const g = halo.getContext("2d"), gr = g.createRadialGradient(32, 32, 0, 32, 32, 32);
@@ -675,6 +740,7 @@ export function init(app) {
         ctx.fillStyle = getMulFill(ctx, w, h);
         ctx.fillRect(0, 0, w, h);
       }
+      // the low sun's glow: only around sunrise and sunset (at night the moon's wash rides in the multiply above)
       if (L.ga > 0.004) {
         ctx.globalCompositeOperation = "screen";
         ctx.fillStyle = getGlowFill(ctx, w, h);
@@ -689,9 +755,11 @@ export function init(app) {
   });
 
   // ---------------------------------------------------------------- the city from afar
-  // Zoomed out, the lights tiles carry only pinpoint lamp pools (windows appear once a tile has about a pixel per metre),
-  // so the whole-map night would go dark. Instead a texture of streetlit roads and lit buildings, laid in ground metres
-  // and added on top, fades in as you zoom out. It is drawn once, a few milliseconds per frame, the first time it's needed.
+  // Far out, a lights tile would carry nothing but specks of lamp light (lit windows stop below 0.5 px/m), so the
+  // whole-map night would go dark. Instead a soft texture of the city's light, laid in ground metres and added on top,
+  // takes over as you zoom out (the hand-over is in the "sky-lights" layer). Two sheets: the streetlit roads, which the
+  // tiles have no counterpart for, and the "spots" (lamps and lit buildings), which stand in for the tiles' lamp pools
+  // and windows. It is drawn once, a few milliseconds per frame, the first time it's needed.
   const GLOW_CELL = app.mobile ? 7 : 5;   // metres per texel
   const LIT = {
     house: 0.5, detached: 0.5, semidetached_house: 0.5, terrace: 0.55, residential: 0.6, bungalow: 0.5, duplex: 0.5,
@@ -704,7 +772,6 @@ export function init(app) {
   let cityGlow = null;
   function cityGlowJob() {
     const tw = Math.ceil((world.x1 - world.x0) / GLOW_CELL), th = Math.ceil((world.y1 - world.y0) / GLOW_CELL);
-    // two sheets: streets and lamps (fine from mid zoom), lit buildings (only from far off, where roofs are specks)
     const glowSheet = () => {
       const c = makeCanvas(tw, th), g = c.getContext("2d");
       g.setTransform(1 / GLOW_CELL, 0, 0, 1 / GLOW_CELL, -world.x0 / GLOW_CELL, -world.y0 / GLOW_CELL);
@@ -712,14 +779,14 @@ export function init(app) {
       g.lineCap = g.lineJoin = "round";
       return [c, g];
     };
-    const [streets, sg] = glowSheet(), [blds, bg] = glowSheet();
-    let g = sg;
+    const [roads, rdg] = glowSheet(), [spots, spg] = glowSheet();
+    let g = rdg;
     const dot = makeCanvas(32, 32), dg = dot.getContext("2d"), rg = dg.createRadialGradient(16, 16, 0, 16, 16, 16);
     rg.addColorStop(0, "rgba(255,206,132,.95)"); rg.addColorStop(0.35, "rgba(255,190,112,.45)"); rg.addColorStop(1, "rgba(255,180,100,0)");
     dg.fillStyle = rg; dg.fillRect(0, 0, 32, 32);
     let stage = 0, i = 0, rk = 0;
     const B = data.buildings, R = data.roads || [], LP = data.lamps || [], RK = Object.keys(ROAD_GLOW);
-    const job = { streets, blds, w: tw * GLOW_CELL, h: th * GLOW_CELL, done: false };
+    const job = { roads, spots, w: tw * GLOW_CELL, h: th * GLOW_CELL, done: false };
     job.step = (budget) => {
       const t0 = performance.now();
       while (!job.done && performance.now() - t0 < budget) {
@@ -734,7 +801,7 @@ export function init(app) {
           }
           g.strokeStyle = `rgba(255,190,112,${a1})`; g.lineWidth = w1; g.stroke();
           g.strokeStyle = `rgba(255,208,140,${a2})`; g.lineWidth = w2; g.stroke();
-          if (rk >= RK.length) stage = 1;
+          if (rk >= RK.length) { stage = 1; g = spg; }
         } else if (stage === 1) {
           // lamps: a soft pool and a bright point, the campus's sparkle from afar
           for (let q = 0; q < LP.length; q += 2) {
@@ -743,7 +810,6 @@ export function init(app) {
           }
           g.globalAlpha = 1;
           stage = 2;
-          g = bg;
         } else {
           for (let n = 0; n < 120 && i < B.length; n++, i++) {
             const b = B[i], lit = LIT[b.k];
@@ -786,50 +852,58 @@ export function init(app) {
     if (turned && turned.r === r) return turned;
     const box = geo.worldScreenBox(r), o = geo.ROTS[r], S = geo.SIN_T, C = GLOW_CELL;
     const tw = Math.ceil((box[2] - box[0]) / C), th = Math.ceil((box[3] - box[1]) / C);
-    const make = (old, withBlds) => {
+    const make = (old, withSpots) => {
       const c = old && old.width === tw && old.height === th ? old : makeCanvas(tw, th), g = c.getContext("2d");
       g.setTransform(1, 0, 0, 1, 0, 0); g.clearRect(0, 0, tw, th);
       g.setTransform(o.R[0] / C, (-S * o.D[0]) / C, o.R[1] / C, (-S * o.D[1]) / C, -box[0] / C, -box[1] / C);
       g.globalCompositeOperation = "lighter";
-      g.drawImage(cityGlow.streets, world.x0, world.y0, cityGlow.w, cityGlow.h);
-      if (withBlds) g.drawImage(cityGlow.blds, world.x0, world.y0, cityGlow.w, cityGlow.h);
+      g.drawImage(cityGlow.roads, world.x0, world.y0, cityGlow.w, cityGlow.h);
+      if (withSpots) g.drawImage(cityGlow.spots, world.x0, world.y0, cityGlow.w, cityGlow.h);
       return c;
     };
-    turned = { r, streets: make(turned && turned.streets, false), both: make(turned && turned.both, true), X0: box[0], Y0: box[1], w: tw * C, h: th * C };
+    turned = { r, roads: make(turned && turned.roads, false), all: make(turned && turned.all, true), X0: box[0], Y0: box[1], w: tw * C, h: th * C };
     return turned;
   }
-  function drawCityGlow(ctx, streetsA, bldA) {
+  /** The city glow, roads at roadsA and spots at spotsA (≤ roadsA), added on top. Builds itself the first time. */
+  function drawCityGlow(ctx, roadsA, spotsA) {
     if (!cityGlow) cityGlow = cityGlowJob();
     if (!cityGlow.done) { cityGlow.step(3); return; }   // show it only once it's whole
     const T = turnedGlow(view.rot), s = view.s;
     const dx = (T.X0 - view.X) * s + view.w / 2, dy = (T.Y0 - view.Y) * s + view.h / 2, dw = T.w * s, dh = T.h * s;
     ctx.globalCompositeOperation = "lighter";
-    // streets at streetsA and buildings at bldA, from the two sheets (streets alone, streets with buildings)
-    if (bldA < 0.01) { ctx.globalAlpha = streetsA; ctx.drawImage(T.streets, dx, dy, dw, dh); }
-    else if (bldA >= streetsA - 0.01) { ctx.globalAlpha = streetsA; ctx.drawImage(T.both, dx, dy, dw, dh); }
+    // from two sheets, roads alone and roads with spots: one blit when the two alphas agree, else two
+    if (spotsA < 0.01) { ctx.globalAlpha = roadsA; ctx.drawImage(T.roads, dx, dy, dw, dh); }
+    else if (spotsA >= roadsA - 0.01) { ctx.globalAlpha = roadsA; ctx.drawImage(T.all, dx, dy, dw, dh); }
     else {
-      ctx.globalAlpha = bldA; ctx.drawImage(T.both, dx, dy, dw, dh);
-      ctx.globalAlpha = streetsA - bldA; ctx.drawImage(T.streets, dx, dy, dw, dh);
+      ctx.globalAlpha = spotsA; ctx.drawImage(T.all, dx, dy, dw, dh);
+      ctx.globalAlpha = roadsA - spotsA; ctx.drawImage(T.roads, dx, dy, dw, dh);
     }
     ctx.globalAlpha = 1;
     ctx.globalCompositeOperation = "source-over";
   }
+  const glowReady = () => !!(cityGlow && cityGlow.done);
 
   // ---------------------------------------------------------------- layer: night lights (z 82)
+  // The hand-over between the lights tiles and the city glow, by device px per metre k. A lights tile holds lamp pools
+  // at every level and lit windows from 0.5 px/m (each window from 1 px/m, a sparse speckle from 0.5), and tiles.js
+  // picks a 0.5 px/m tile for screens down to about 0.32 px/m. Below that a tile would show only specks of lamp light, so
+  // there the glow's spots (lamps, lit buildings) take over: they crossfade with the tiles over HAND_LO..HAND_HI, never
+  // both at full strength, so a lamp is never lit twice (the tile's pool and the glow's) and the windows never go dark.
+  // The glow's streetlit roads have no counterpart in the tiles: they fade in from 1.2 px/m, so the streets read as
+  // the city spreads out below you. And the workers needn't render a far-zoom lights layer at all.
+  const HAND_LO = 0.26, HAND_HI = 0.38;
   app.addLayer({
     id: "sky-lights", z: 82,
     draw(ctx, f) {
       // the lights tiles are only drawn (and so only rendered) once dusk comes
       if (!app.layerEnabled("sky") || W.night <= 0.02) return;
       const a = Math.min(1, W.night * 1.08), k = f.s * f.dpr;
-      // From far off the tiles hold nothing but specks of lamp light, which the city glow already carries: hand over to
-      // it there, and the workers needn't render a far-zoom lights layer at all.
-      const far = smooth(1.2, 0.45, k), glowReady = !!(cityGlow && cityGlow.done);
-      const tilesA = glowReady ? smooth(0.22, 0.4, k) : 1;
+      const tilesA = glowReady() ? smooth(HAND_LO, HAND_HI, k) : 1;
       if (tilesA > 0.01) app.tiles.draw(ctx, f.view, "lights", { alpha: a * tilesA, op: "lighter" });
-      if (far > 0.01) {
+      const roadsA = smooth(1.2, 0.45, k);
+      if (roadsA > 0.01) {
         const g = a * (1 - 0.5 * W.fog);
-        drawCityGlow(ctx, g * far, g * smooth(0.42, 0.2, k));
+        drawCityGlow(ctx, g * roadsA, g * Math.min(roadsA, 1 - tilesA));
       }
     },
   });
@@ -873,6 +947,7 @@ export function init(app) {
   const _ws = [0, 0];
 
   const FLAKE_R = [1.3, 2, 2.9];
+  const FOG_BLOOM = [0.5, 0.75];   // the city glow over the fog, per unit of fog at full night: up close, from afar
 
   let hazeFill = null, hazeKey = NaN, hazeVer = -1, hazeH = 0;
   function drawFog(ctx, f) {
@@ -1034,7 +1109,16 @@ export function init(app) {
     draw(ctx, f) {
       if (!app.layerEnabled("sky")) { panRot = -1; return; }
       panDelta(f, _pan);
-      if (W.fog > 0.02) drawFog(ctx, f);
+      if (W.fog > 0.02) {
+        drawFog(ctx, f);
+        // Lights bloom in fog rather than vanish: over the fog sheet, the city glow again (soft already, 5 m texels:
+        // up close a broad halo round each lamp and lit street, from afar the city's light seen through the murk)
+        if (W.night > 0.02) {
+          // a little more from afar, where the glow is all there is of the city's lights
+          const b = Math.min(1, W.night * 1.08) * W.fog * lerp(FOG_BLOOM[0], FOG_BLOOM[1], smooth(1.2, 0.3, f.s * f.dpr));
+          drawCityGlow(ctx, b, b);
+        }
+      }
       // counts follow the screen's area, so a phone carries fewer drops than a desktop
       const area = f.w * f.h;
       const wantRain = Math.min(PARTICLE_CAP, Math.round((area / 1600) * W.rain * (calm ? 0.35 : 1)));

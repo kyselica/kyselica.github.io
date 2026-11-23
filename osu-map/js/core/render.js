@@ -9,9 +9,28 @@
 // foreshortened like everything else. Buildings and trees are drawn in screen metres from their projected outlines.
 //
 // drawObject never changes the composite operation and never sets globalAlpha outright: callers draw objects with
-// "destination-out" to rub out what stands behind them (buses.js), or with an alpha of their own.
+// "destination-out" to rub out what stands behind them (buses.js), or with an alpha of their own. The paper wash is laid
+// on the ground only, under the objects, so an object redrawn by app.occlude is pixel for pixel the one in the tile.
+//
+// For other modules (life.js clips cars and people out where something stands in front of them):
+//   treeBare(t, style) → whether broad-leaved tree t (its index in data.trees / 5) stands bare in style.season
+//     (late-autumn: ~72 % of them, by a hash of t; winter: all). Conifers never are.
+//   silhouette(path, r, cam, id, style) → path. Appends scene object id's visible outline (as drawObject paints it at
+//     cam.lod) in device pixels for cam { k, lod?, ox, oy } (px = X·k − ox, py = Y·k − oy, X/Y in screen metres):
+//       building — its camera-facing walls and the solid outline of its roof (pitched: eaves and ridge; a stadium bowl:
+//                  the facade and the rim all round, plus press box, scoreboard, rotunda), and from lod 2 its rooftop
+//                  plant rooms and air handlers. Courtyards count as solid (nothing in one can be behind the building).
+//       tree     — canopy and trunk (a conifer's tiered outline; a leafy crown's circles); a bare tree only its trunk;
+//                  from afar (lod < 0.7) the single circle or triangle drawn there.
+//       lamp     — post and lantern; nothing below lod 1.2 (lamps aren't drawn there).
+//     Pieces overlap and all wind like ctx.rect(), so fill or clip with the "nonzero" rule. path may be a Path2D (crowns
+//     are added exactly, with addPath) or a 2D context's current path (crowns fall back to their bounding circle).
 
 export const TS = 512;   // tile size, device pixels
+// Debugging aid for tools/profile.mjs --check (off in the app): which object, and which part of it (0 walls, 1 roof and
+// what stands on it, 2 things in front of a wall, 3 night lights), is being painted right now, so a wrapped context can
+// paint every building in its own flat colour and compare the night lights with the day tiles pixel by pixel.
+export const DBG = { on: false, id: -1, part: 0 };
 
 // ------------------------------------------------------------------------------------------------ colour helpers
 const hexToRgb = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
@@ -20,26 +39,34 @@ export const shade = (h, f) => rgbToHex(hexToRgb(h).map((v) => v * f));
 export const mix = (a, b, t) => { const A = hexToRgb(a), B = hexToRgb(b); return rgbToHex(A.map((v, i) => v + (B[i] - v) * t)); };
 // Quantised, memoised versions for the hot paths: the same few hundred colours are asked for thousands of times a tile,
 // and building a colour string each time is most of the cost of a small fill.
+// (Keyed colour → table by the quantised step: no key string is built per call.)
 const SHADES = new Map(), MIXES = new Map(), RGBAS = new Map();
 function sh(h, f) {
-  const q = Math.round(f * 50), key = h + q;
-  let v = SHADES.get(key);
-  if (v === undefined) { v = shade(h, q / 50); SHADES.set(key, v); }
+  const q = Math.round(f * 50);
+  let t = SHADES.get(h);
+  if (t === undefined) SHADES.set(h, (t = []));
+  let v = t[q];
+  if (v === undefined) v = t[q] = shade(h, q / 50);
   return v;
 }
 function mx(a, b, t) {
   const q = Math.round(t * 40);
   if (q <= 0) return a;
   if (q >= 40) return b;
-  const key = a + b + q;
-  let v = MIXES.get(key);
-  if (v === undefined) { v = mix(a, b, q / 40); MIXES.set(key, v); }
+  let m = MIXES.get(a);
+  if (m === undefined) MIXES.set(a, (m = new Map()));
+  let tb = m.get(b);
+  if (tb === undefined) m.set(b, (tb = []));
+  let v = tb[q];
+  if (v === undefined) v = tb[q] = mix(a, b, q / 40);
   return v;
 }
 function rgba(h, a) {
-  const q = Math.round(a * 100), key = h + q;
-  let v = RGBAS.get(key);
-  if (v === undefined) { const c = hexToRgb(h); v = `rgba(${c[0]},${c[1]},${c[2]},${q / 100})`; RGBAS.set(key, v); }
+  const q = Math.round(a * 100);
+  let t = RGBAS.get(h);
+  if (t === undefined) RGBAS.set(h, (t = []));
+  let v = t[q];
+  if (v === undefined) { const c = hexToRgb(h); v = t[q] = `rgba(${c[0]},${c[1]},${c[2]},${q / 100})`; }
   return v;
 }
 const strHash = (s) => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0) / 4294967296; };
@@ -59,7 +86,7 @@ function pickW(list, h) {
 // ------------------------------------------------------------------------------------------------ palette
 export const PAL = {
   bg: "#efe9db",
-  land: "#e9e2cc", res: "#e8e0cb", com: "#e9dfd1", ind: "#e0dbd0", rel: "#e6ddca", campus: "#e6e2c9", cem: "#c7d6a2", farm: "#e1d9a8", cons: "#ddd1b5",
+  land: "#e9e2cc", res: "#e8e0cb", com: "#e9dfd1", ind: "#e0dbd0", rel: "#e6ddca", campus: "#e6e2c9", cem: "#c7d6a2", farm: "#e1d9a8", cons: "#d4bd90",
   grass: "#bcd391", park: "#b6cf8b", meadow: "#c6d79c", garden: "#adca87", flower: "#b2cc88", scrub: "#a5c084", wood: "#97b87a", sand: "#ecdcab",
   water: "#8fc5d8", waterEdge: "#6aa3bb", pool: "#82d1e3", bank: "#b9b48c", shallow: "#a9d6e2",
   parking: "#b3b1ac", stall: "#f4f2ea", plaza: "#e6dcc6", plazaEdge: "#d2c6ad", roadArea: "#9a9b9e",
@@ -77,13 +104,26 @@ const TRIM = ["#e8dcc0", "#ece3cf", "#dfd2b4", "#efe8d8"];
 const MODERN = ["#c9c5bd", "#b4babd", "#d2cdc4", "#aab2b6", "#c3c5c2", "#bdb5a8"];
 const GLASSWALL = ["#8ea5b2", "#98acb5", "#8199a8", "#a3b3b8"];
 const HOUSE = ["#e8dcc0", "#d9c8a2", "#b9c7c0", "#a9b8c9", "#e0d6cb", "#c9a77f", "#b4775a", "#f0ebe0", "#9fb59a", "#d6b46e", "#c4cfd6", "#e3c9b0", "#c98f72", "#efe3c8"];
-const HOUSE_ROOF = ["#5b5450", "#6b5d55", "#4c4a4f", "#7a5a4c", "#58616b", "#6e665e", "#8a5a48", "#4f5a55", "#665a62"];
+// asphalt shingles, mostly greys and browns, a few weathered reds, slate blues and greens (lit, they come out lighter)
+const HOUSE_ROOF = ["#5b5450", "#6b5d55", "#4c4a4f", "#7a5a4c", "#58616b", "#6e665e", "#8a5a48", "#4f5a55", "#665a62",
+  "#7d7571", "#8c8279", "#66717c", "#93604d", "#5f6b60", "#857a70"];
 const APT = ["#c58f6e", "#d6c3a5", "#a87a62", "#bfb6a8", "#9c6b55", "#d9cbb6", "#b7a08a", "#b0644c"];
 const COMM = ["#cdbb9c", "#b98d6a", "#c9c2b6", "#a6876c", "#d8cdb9", "#bfa98c", "#b25e48"];
 const IND = ["#b8bcc0", "#a9a59c", "#c2bfb6", "#9fa6ab"];
 const DOORS = ["#7a3b33", "#3f5a4a", "#2f3f5a", "#efece4", "#6b4a3a", "#8c2f2f", "#4a4f55"];
 // flat roofs: [kind, colour, weight]
 const FLAT_ROOFS = [["membrane", "#e5e2db", 26], ["membrane", "#d8d5ce", 18], ["gravel", "#b6b0a5", 16], ["gravel", "#a59f95", 9], ["tar", "#8f8c88", 9], ["metal", "#c5c9ca", 6], ["green", "#a3b57d", 5]];
+// a few campus landmarks whose material everyone knows: [facade, wall, trim]
+const LANDMARK_LOOK = new Map([
+  ["William Oxley Thompson Memorial Library", ["stone", "#d9d2c1", "#efe9da"]],
+  ["University Hall", ["brick", "#a64b39", "#e9dfc9"]],
+  ["Orton Hall", ["stone", "#c7ae86", "#e6d9bd"]],
+  // the twin dormitory towers by the river, in the same brown brick
+  ["Morrill Tower", ["brick", "#9e5844", "#e3d6bc"]],
+  ["Lincoln Tower", ["brick", "#9e5844", "#e3d6bc"]],
+]);
+// pitched roofs on the parts of big campus buildings: slate, weathered copper, old tile
+const PART_ROOF = ["#5f6567", "#6c7173", "#77867f", "#55605f", "#7a5c50", "#6f8a80"];
 const HOUSE_FLAT = [["tar", "#8a8580", 3], ["membrane", "#cfcbc3", 2], ["gravel", "#a8a297", 2]];
 const CAMPUS_KINDS = new Set(["university", "college", "school", "dormitory", "civic", "public", "government", "library", "sports_centre", "sports_hall", "museum", "theatre", "kindergarten", "train_station", "transportation", "pavilion"]);
 const HOUSE_KINDS = new Set(["house", "detached", "semidetached_house", "terrace", "residential", "bungalow", "duplex"]);
@@ -208,6 +248,8 @@ function rng(seed) {
 }
 
 // ------------------------------------------------------------------------------------------------ renderer
+import * as LM from "./landmarks.js";
+
 export function makeRenderer(scene) {
   const { data, geo } = scene;
   const { SIN_T: S, COS_T: C } = geo;
@@ -268,7 +310,18 @@ export function makeRenderer(scene) {
       hvac: 0, skylights: false, solar: false, penthouse: false, h1, h2, h3, h4, area,
     };
     const flatRoof = (list) => { const fr = pickW(list, h2); st.roofKind = fr[0]; st.roof = fr[1]; };
-    if (b.lm === "Ohio Stadium" || ((k === "stadium" || k === "grandstand") && b.p.length > 1 && area > 3000)) {
+    // Simple-3D-building parts are drawn in place of their (hidden) outline, so they wear its look: a library drawn as
+    // a podium, a stack tower and wings stays one building in one material (not a row of sided houses, which is what a
+    // gabled part of kind "yes" would otherwise become). Canopies (building:part=roof) keep their own.
+    const pi = b.part && k !== "roof" ? parentOf(i) : -1;
+    const ps = pi >= 0 ? styleOf(pi) : null;
+    if (ps && ps.kind !== "bowl" && ps.kind !== "bleachers") {
+      st = { ...ps, h1, h2, h3, h4, area };
+      if (b.roof && b.roof !== "flat" && b.obb) { st.roof = pick(PART_ROOF, ps.h2); st.roofKind = "tar"; }
+      // only big parts carry rooftop plant
+      if (area < 300) { st.hvac = 0; st.penthouse = false; st.solar = false; st.skylights = false; }
+      else st.penthouse = st.penthouse && b.h > 14;
+    } else if (b.lm === "Ohio Stadium" || ((k === "stadium" || k === "grandstand") && b.p.length > 1 && area > 3000)) {
       st.kind = "bowl"; st.facade = "bowl"; st.wall = b.lm === "Ohio Stadium" ? "#dccfb2" : "#cfc6b5"; st.roof = "#d6cdbb";
     } else if (k === "grandstand" || (k === "stadium" && area < 2500)) {
       st.kind = "bleachers"; st.facade = "bleachers"; st.wall = "#c9c1b2"; st.roof = "#b9b6b0";
@@ -310,6 +363,10 @@ export function makeRenderer(scene) {
       else if (h1 < 0.5) campusLook(st, h1 * 2 * 0.62, h2, h3, h4, b);
       else { st.kind = "comm"; st.facade = "comm"; st.wall = pick(COMM, (h1 - 0.5) * 2); flatRoof(FLAT_ROOFS); st.fh = 4; st.spacing = 3; st.winW = 0.48; st.glass = "#4d6273"; st.hvac = 0.8; st.trim = "#e2d6bd"; }
     }
+    const lm = b.n ? LANDMARK_LOOK.get(b.n) : null;
+    if (lm && !ps) { campusLook(st, lm[0] === "stone" ? 0.6 : 0.3, h2, h3, h4, b); st.wall = lm[1]; st.trim = lm[2]; }
+    // LANDMARK HOOK (look): landmarks.js may override any of the style fields
+    if (b.lm != null) { const ov = LM.look(api, b, st); if (ov) Object.assign(st, ov); }
     if (b.c) st.wall = b.c;
     if (b.rc) st.roof = b.rc;
     if (b.mat === "brick" && !b.c) { st.wall = pick(BRICK, h1); if (st.facade === "modern" || st.facade === "curtain") st.facade = "brick"; }
@@ -317,6 +374,27 @@ export function makeRenderer(scene) {
     if (!st.trim) st.trim = sh(st.wall, 1.25);
     buildingStyle.set(i, st);
     return st;
+  }
+  // the innermost hidden outline a building part stands in (by its centroid), or -1
+  let hiddenList = null;
+  const parents = new Map();
+  function parentOf(i) {
+    let p = parents.get(i);
+    if (p !== undefined) return p;
+    if (!hiddenList) {
+      hiddenList = [];
+      data.buildings.forEach((b, j) => { if (b.hidden) hiddenList.push([j, ringBox(b.p[0])]); });
+    }
+    const [cx, cy] = ringCentroid(data.buildings[i].p[0]);
+    p = -1;
+    let best = Infinity;
+    for (const [j, bb] of hiddenList) {
+      if (cx < bb[0] || cx > bb[2] || cy < bb[1] || cy > bb[3] || !ptInRing(data.buildings[j].p[0], cx, cy)) continue;
+      const a = (bb[2] - bb[0]) * (bb[3] - bb[1]);
+      if (a < best) { best = a; p = j; }
+    }
+    parents.set(i, p);
+    return p;
   }
   function houseLook(st, h1, h2, h3) {
     st.kind = "house"; st.facade = "house"; st.wall = pick(HOUSE, h1); st.roof = pick(HOUSE_ROOF, h2);
@@ -372,11 +450,54 @@ export function makeRenderer(scene) {
         const nd = nx * o.D[0] + ny * o.D[1];
         if (nd >= -0.001) continue;
         const nu = nx * o.R[0] + ny * o.R[1];
-        out.push({ ri, c, a, L, nx, ny, nu, nd, light: lightOf(nu, nd), depth: ((ax + bx) / 2) * o.D[0] + ((ay + by) / 2) * o.D[1] });
+        const u1 = ax * o.R[0] + ay * o.R[1], u2 = bx * o.R[0] + by * o.R[1];
+        out.push({ ri, c, a, L, nx, ny, nu, nd, light: lightOf(nu, nd), depth: ((ax + bx) / 2) * o.D[0] + ((ay + by) / 2) * o.D[1],
+          u1, v1: ax * o.D[0] + ay * o.D[1], u2, v2: bx * o.D[0] + by * o.D[1] });
       }
     });
     out.sort((p, q) => q.depth - p.depth);
-    wallCache.set(key, out);
+    wallCache.set(key, orderWalls(out));
+    return wallCache.get(key);
+  }
+  // Far to near by the middles is not always back to front: a short wall can sit in front of the far end of a long one
+  // whose middle is nearer (a notch, the arm of an L). Two walls that share some of the screen are ordered by which is
+  // nearer where they overlap (the edges of a footprint never cross, so this never loops); the rest keep the middles'
+  // order.
+  // (`overlap` on the result: whether any two of the walls share some of the screen; when none do, as round any convex
+  // footprint, the night lights can rub out all the walls at once and light all their windows in one go)
+  function orderWalls(w) {
+    const n = w.length;
+    w.overlap = false;
+    if (n < 2) return w;
+    const after = new Array(n), indeg = new Int32Array(n);
+    let any = false;
+    for (let p = 0; p < n; p++) for (let q = p + 1; q < n; q++) {
+      const A = w[p], Q = w[q];
+      const lo = Math.max(Math.min(A.u1, A.u2), Math.min(Q.u1, Q.u2)), hi = Math.min(Math.max(A.u1, A.u2), Math.max(Q.u1, Q.u2));
+      if (hi - lo < 0.02) continue;
+      w.overlap = true;
+      const u = (lo + hi) / 2;
+      const va = A.v1 + ((A.v2 - A.v1) * (u - A.u1)) / (A.u2 - A.u1), vq = Q.v1 + ((Q.v2 - Q.v1) * (u - Q.u1)) / (Q.u2 - Q.u1);
+      // the farther one first
+      const [first, then] = va >= vq ? [p, q] : [q, p];
+      if (first > then) any = true;
+      (after[first] || (after[first] = [])).push(then);
+      indeg[then]++;
+    }
+    if (!any) return w;
+    const out = [], ready = [];
+    for (let p = 0; p < n; p++) if (!indeg[p]) ready.push(p);
+    while (out.length < n) {
+      if (!ready.length) for (let p = 0; p < n; p++) if (indeg[p] >= 0) { ready.push(p); break; }   // (a degenerate loop)
+      // the farthest of the walls that are free to go
+      let bi = 0;
+      for (let k = 1; k < ready.length; k++) if (ready[k] < ready[bi]) bi = k;
+      const p = ready.splice(bi, 1)[0];
+      indeg[p] = -1;
+      out.push(w[p]);
+      if (after[p]) for (const q of after[p]) if (indeg[q] > 0 && --indeg[q] === 0) ready.push(q);
+    }
+    out.overlap = true;
     return out;
   }
   const idInt = new Map();
@@ -400,12 +521,56 @@ export function makeRenderer(scene) {
           const rd = data.roads[ri];
           if (!STREETS.has(rd.k) || rd.tn || rd.br) continue;
           const dd = lineDist(rd.pts, px, py);
-          if (dd < best - 0.01) { best = dd; f = [nx, ny]; }
+          // [direction out of the front, distance from that side's middle to the street's centre line, its width]
+          if (dd < best - 0.01) { best = dd; f = [nx, ny, dd, rd.w]; }
         }
       }
     }
     fronts.set(i, f);
     return f;
+  }
+
+  // A house's front walk: from its front door (where drawWindows puts it, on the longest wall facing the street) straight
+  // out to the sidewalk. [x0, y0, x1, y1] in ground metres, or null.
+  const walks = new Map();
+  function frontWalk(i, r) {
+    let w = walks.get(i);
+    if (w !== undefined) return w;
+    w = null;
+    const b = data.buildings[i], st = styleOf(i), front = st.kind === "house" ? frontOf(i, r) : null;
+    if (front) {
+      const f = b.p[0], n = f.length / 2;
+      let best = null;
+      for (let a = 0, c = n - 1; a < n; c = a++) {
+        const dx = f[2 * a] - f[2 * c], dy = f[2 * a + 1] - f[2 * c + 1], L = Math.hypot(dx, dy);
+        if (L < 4.5) continue;
+        const nx = dy / L, ny = -dx / L;
+        if (nx * front[0] + ny * front[1] > 0.8 && (!best || L > best.L)) best = { c, a, L, nx, ny };
+      }
+      const len = front[2] - front[3] / 2 - 2.6;
+      if (best && len > 0.8 && len < 16) {
+        const count = Math.max(1, Math.floor(best.L / st.spacing)), pad = (best.L - count * st.spacing) / 2 / best.L, span = st.spacing / best.L;
+        const t = pad + span * (Math.floor(count / 2) + 0.5);
+        const x = f[2 * best.c] + (f[2 * best.a] - f[2 * best.c]) * t, y = f[2 * best.c + 1] + (f[2 * best.a + 1] - f[2 * best.c + 1]) * t;
+        w = new Float32Array([x, y, x + best.nx * len, y + best.ny * len]);
+      }
+    }
+    walks.set(i, w);
+    return w;
+  }
+  function drawFrontWalks(ctx, r, X0, Y0, X1, Y1, G) {
+    const ids = scene.query(r, "objects", X0 - 16, Y0 - 16, X1 + 16, Y1 + 16);
+    ctx.beginPath();
+    let any = false;
+    for (const i of ids) {
+      if (i >= B || data.buildings[i].hidden) continue;
+      const w = frontWalk(i, r);
+      if (!w) continue;
+      ctx.moveTo(w[0], w[1]); ctx.lineTo(w[2], w[3]);
+      any = true;
+    }
+    if (!any) return;
+    ctx.lineCap = "butt"; ctx.lineWidth = 1.1; ctx.strokeStyle = G.sidewalk; ctx.stroke();
   }
 
   // ================================================================ tiles
@@ -414,6 +579,7 @@ export function makeRenderer(scene) {
     const cam = { k, ox: tx * TS, oy: ty * TS };
     currentStyle = style || currentStyle;
     const X0 = (tx * TS) / k, Y0 = (ty * TS) / k, X1 = ((tx + 1) * TS) / k, Y1 = ((ty + 1) * TS) / k;
+    if (DBG.on) DBG.id = -1;
     ctx.save();
     if (layer === "lights") drawLights(ctx, r, cam, X0, Y0, X1, Y1, style || currentStyle);
     else drawBase(ctx, r, cam, X0, Y0, X1, Y1, style || currentStyle);
@@ -458,6 +624,8 @@ export function makeRenderer(scene) {
     G.path = snowy(PAL.path, 0.5); G.sidewalk = snowy(PAL.sidewalk, 0.45); G.pavers = snowy(PAL.pavers, 0.5); G.cycle = snowy(PAL.cycle, 0.5);
     G.steps = snowy(PAL.steps, 0.5); G.dirt = snowy(PAL.dirt, 0.7); G.pathEdge = snowy(PAL.pathEdge, 0.5);
     G.hedge = snowy(season === "winter" ? "#78905e" : PAL.hedge, 0.5);
+    // house lawns: the park grass a little dulled toward the paper, so neighbourhoods read leafy but quieter than parks
+    G.yard = snowy(green(mix(PAL.grass, PAL.res, 0.14)), 1);
     G.flowers = season === "summer" || season === "spring" ? 1 : season === "autumn" ? 0.45 : 0;
     G.litter = snow > 0.3 ? 0 : season === "autumn" ? 0.22 : season === "late-autumn" ? 0.34 : 0;
     groundCols.set(key, G);
@@ -482,8 +650,21 @@ export function makeRenderer(scene) {
     ctx.fillRect(w.x0, w.y0, w.x1 - w.x0, w.y1 - w.y0);
     ctx.lineJoin = "round";
 
-    // areas, in priority order (the data is sorted)
-    for (const i of q("areas")) drawArea(ctx, i, k, G, gb, cam, r);
+    // areas, in priority order (the data is sorted): land use first, then lawns round the houses (OSM rarely maps
+    // yards), then everything else (lots, plazas and gardens cover the lawns)
+    let yards = false;
+    const underlay = () => {
+      drawYards(ctx, r, X0, Y0, X1, Y1, k, G);
+      // the floor of a stadium bowl is all turf, round the marked field
+      for (const i of objIds) if (i < B && styleOf(i).kind === "bowl") bowlFloor(ctx, i, G);
+      yards = true;
+    };
+    const areaIds = q("areas");
+    for (const i of areaIds) {
+      if (!yards && !LANDUSE.has(data.areas[i].k)) underlay();
+      drawArea(ctx, i, k, G, gb, cam, r);
+    }
+    if (!yards) underlay();
     lap("areas");
 
     // streams and the river's centre line
@@ -499,6 +680,8 @@ export function makeRenderer(scene) {
     // paths under roads (footway crossings run under the street)
     const pathIds = q("paths");
     const roadIds = q("roads");
+    if (k >= 1.5) drawFrontWalks(ctx, r, X0, Y0, X1, Y1, G);
+    if (k >= 0.5) drawStreetWalks(ctx, r, roadIds, k, G);
     drawPaths(ctx, pathIds.filter((i) => !data.paths[i].br && !data.paths[i].tn), k, G, false);
     drawRails(ctx, q("rails"), k);
     drawRoads(ctx, roadIds.filter((i) => !data.roads[i].br && !data.roads[i].tn), k, G, false);
@@ -506,17 +689,24 @@ export function makeRenderer(scene) {
     const bridgeRoads = roadIds.filter((i) => data.roads[i].br && !data.roads[i].tn), bridgePaths = pathIds.filter((i) => data.paths[i].br);
     if (bridgeRoads.length || bridgePaths.length) drawBridges(ctx, r, cam, bridgeRoads, bridgePaths, k, G);
     if (k >= 1) drawBarriers(ctx, r, cam, q("barriers"), k, G);
+    drawSites(ctx, r, cam, areaIds, k, G);
     lap("lines");
 
     // things lying on the ground: fallen leaves, parked cars
     if (G.litter && k >= 0.5) drawLitter(ctx, r, cam, objIds, k, G);
     if (k >= 0.2) drawParked(ctx, r, cam, roadIds, q("areas", 8), gb, k);
-    ctx.restore();
     lap("cars");
 
-    // shadows (from anything whose shadow can reach this tile)
+    // shadows (from anything whose shadow can reach this tile), still inside the world's clip: a shadow cast past the
+    // map's edge must not darken the diorama's earth sides
     drawShadows(ctx, r, cam, X0, Y0, X1, Y1);
+    ctx.restore();
     lap("shadows");
+
+    // paper over the ground (not over the transparent margin round it, and not over the objects: those are redrawn on
+    // the main thread over moving things, and must come out the same there)
+    if (k >= 0.2) { ctx.save(); worldClip(ctx, cam, r); paper(ctx, cam); ctx.restore(); }
+    lap("paper");
 
     // objects, back to front
     if (prof) {
@@ -529,10 +719,6 @@ export function makeRenderer(scene) {
       }
       tp = performance.now();
     } else for (const i of objIds) drawObject(ctx, r, cam, i, style);
-
-    // paper over the map (not over the transparent margin round it)
-    if (k >= 0.2) { ctx.save(); worldClip(ctx, cam, r); paper(ctx, cam); ctx.restore(); }
-    lap("paper");
   }
 
   // ================================================================ ground areas
@@ -568,31 +754,35 @@ export function makeRenderer(scene) {
     if (kind === "pool") {
       areaPath(ctx, a);
       ctx.fillStyle = G.pool; ctx.fill("evenodd");
-      ctx.strokeStyle = "#f2f0ea"; ctx.lineWidth = 0.7; ctx.stroke();
+      if (k >= 0.35) { ctx.strokeStyle = "#f2f0ea"; ctx.lineWidth = 0.7; ctx.stroke(); }
       if (k >= 2 && a.A > 150 && G.snow < 0.4) poolLanes(ctx, i, a);
       return;
     }
     if (kind === "pitch") return drawPitch(ctx, i, a, k, G, cam, r);
     if (kind === "court") return drawCourt(ctx, i, a, k, G, cam, r);
     if (kind === "track") return drawTrack(ctx, i, a, k, G);
-    const col = G[kind] || (kind === "road" ? G.roadArea : kind === "bridge" ? G.bridge : G.land);
+    if (kind === "cons") { areaPath(ctx, a); return drawSiteGround(ctx, i, a, k, G, cam, r); }
+    // grass inside a stadium bowl is its artificial turf
+    const col = GREENS.has(kind) && inBowl(i) ? G.turf : G[kind] || (kind === "road" ? G.roadArea : kind === "bridge" ? G.bridge : G.land);
     areaPath(ctx, a);
     ctx.fillStyle = col;
     ctx.fill("evenodd");
     if (GREENS.has(kind)) {
       if (k >= 1 && G.snow < 0.5) texture(ctx, "grass", k, 1);
+      if (k >= 2 && G.snow < 0.3 && G.season !== "winter" && (kind === "grass" || kind === "park") && a.A > 2500) mowLines(ctx, i, a);
       if (k >= 0.8) { ctx.strokeStyle = sh(col, 0.93); ctx.lineWidth = Math.min(0.5, 1.2 / k); ctx.stroke(); }
     } else if (kind === "plaza") {
       if (k >= 2) texture(ctx, a.su === "bricks" || a.su === "paving_stones" || a.su === "bricksq" ? "pavers" : "slabs", k, 1);
-      ctx.strokeStyle = G.plazaEdge; ctx.lineWidth = 0.35; ctx.stroke();
+      // (edges thinner than a quarter of a pixel are left out: they cost a stroke and show nothing)
+      if (k >= 0.7) { ctx.strokeStyle = G.plazaEdge; ctx.lineWidth = 0.35; ctx.stroke(); }
     } else if (kind === "bridge") {
-      ctx.strokeStyle = "#8f877b"; ctx.lineWidth = 0.45; ctx.stroke();
+      if (k >= 0.55) { ctx.strokeStyle = "#8f877b"; ctx.lineWidth = 0.45; ctx.stroke(); }
     } else if (kind === "parking") {
       if (k >= 2 && G.snow < 0.5) texture(ctx, "asphalt", k, 1);
-      ctx.strokeStyle = G.curb; ctx.lineWidth = 0.6; ctx.stroke();
+      if (k >= 0.4) { ctx.strokeStyle = G.curb; ctx.lineWidth = 0.6; ctx.stroke(); }
     } else if (kind === "wood" || kind === "scrub") {
       if (k >= 0.7 && G.snow < 0.6) texture(ctx, "undergrowth", k, 1);
-      ctx.strokeStyle = sh(col, 0.86); ctx.lineWidth = 0.7; ctx.stroke();
+      if (k >= 0.35) { ctx.strokeStyle = sh(col, 0.86); ctx.lineWidth = 0.7; ctx.stroke(); }
     } else if (kind === "flower") {
       if (k >= 0.8) { ctx.strokeStyle = sh(col, 0.9); ctx.lineWidth = 0.4; ctx.stroke(); }
       if (k >= 2 && G.snow < 0.3) flowerDots(ctx, a, bb, gb, G);
@@ -637,6 +827,22 @@ export function makeRenderer(scene) {
       ctx.stroke();
     }
   }
+  // A big lawn's mowing stripes: broad bands along its longer side, alternately a touch lighter (laid inside a clip,
+  // which keeps the area's path for the edge stroke that follows)
+  function mowLines(ctx, i, a) {
+    const o = areaObb(i);
+    if (!o || o.W < 18) return;
+    ctx.save();
+    ctx.clip("evenodd");
+    ctx.translate(o.cx, o.cy); ctx.rotate(o.ang);
+    ctx.fillStyle = "rgba(255,255,236,.07)";
+    const sw = 3.2;
+    ctx.beginPath();
+    for (let v = -o.W / 2, n = 0; v < o.W / 2; v += sw, n++) if (n & 1) ctx.rect(-o.L / 2, v, o.L, sw);
+    ctx.fill();
+    ctx.restore();
+    areaPath(ctx, a);
+  }
   function poolLanes(ctx, i, a) {
     const o = areaObb(i);
     if (!o || o.L < 12) return;
@@ -670,6 +876,376 @@ export function makeRenderer(scene) {
     ctx.restore();
   }
 
+  // ---------------------------------------------------------------- lawns, sidewalks, the stadium floor
+  // ================================================================ construction sites
+  // A site should read as one on purpose, not as unrendered ground: packed ochre earth with a speckle of spoil, the ruts
+  // of the trucks that come in at its gate and a heap or two of earth; round it a hoarding (2 m of green windscreen
+  // mesh, open at the gate and wherever a road, path or building meets the line); and on bigger sites the site office
+  // and a container just inside the gate, lit at night. The earth is laid with the land use (other areas mapped inside
+  // the site cover it); the hoarding and the cabins stand up, so they go in after the roads and the other areas.
+  // Each site is planned once, from ground geometry only, so every tile, worker and rotation agrees.
+  const HOARD_H = 2, HOARD = "#56675a";
+  const CABIN = { L: 6.1, W: 2.5, H: 2.6, side: "#e2ddd1", top: "#cbc6ba" }, CONTAINER = { L: 6.1, W: 2.4, H: 2.6, side: "#b0623d", top: "#9b5535" };
+  const sitePlans = new Map();
+  function sitePlan(i, r) {
+    let P = sitePlans.get(i);
+    if (P) return P;
+    const a = data.areas[i], f = a.p[0], n = f.length / 2, bb = areaBox(i), rnd = rng(i * 7919 + 17);
+    // what the plan must keep clear of (the scene's screen-box query is a superset of what lies near on the ground, so
+    // the filtered answer is the same whichever rotation asks first)
+    const near = (name, pad) => nearGround(r, name, bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad);
+    // each with its bounding box, [rings or points, box, half-width]
+    const ways = [];
+    for (const q of near("roads", 30)) { const w = data.roads[q]; if (!w.tn && w.pts && w.pts.length >= 4) ways.push([w.pts, ringBox(w.pts), w.w / 2, 1]); }
+    for (const q of near("paths", 4)) { const w = data.paths[q]; if (!w.tn && w.pts && w.pts.length >= 4) ways.push([w.pts, ringBox(w.pts), (w.w || 2) / 2, 0.5]); }
+    const blds = [], trees = [], others = [];
+    for (const o of near("objects", 6)) {
+      if (o < B) { const b = data.buildings[o]; blds.push([b.p, ringBox(b.p[0])]); }
+      else if (o < B + T) trees.push(o - B);
+    }
+    for (const q of near("areas", 4)) { const ar = data.areas[q]; if (q !== i && !LANDUSE.has(ar.k) && ar.k !== "stall") others.push([ar.p, areaBox(q)]); }
+    const inBox = (bx, x, y, m) => x > bx[0] - m && x < bx[2] + m && y > bx[1] - m && y < bx[3] + m;
+    // on a road or path (or within pad of one; paths count half)
+    const onWay = (x, y, pad) => {
+      for (const [pts, bx, hw, kp] of ways) if (inBox(bx, x, y, hw + pad) && lineDist(pts, x, y) < hw + pad * kp) return true;
+      return false;
+    };
+    // well inside a carriageway (a site's edge mapped along the kerb keeps its hoarding)
+    const onRoad = (x, y) => {
+      for (const [pts, bx, hw, kp] of ways) if (kp === 1 && inBox(bx, x, y, hw) && lineDist(pts, x, y) < hw - 1) return true;
+      return false;
+    };
+    // in (or within pad of) a building
+    const inBuilding = (x, y, pad) => {
+      for (const [rings, bx] of blds) if (inBox(bx, x, y, pad) && (ptInRings(rings, x, y) || (pad > 0 && ringsEdgeDist(rings, x, y) < pad))) return true;
+      return false;
+    };
+    // that, under a tree, or on an area mapped as something else (a lot, a lawn)
+    const blocked = (x, y, pad) => {
+      if (inBuilding(x, y, pad)) return true;
+      const tr = data.trees;
+      for (const t of trees) if (Math.hypot(tr[5 * t] - x, tr[5 * t + 1] - y) < tr[5 * t + 2] + pad * 0.5) return true;
+      for (const [rings, bx] of others) if (inBox(bx, x, y, 0) && ptInRings(rings, x, y)) return true;
+      return false;
+    };
+    // A construction polygon is often a project long finished (OpenStreetMap lags), or a campus block with one building
+    // going up: when most of the site is built over or mapped as something else, it gets no hoarding, office or ruts.
+    let inside = 0, free = 0;
+    const step = Math.max(3, Math.sqrt(a.A / 300));
+    for (let y = bb[1] + step / 2; y < bb[3]; y += step) for (let x = bb[0] + step / 2; x < bb[2]; x += step) {
+      if (!ptInRing(f, x, y)) continue;
+      inside++;
+      if (!blocked(x, y, 0) && !onWay(x, y, 0)) free++;
+    }
+    if (free < 0.5 * inside) { P = { panels: [], boxes: [], tracks: [], heaps: [], gate: [0, 0], ux: 1, uy: 0 }; sitePlans.set(i, P); return P; }
+    const ccw = ringArea(f) > 0;
+    // the gate: on the side nearest a road (the longer of two equally near), where the trucks turn in
+    let gs = 0, gScore = -Infinity;
+    for (let s = 0; s < n; s++) {
+      const e = (s + 1) % n, L = Math.hypot(f[2 * e] - f[2 * s], f[2 * e + 1] - f[2 * s + 1]);
+      if (L < 9) continue;
+      const mx = (f[2 * s] + f[2 * e]) / 2, my = (f[2 * s + 1] + f[2 * e + 1]) / 2;
+      let d = 60;
+      for (const [pts, bx, hw, kp] of ways) if (kp === 1 && inBox(bx, mx, my, 60)) d = Math.min(d, lineDist(pts, mx, my) - hw);
+      const score = Math.min(L, 40) - 2 * Math.max(0, d);
+      if (score > gScore) { gScore = score; gs = s; }
+    }
+    const ge = (gs + 1) % n, gdx = f[2 * ge] - f[2 * gs], gdy = f[2 * ge + 1] - f[2 * gs + 1], gL = Math.hypot(gdx, gdy) || 1;
+    const ux = gdx / gL, uy = gdy / gL, inx = ccw ? -uy : uy, iny = ccw ? ux : -ux;   // along the gate side; inward
+    const gx = f[2 * gs] + gdx / 2, gy = f[2 * gs + 1] + gdy / 2;
+    // does any way cross the line from (ax, ay) to (bx, by)? (a sidewalk running along the site's edge doesn't open the
+    // hoarding; a path or a driveway through it does)
+    const crossed = (ax, ay, bx, by) => {
+      const ex = bx - ax, ey = by - ay;
+      for (const [pts, bx2] of ways) {
+        if (Math.max(ax, bx) < bx2[0] || Math.min(ax, bx) > bx2[2] || Math.max(ay, by) < bx2[1] || Math.min(ay, by) > bx2[3]) continue;
+        for (let q = 2; q < pts.length; q += 2) {
+          const px = pts[q - 2], py = pts[q - 1], qx = pts[q] - px, qy = pts[q + 1] - py, den = ex * qy - ey * qx;
+          if (Math.abs(den) < 1e-9) continue;
+          const t = ((px - ax) * qy - (py - ay) * qx) / den, u = ((px - ax) * ey - (py - ay) * ex) / den;
+          if (t >= 0 && t <= 1 && u >= 0 && u <= 1) return true;
+        }
+      }
+      return false;
+    };
+    // the hoarding: each side in pieces of about 4 m, a piece left open at the gate, where a way crosses the line, where
+    // the line runs down a carriageway, or where a building stands on it
+    const panels = [];
+    for (let s = 0; s < n; s++) {
+      const e = (s + 1) % n, x0 = f[2 * s], y0 = f[2 * s + 1], dx = f[2 * e] - x0, dy = f[2 * e + 1] - y0, L = Math.hypot(dx, dy);
+      if (L < 0.5) continue;
+      const m = Math.max(1, Math.round(L / 4));
+      let run = -1;
+      for (let p = 0; p < m; p++) {
+        const t0 = p / m, t1 = (p + 1) / m, cx = x0 + dx * (t0 + t1) / 2, cy = y0 + dy * (t0 + t1) / 2;
+        const ax = x0 + dx * t0, ay = y0 + dy * t0, bx = x0 + dx * t1, by = y0 + dy * t1;
+        const open = (s === gs && Math.hypot(cx - gx, cy - gy) < 4) || crossed(ax, ay, bx, by) || onRoad(cx, cy) || inBuilding(cx, cy, 0.2);
+        if (open) { run = -1; continue; }
+        if (run < 0) { run = panels.length; panels.push({ x0: x0 + dx * t0, y0: y0 + dy * t0, x1: 0, y1: 0, nx: ccw ? dy / L : -dy / L, ny: ccw ? -dx / L : dx / L }); }
+        panels[run].x1 = x0 + dx * t1; panels[run].y1 = y0 + dy * t1;
+      }
+    }
+    // a box of size S that fits: wholly inside the site, 4 m clear of its edge, clear of buildings, trees, ways and areas
+    const fits = (cx, cy, S) => {
+      const hx = S.L / 2 + 1, hy = S.W / 2 + 1;
+      for (let c = 0; c < 5; c++) {
+        const su = c === 4 ? 0 : c & 1 ? hx : -hx, sv = c === 4 ? 0 : c & 2 ? hy : -hy;
+        const x = cx + ux * su + inx * sv, y = cy + uy * su + iny * sv;
+        if (!ptInRing(f, x, y) || ringsEdgeDist([f], x, y) < 4 || onWay(x, y, 1.5) || blocked(x, y, 2)) return false;
+      }
+      return true;
+    };
+    const boxes = [];
+    if (a.A >= 1500) {
+      // the site office just inside the gate (looking for room a little deeper and to either side), its container beside it
+      search: for (let d = 8; d <= 30; d += 4) for (const side of [0, 1, -1, 2, -2]) {
+        const cx = gx + inx * d + ux * side * 7, cy = gy + iny * d + uy * side * 7;
+        if (!fits(cx, cy, CABIN)) continue;
+        boxes.push({ cx, cy, S: CABIN });
+        if (a.A >= 4000) for (const o of [7.4, -7.4]) if (fits(cx + ux * o, cy + uy * o, CONTAINER)) { boxes.push({ cx: cx + ux * o, cy: cy + uy * o, S: CONTAINER }); break; }
+        break search;
+      }
+    }
+    // truck ruts from the gate: to the office, and on into the site
+    const tracks = [], ends = [];
+    if (boxes.length) ends.push([boxes[0].cx + inx * 4, boxes[0].cy + iny * 4]);
+    const far = rayFar(f, gx + inx * 0.5, gy + iny * 0.5, inx, iny);
+    if (far > 12) {
+      ends.push([gx + inx * far * 0.75 + ux * far * (rnd() - 0.5) * 0.5, gy + iny * far * 0.75 + uy * far * (rnd() - 0.5) * 0.5]);
+      if (a.A >= 6000) ends.push([gx + inx * far * 0.45 + ux * far * (rnd() < 0.5 ? -0.5 : 0.5), gy + iny * far * 0.45 + uy * far * (rnd() < 0.5 ? -0.5 : 0.5)]);
+    }
+    for (const [tx, ty] of ends) {
+      // a gentle curve: straight in through the gate, then bending toward where it's going
+      const d = Math.hypot(tx - gx, ty - gy), kx = gx + inx * d * 0.5, ky = gy + iny * d * 0.5, pts = [];
+      for (let q = 0; q <= 14; q++) { const t = q / 14, u = 1 - t; pts.push(u * u * (gx - inx * 3) + 2 * u * t * kx + t * t * tx, u * u * (gy - iny * 3) + 2 * u * t * ky + t * t * ty); }
+      tracks.push(pts);
+    }
+    // a heap of spoil or two, on open ground
+    const heaps = [];
+    for (let h = 0, tries = 0; h < (a.A >= 3000 ? (a.A >= 12000 ? 3 : 2) : a.A >= 1200 ? 1 : 0) && tries < 30; tries++) {
+      const x = bb[0] + (bb[2] - bb[0]) * rnd(), y = bb[1] + (bb[3] - bb[1]) * rnd(), rad = 3.5 + 3 * rnd();
+      if (!ptInRing(f, x, y) || ringsEdgeDist([f], x, y) < rad + 3 || blocked(x, y, rad + 1) || onWay(x, y, rad)) continue;
+      if (boxes.some((b) => Math.hypot(b.cx - x, b.cy - y) < rad + 6) || tracks.some((t) => lineDist(t, x, y) < rad + 2)) continue;
+      heaps.push([x, y, rad, rnd()]);
+      h++;
+    }
+    P = { panels, boxes, tracks, heaps, gate: [gx, gy], ux, uy };
+    sitePlans.set(i, P);
+    return P;
+  }
+  // the earth, its ruts and heaps (with the land use, under everything else; the path is the site's outline)
+  function drawSiteGround(ctx, i, a, k, G, cam, r) {
+    ctx.fillStyle = G.cons;
+    ctx.fill("evenodd");
+    if (k >= 0.7 && G.snow < 0.6) texture(ctx, "spoil", k, 1);
+    if (k < 0.6) return;
+    const P = sitePlan(i, r), snowy = G.snow >= 0.3;
+    ctx.save();
+    ctx.clip("evenodd");
+    // ruts: two wheel lines a lorry's track apart, or one worn band from further off
+    const rut = snowy ? "rgba(120,116,110,.3)" : "rgba(112,82,48,.26)";
+    ctx.lineCap = "round"; ctx.strokeStyle = rut;
+    for (const t of P.tracks) {
+      if (k >= 1.5) {
+        ctx.lineWidth = 0.5;
+        ctx.beginPath(); linePath(ctx, offsetLine(t, 0.95)); linePath(ctx, offsetLine(t, -0.95)); ctx.stroke();
+      } else { ctx.lineWidth = 2.2; ctx.beginPath(); linePath(ctx, t); ctx.stroke(); }
+    }
+    // heaps: a low mound seen from above, its flank at ground level (lit on the light's side, shaded on the other) and
+    // its crown a third of its width up, so the near flank shows below it
+    const o = geo.ROTS[r], lx = LIGHT_U * o.R[0] + LIGHT_V * o.D[0], ly = LIGHT_U * o.R[1] + LIGHT_V * o.D[1];
+    const lit = snowy ? "#eef0f2" : sh(G.cons, 1.02), dark = snowy ? "#c9ced4" : sh(G.cons, 0.8), crown = snowy ? "#f4f6f8" : sh(G.cons, 1.06);
+    for (const [x, y, rad, h] of P.heaps) {
+      const ry = rad * (0.75 + 0.2 * h), rot = h * 3;
+      const g = ctx.createLinearGradient(x + lx * rad, y + ly * rad, x - lx * rad, y - ly * rad);
+      g.addColorStop(0, lit); g.addColorStop(1, dark);
+      setWorld(ctx, cam, r);
+      ctx.fillStyle = g;
+      ctx.beginPath(); ctx.ellipse(x, y, rad, ry, rot, 0, TAU); ctx.fill();
+      setWorld(ctx, cam, r, rad * 0.32);
+      ctx.fillStyle = crown;
+      ctx.beginPath(); ctx.ellipse(x + lx * rad * 0.12, y + ly * rad * 0.12, rad * 0.62, ry * 0.62, rot, 0, TAU); ctx.fill();
+    }
+    setWorld(ctx, cam, r);
+    ctx.restore();
+  }
+  // the hoarding and the cabins (after the roads and areas: they stand up over whatever lies behind them)
+  function drawSites(ctx, r, cam, ids, k, G) {
+    if (k < 0.5) return;
+    const o = geo.ROTS[r], sx = SH_U * o.R[0] + SH_V * o.D[0], sy = SH_U * o.R[1] + SH_V * o.D[1];
+    const panel = (p, col) => {
+      projInto(PQ, 0, p.x0, p.y0, 0, r); projInto(PQ, 2, p.x1, p.y1, 0, r);
+      ctx.beginPath();
+      ctx.moveTo(PQ[0], PQ[1]); ctx.lineTo(PQ[2], PQ[3]); ctx.lineTo(PQ[2], PQ[3] - HOARD_H * C); ctx.lineTo(PQ[0], PQ[1] - HOARD_H * C); ctx.closePath();
+      ctx.fillStyle = col; ctx.fill();
+    };
+    const fence = (P, front) => {
+      for (const p of P.panels) {
+        const nd = p.nx * o.D[0] + p.ny * o.D[1];
+        if ((nd < 0) !== front) continue;
+        // the outer face lit by its bearing to the light; from inside the site, its shaded back
+        panel(p, front ? sh(HOARD, 0.8 + 0.32 * lightOf(p.nx * o.R[0] + p.ny * o.R[1], nd)) : sh(HOARD, 0.66));
+      }
+      // the top rail, and from closer in the posts
+      ctx.beginPath();
+      for (const p of P.panels) {
+        if ((p.nx * o.D[0] + p.ny * o.D[1] < 0) !== front) continue;
+        projInto(PQ, 0, p.x0, p.y0, HOARD_H, r); projInto(PQ, 2, p.x1, p.y1, HOARD_H, r);
+        ctx.moveTo(PQ[0], PQ[1]); ctx.lineTo(PQ[2], PQ[3]);
+        if (k >= 2) {
+          const L = Math.hypot(p.x1 - p.x0, p.y1 - p.y0), m = Math.max(1, Math.round(L / 3));
+          for (let q = 0; q <= m; q++) { const x = PQ[0] + (PQ[2] - PQ[0]) * q / m, y = PQ[1] + (PQ[3] - PQ[1]) * q / m; ctx.moveTo(x, y); ctx.lineTo(x, y + HOARD_H * C); }
+        }
+      }
+      ctx.strokeStyle = sh(HOARD, front ? 0.62 : 0.55); ctx.lineWidth = Math.max(0.1, 0.7 / k); ctx.stroke();
+    };
+    for (const i of ids) {
+      if (data.areas[i].k !== "cons") continue;
+      const P = sitePlan(i, r);
+      setScreen(ctx, cam);
+      fence(P, false);
+      for (const bx of P.boxes) {
+        const q = rectQuad(bx.cx, bx.cy, Math.atan2(P.uy, P.ux), bx.S.L / 2, bx.S.W / 2);
+        // a contact shadow, then the box
+        setWorld(ctx, cam, r);
+        ctx.beginPath();
+        const hull = hull2([0, 1, 2, 3].flatMap((c) => [[q[2 * c], q[2 * c + 1]], [q[2 * c] + sx * bx.S.H, q[2 * c + 1] + sy * bx.S.H]]));
+        ctx.moveTo(hull[0][0], hull[0][1]); for (const h of hull) ctx.lineTo(h[0], h[1]); ctx.closePath();
+        ctx.fillStyle = rgba(PAL.shadow, 0.2); ctx.fill();
+        setScreen(ctx, cam);
+        prism(ctx, r, q, 0, bx.S.H, bx.S.side, bx.S.top, Math.min(0.12, 0.8 / k));
+        if (bx.S === CABIN && k >= 1.2) cabinWindows(ctx, r, q, "#4b5763");
+      }
+      fence(P, true);
+      setWorld(ctx, cam, r);
+    }
+  }
+  // the office's windows on its camera-facing long side: dark by day, lit (drawn again over the lights) at night
+  function cabinWindows(ctx, r, q, col) {
+    const o = geo.ROTS[r];
+    for (const e of [0, 2]) {
+      const a = e, c = e + 1, dx = q[2 * c] - q[2 * a], dy = q[2 * c + 1] - q[2 * a + 1], L = Math.hypot(dx, dy) || 1;
+      if ((dy / L) * o.D[0] + (-dx / L) * o.D[1] >= 0) continue;
+      projInto(PQ, 0, q[2 * a], q[2 * a + 1], 0, r); projInto(PQ, 2, q[2 * c], q[2 * c + 1], 0, r);
+      ctx.beginPath();
+      quad(ctx, PQ[0], PQ[1], PQ[2], PQ[3], 0.14, 0.38, 1.1, 2.0);
+      quad(ctx, PQ[0], PQ[1], PQ[2], PQ[3], 0.62, 0.86, 1.1, 2.0);
+      ctx.fillStyle = col; ctx.fill();
+    }
+  }
+
+  const LANDUSE = new Set(["land", "res", "com", "ind", "rel", "cem", "campus", "farm", "cons"]);
+  // A lawn round each house (and a narrower one round apartment blocks): their outlines stroked wide and filled, so
+  // neighbours' yards run together into green blocks cut by the streets, alleys and lots drawn over them.
+  function drawYards(ctx, r, X0, Y0, X1, Y1, k, G) {
+    if (k < 0.2) return;
+    const ids = scene.query(r, "objects", X0 - 9, Y0 - 9, X1 + 9, Y1 + 9);
+    for (let pass = 0; pass < 2; pass++) {
+      ctx.beginPath();
+      let any = false;
+      for (const i of ids) {
+        if (i >= B || data.buildings[i].hidden) continue;
+        const kind = styleOf(i).kind;
+        if (kind !== (pass === 0 ? "house" : "apt")) continue;
+        ringPath(ctx, data.buildings[i].p[0]);
+        any = true;
+      }
+      if (!any) continue;
+      ctx.lineJoin = k >= 1 ? "round" : "bevel";   // round joins cost twice as much and don't show from afar
+      ctx.strokeStyle = ctx.fillStyle = G.yard;
+      ctx.lineWidth = pass === 0 ? 13 : 7;
+      ctx.stroke(); ctx.fill();
+    }
+  }
+  // is area i inside the field of a stadium bowl?
+  let bowlHoles = null;
+  const inBowlCache = new Map();
+  function inBowl(i) {
+    let v = inBowlCache.get(i);
+    if (v !== undefined) return v;
+    if (!bowlHoles) {
+      bowlHoles = [];
+      data.buildings.forEach((b, j) => {
+        if (b.hidden || b.p.length < 2 || !(b.lm || b.k === "stadium" || b.k === "grandstand") || styleOf(j).kind !== "bowl") return;
+        for (let q = 1; q < b.p.length; q++) if (Math.abs(ringArea(b.p[q])) > 400) bowlHoles.push(b.p[q]);
+      });
+    }
+    const [cx, cy] = ringCentroid(data.areas[i].p[0]);
+    v = bowlHoles.some((f) => ptInRing(f, cx, cy));
+    inBowlCache.set(i, v);
+    return v;
+  }
+  function bowlFloor(ctx, i, G) {
+    const b = data.buildings[i];
+    let inner = null, ia = 0;
+    for (let q = 1; q < b.p.length; q++) { const a = Math.abs(ringArea(b.p[q])); if (a > ia) { ia = a; inner = b.p[q]; } }
+    if (!inner) return;
+    ctx.fillStyle = G.turf;
+    ctx.beginPath(); ringPath(ctx, inner); ctx.fill();
+    // and out to the foot of the stands as drawBowl builds them (its smoothed rays can reach a little past the ring)
+    const g = bowlOf(i);
+    if (!g) return;
+    ctx.beginPath();
+    for (let j = 0; j < g.N; j++) {
+      const a = (j / g.N) * TAU, x = g.cx + Math.cos(a) * (g.rin[j] + 0.3), y = g.cy + Math.sin(a) * (g.rin[j] + 0.3);
+      if (j) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    }
+    ctx.closePath(); ctx.fill();
+  }
+  // Sidewalks along the streets where OSM has none mapped (most of the neighbourhoods): a strip of concrete on each
+  // side, a tree lawn's width back from the curb. A side counts as mapped when footways run along most of it.
+  const walkSides = new Map();
+  function streetWalks(ri, r) {
+    let v = walkSides.get(ri);
+    if (v !== undefined) return v;
+    const rd = data.roads[ri];
+    v = null;
+    if (STREETS.has(rd.k) && rd.k !== "trunk" && !rd.br && !rd.tn && rd.pts.length >= 4) {
+      const off = rd.w / 2 + 2.9, f = rd.pts, bb = ringBox(f), pad = off + 6;
+      const near = nearGround(r, "paths", bb[0] - pad, bb[1] - pad, bb[2] + pad, bb[3] + pad).filter((j) => {
+        const p = data.paths[j];
+        return p.fw !== "crossing" && p.k !== "steps";
+      });
+      const sides = [null, null];
+      let some = false;
+      for (let side = 0; side < 2; side++) {
+        const line = offsetLine(f, (side ? -1 : 1) * off);
+        // sample every ~6 m along the side: is there a mapped walk within 3.5 m?
+        let n = 0, hit = 0;
+        for (let q = 2; q < line.length; q += 2) {
+          const L = Math.hypot(line[q] - line[q - 2], line[q + 1] - line[q - 1]), m = Math.max(1, Math.round(L / 6));
+          for (let t = 0; t < m; t++) {
+            const x = line[q - 2] + ((line[q] - line[q - 2]) * (t + 0.5)) / m, y = line[q - 1] + ((line[q + 1] - line[q - 1]) * (t + 0.5)) / m;
+            n++;
+            for (const j of near) if (lineDist(data.paths[j].pts, x, y) < 3.5) { hit++; break; }
+          }
+        }
+        if (n && hit / n < 0.35) { sides[side] = line; some = true; }
+      }
+      if (some) v = sides;
+    }
+    walkSides.set(ri, v);
+    return v;
+  }
+  function drawStreetWalks(ctx, r, roadIds, k, G) {
+    ctx.beginPath();
+    let any = false;
+    for (const ri of roadIds) {
+      const v = streetWalks(ri, r);
+      if (!v) continue;
+      for (const line of v) if (line) { linePath(ctx, line); any = true; }
+    }
+    if (!any) return;
+    ctx.lineCap = "butt"; ctx.lineJoin = "round";
+    ctx.lineWidth = Math.max(1.6, 0.8 / k); ctx.strokeStyle = G.sidewalk; ctx.stroke();
+    if (k >= 2.5 && G.snow < 0.5) {
+      // slab joints
+      ctx.setLineDash([0.07, 1.5]);
+      ctx.lineWidth = 1.6; ctx.strokeStyle = "rgba(120,105,80,.16)"; ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
   // ---------------------------------------------------------------- sports
   function drawPitch(ctx, i, a, k, G, cam, r) {
     const sp = a.sp || "", su = a.su || "";
@@ -700,7 +1276,8 @@ export function makeRenderer(scene) {
       // end zones and a yard line every five yards
       const field = Math.min(L - 2, 109.7), ez = 9.14 * (field / 109.7), x0 = -field / 2;
       const ww = Math.min(W - 1.6, 48.8);
-      ctx.fillStyle = "rgba(160, 30, 30, .42)";
+      // scarlet end zones (painted over the turf: its stripes still show through a little)
+      ctx.fillStyle = "rgba(176, 28, 44, .9)";
       ctx.fillRect(x0, -ww / 2, ez, ww); ctx.fillRect(-x0 - ez, -ww / 2, ez, ww);
       ctx.strokeRect(x0, -ww / 2, field, ww);
       ctx.beginPath();
@@ -925,6 +1502,7 @@ export function makeRenderer(scene) {
     else if (name === "asphalt") spots(340, ["rgba(0,0,0,.07)", "rgba(255,255,255,.07)"], 1, 1);
     else if (name === "gravel") spots(700, ["rgba(0,0,0,.12)", "rgba(255,255,255,.14)", "rgba(80,60,40,.08)"], 1, 1);
     else if (name === "sedum") spots(500, ["rgba(70,100,40,.25)", "rgba(200,210,120,.25)", "rgba(160,90,60,.12)"], 1, 1);
+    else if (name === "spoil") spots(420, ["rgba(96,66,36,.16)", "rgba(255,248,228,.2)", "rgba(120,96,70,.14)", "rgba(70,60,52,.1)"], 1, 1);
     else if (name === "slabs" || name === "pavers") {
       // joints of square slabs (or small pavers), a little irregular
       g.strokeStyle = name === "slabs" ? "rgba(110,95,70,.20)" : "rgba(120,70,50,.22)"; g.lineWidth = 1;
@@ -1199,7 +1777,8 @@ export function makeRenderer(scene) {
 
   // ================================================================ parked cars
   // Slots are laid out once per parking aisle, stall, small lot and driveway (in ground metres, the same in every worker
-  // and rotation), as [x, y, angle, seed, lines] per slot; a slot holds a car when its seed is under the lot's fill.
+  // and rotation), as [x, y, angle, seed, lines] per slot. A slot holds a car when its hash is under the lot's fill; seed
+  // is then that hash over the fill (0..1, which picks the car's paint and shape), else 2 (empty).
   const slotCache = new Map();
   const PITCH = 2.7, DEPTH = 5.1;
   const lotFill = (ai) => 0.38 + 0.5 * nHash(ai * 7907 + 3);
@@ -1246,7 +1825,8 @@ export function makeRenderer(scene) {
             for (const j of objs) if (ptInRing(data.buildings[j].p[0], cx, cy)) { ok = false; break; }
             if (!ok) continue;
             const seed = nHash((Math.round(cx * 10) * 73856093) ^ (Math.round(cy * 10) * 19349663));
-            res.push(cx, cy, Math.atan2(ny * side, nx * side), seed < lotFill(lot) ? seed : 2, 1);
+            const fill = lotFill(lot);
+            res.push(cx, cy, Math.atan2(ny * side, nx * side), seed < fill ? seed / fill : 2, 1);
           }
         }
         carry = Math.max(0.6, carry - L + Math.ceil((L - carry) / PITCH) * PITCH);
@@ -1266,7 +1846,7 @@ export function makeRenderer(scene) {
     if (o && o.L > 3.6 && o.L < 9 && o.W > 1.9 && o.W < 4.5) {
       const seed = nHash(ai * 2654435761 + 17);
       // nose in: either way along the stall
-      out = new Float32Array([o.cx, o.cy, o.ang + (nHash(ai + 5) < 0.5 ? Math.PI : 0), seed < 0.78 ? seed : 2, 0]);
+      out = new Float32Array([o.cx, o.cy, o.ang + (nHash(ai + 5) < 0.5 ? Math.PI : 0), seed < 0.78 ? seed / 0.78 : 2, 0]);
     }
     slotCache.set(key, out);
     return out;
@@ -1307,7 +1887,7 @@ export function makeRenderer(scene) {
             }
             if (!ok) continue;
             const seed = nHash((Math.round(cx * 10) * 73856093) ^ (Math.round(cy * 10) * 19349663));
-            res.push(cx, cy, Math.atan2(vy * s, vx * s), seed < fill ? seed : 2, 1);
+            res.push(cx, cy, Math.atan2(vy * s, vx * s), seed < fill ? seed / fill : 2, 1);
           }
         }
       }
@@ -1336,7 +1916,7 @@ export function makeRenderer(scene) {
           const cx = f[q - 2] + tx * t, cy = f[q - 1] + ty * t;
           let ok = true;
           for (const j of nearGround(r, "objects", cx - 3, cy - 3, cx + 3, cy + 3)) if (j < B && ptInRing(data.buildings[j].p[0], cx, cy)) { ok = false; break; }
-          if (ok) out = new Float32Array([cx, cy, Math.atan2(ty, tx) + (seed < 0.3 ? Math.PI : 0), seed, 0]);
+          if (ok) out = new Float32Array([cx, cy, Math.atan2(ty, tx) + (seed < 0.3 ? Math.PI : 0), seed / 0.55, 0]);
           break;
         }
         d -= L;
@@ -1392,24 +1972,7 @@ export function makeRenderer(scene) {
     }
     if (!carOrder.length) return;
     const dep = (id) => { const arr = SLOTS[Math.floor(id / 1e6)], s = id % 1e6; return arr[s] * o.D[0] + arr[s + 1] * o.D[1]; };
-    if (k < 0.8) {
-      // specks of paint, one fill per colour
-      const sx = SH_U * o.R[0] + SH_V * o.D[0], sy = SH_U * o.R[1] + SH_V * o.D[1];
-      for (let c = -1; c < PAINT.length; c++) {
-        ctx.beginPath();
-        for (const id of carOrder) {
-          const arr = SLOTS[Math.floor(id / 1e6)], s = id % 1e6;
-          if (c >= 0 && paintOf(arr[s + 3] / 0.9) !== c) continue;
-          const x = arr[s] + (c < 0 ? sx * 0.8 : 0), y = arr[s + 1] + (c < 0 ? sy * 0.8 : 0), ca = Math.cos(arr[s + 2]), sa = Math.sin(arr[s + 2]);
-          const l = 2.25, w = 0.92;
-          ctx.moveTo(x + ca * l - sa * w, y + sa * l + ca * w); ctx.lineTo(x + ca * l + sa * w, y + sa * l - ca * w);
-          ctx.lineTo(x - ca * l + sa * w, y - sa * l - ca * w); ctx.lineTo(x - ca * l - sa * w, y - sa * l + ca * w); ctx.closePath();
-        }
-        ctx.fillStyle = c < 0 ? "rgba(38,50,60,.2)" : PAINT[c][0];
-        ctx.fill();
-      }
-      return;
-    }
+    if (k < 0.8) { parkedSpecks(ctx, r, cam, k); return; }
     carOrder.sort((p, q) => dep(q) - dep(p));
     // soft shadows under them all, then each car
     const sx = SH_U * o.R[0] + SH_V * o.D[0], sy = SH_U * o.R[1] + SH_V * o.D[1];
@@ -1425,19 +1988,67 @@ export function makeRenderer(scene) {
     setScreen(ctx, cam);
     for (const id of carOrder) {
       const arr = SLOTS[Math.floor(id / 1e6)], s = id % 1e6;
-      drawCar(ctx, r, arr[s], arr[s + 1], arr[s + 2], arr[s + 3] / 0.9, k);
+      drawCar(ctx, r, arr[s], arr[s + 1], arr[s + 2], arr[s + 3], k);
     }
     setWorld(ctx, cam, r);
   }
+  // From afar a parked car is a pixel or two of its paint. A big lot holds thousands, and as many tiny antialiased paths
+  // cost about a second a tile, so they are written straight into an image (blended by hand, a soft shadow pixel under
+  // each), which is then laid on the tile: a millisecond or two.
+  const PAINT_RGB = PAINT.map((p) => hexToRgb(p[0]));
+  let speckImg = null;
+  function parkedSpecks(ctx, r, cam, k) {
+    if (!canMakeCanvas) return;
+    const W = ctx.canvas.width, H = ctx.canvas.height;
+    if (!speckImg || speckImg.width !== W || speckImg.height !== H) speckImg = { width: W, height: H, img: new ImageData(W, H), canvas: new OffscreenCanvas(W, H) };
+    const px = speckImg.img.data;
+    px.fill(0);
+    const o = geo.ROTS[r];
+    // a car's length and width in pixels: specks are a pixel at 0.25 px/m, two along the car at 0.5 px/m
+    const along = k >= 0.45 ? 2 : 1, cover = k >= 0.45 ? 0.95 : 0.8;
+    // blend a colour into pixel (x, y) by alpha a (straight alpha, as ImageData holds it)
+    const put = (x, y, c, a) => {
+      if (x < 0 || y < 0 || x >= W || y >= H) return;
+      const p = 4 * (y * W + x), a0 = px[p + 3] / 255, ao = a + a0 * (1 - a);
+      if (ao <= 0) return;
+      for (let q = 0; q < 3; q++) px[p + q] = (c[q] * a + px[p + q] * a0 * (1 - a)) / ao;
+      px[p + 3] = ao * 255;
+    };
+    const SHADOW = [38, 50, 60];
+    let any = false;
+    for (const id of carOrder) {
+      const arr = SLOTS[Math.floor(id / 1e6)], s = id % 1e6;
+      const x = arr[s], y = arr[s + 1];
+      const X = (x * o.R[0] + y * o.R[1]) * k - cam.ox, Y = -(x * o.D[0] + y * o.D[1]) * S * k - cam.oy;
+      const ix = Math.floor(X), iy = Math.floor(Y);
+      if (ix < -2 || iy < -2 || ix > W + 1 || iy > H + 1) continue;
+      any = true;
+      const col = PAINT_RGB[paintOf(arr[s + 3])];
+      // the car's axis on the screen picks which neighbour the second pixel goes in
+      const ca = Math.cos(arr[s + 2]), sa = Math.sin(arr[s + 2]);
+      const fx = ca * o.R[0] + sa * o.R[1], fy = -(ca * o.D[0] + sa * o.D[1]) * S;
+      const dx = Math.abs(fx) >= Math.abs(fy) ? 1 : 0, dy = 1 - dx;
+      put(ix + 1, iy + 1, SHADOW, 0.22);
+      put(ix, iy, col, cover);
+      if (along > 1) put(ix + dx, iy + dy, col, cover * 0.85);
+    }
+    if (!any) return;
+    const g = speckImg.canvas.getContext("2d");
+    g.putImageData(speckImg.img, 0, 0);
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.drawImage(speckImg.canvas, 0, 0);
+    ctx.restore();
+  }
   // a parked car: a body and a glasshouse, each a box, their camera-facing sides and tops (in screen metres)
   const CQ = new Float64Array(16);
-  function drawCar(ctx, r, x, y, ang, seed, k) {
+  function drawCar(ctx, r, x, y, ang, seed, k, lift = 0) {
     const o = geo.ROTS[r];
     const type = seed * 7.3 % 1;   // a second number from the same seed
     const L = type < 0.55 ? 4.5 : type < 0.85 ? 4.8 : 4.1, W = type < 0.55 ? 1.8 : type < 0.85 ? 1.95 : 1.75, H = type < 0.55 ? 1.42 : type < 0.85 ? 1.72 : 1.48;
     const paint = PAINT[paintOf(seed)][0];
     const fx = Math.cos(ang), fy = Math.sin(ang), rx = fy, ry = -fx;
-    const X = x * o.R[0] + y * o.R[1], Y = -(x * o.D[0] + y * o.D[1]) * S;
+    const X = x * o.R[0] + y * o.R[1], Y = -(x * o.D[0] + y * o.D[1]) * S - lift * C;
     const Fx = fx * o.R[0] + fy * o.R[1], Fy = -(fx * o.D[0] + fy * o.D[1]) * S;
     const Rx = rx * o.R[0] + ry * o.R[1], Ry = -(rx * o.D[0] + ry * o.D[1]) * S;
     const fd = fx * o.D[0] + fy * o.D[1], rd = rx * o.D[0] + ry * o.D[1];
@@ -1496,11 +2107,10 @@ export function makeRenderer(scene) {
     const o = geo.ROTS[r];
     // the shadow vector per metre of height, in ground metres
     const sx = SH_U * o.R[0] + SH_V * o.D[0], sy = SH_U * o.R[1] + SH_V * o.D[1];
+    // (drawBase calls this inside the world's clip: the mask may run past the edge, the tile it lands on can't)
     setWorld(sctx, cam, r);
     sctx.fillStyle = "#000";
-    const w = data.world;
     sctx.save();
-    sctx.beginPath(); sctx.rect(w.x0, w.y0, w.x1 - w.x0, w.y1 - w.y0); sctx.clip();
     // buildings: one path (their hulls all turn the same way, so they simply union)
     sctx.beginPath();
     for (const i of ids) {
@@ -1590,6 +2200,11 @@ export function makeRenderer(scene) {
         g.fillStyle = ["rgba(150,85,40,.7)", "rgba(190,130,60,.7)", "rgba(120,80,45,.6)"][s % 3];
         g.fillRect(32 + Math.cos(a) * d, 32 + Math.sin(a) * d, 2, 1.5);
       }
+    } else if (kind === "haze" || kind === "haze-w") {
+      // the twigs of a bare crown: dense in the middle, thinning to nothing at the edge
+      const c = kind === "haze" ? "130,100,84" : "120,106,100";
+      gr.addColorStop(0, `rgba(${c},1)`); gr.addColorStop(0.55, `rgba(${c},.8)`); gr.addColorStop(0.85, `rgba(${c},.3)`); gr.addColorStop(1, `rgba(${c},0)`);
+      g.fillStyle = gr; g.fillRect(0, 0, 64, 64);
     } else if (kind === "pool") { gr.addColorStop(0, "rgba(255, 210, 140, .5)"); gr.addColorStop(1, "rgba(255, 210, 140, 0)"); g.fillStyle = gr; g.fillRect(0, 0, 64, 64); }
     else { gr.addColorStop(0, "rgba(255, 236, 190, 1)"); gr.addColorStop(1, "rgba(255, 220, 160, 0)"); g.fillStyle = gr; g.fillRect(0, 0, 64, 64); }
     return (sprites[kind] = c);
@@ -1598,6 +2213,7 @@ export function makeRenderer(scene) {
   // ================================================================ objects
   function drawObject(ctx, r, cam, i, style) {
     currentStyle = style || currentStyle;
+    if (DBG.on) { DBG.id = i; DBG.part = 0; }
     if (i < B) drawBuilding(ctx, r, cam, i, currentStyle);
     else if (i < B + T) drawTree(ctx, r, cam, i - B, currentStyle);
     else drawLamp(ctx, r, cam, i - B - T);
@@ -1677,7 +2293,7 @@ export function makeRenderer(scene) {
     }
     // a leader up the middle
     branch(lean, fork, -Math.PI / 2 + (rnd() - 0.5) * 0.2, (fork - (ccy - ry)) * 0.55, 1);
-    return (bareTpls[key] = { trunk, l1, l2, l3, tips, tipsMany, ccy, rx, ry, a });
+    return (bareTpls[key] = { trunk, l1, l2, l3, tips, tipsMany, ccy, rx, ry, a, tw: [tw0, tw1], lean, fork });
   }
   // Leafy crowns: unit = crown radius, origin at the crown's middle. A dark mass, the lit middle tone, highlights up
   // and to the left (where the light comes from), and a sprinkle of leaf flecks for close up.
@@ -1708,7 +2324,10 @@ export function makeRenderer(scene) {
       const p = x + y < -0.2 ? flecksL : flecks;
       p.moveTo(x + rr, y); p.arc(x, y, rr, 0, TAU);
     }
-    return (leafTpls[variant] = { base, mid, light, dark, flecks, flecksL });
+    // the whole crown's outline, for silhouette(): every circle above, all wound the same way
+    const sil = new Path2D();
+    for (const p of [base, mid, light, dark]) sil.addPath(p);
+    return (leafTpls[variant] = { base, mid, light, dark, flecks, flecksL, sil });
   }
   // Conifers: unit x = crown radius, unit y = the tree's screen height; origin at the foot. Tiers droop at the tips.
   const coneTpls = [];
@@ -1737,7 +2356,7 @@ export function makeRenderer(scene) {
       const a2 = left[2 * t], b2 = left[2 * t + 1];
       const y0 = a2[1], top = t + 1 < n ? left[2 * t + 3][1] - 0.02 : yt;
       lit.moveTo(a2[0] * 0.92, a2[1] - 0.01); lit.lineTo(b2[0] * 0.8, b2[1]); lit.lineTo(-0.02, top); lit.lineTo(0.02, y0 - (y0 - top) * 0.25); lit.closePath();
-      snow.moveTo(a2[0] * 0.9, a2[1] - 0.012); lit.lineTo; snow.lineTo(b2[0] * 0.7, b2[1] - 0.01); snow.lineTo(-0.03, top + 0.02); snow.lineTo(b2[0] * 0.5, b2[1] + 0.02); snow.closePath();
+      snow.moveTo(a2[0] * 0.9, a2[1] - 0.012); snow.lineTo(b2[0] * 0.7, b2[1] - 0.01); snow.lineTo(-0.03, top + 0.02); snow.lineTo(b2[0] * 0.5, b2[1] + 0.02); snow.closePath();
     }
     return (coneTpls[variant] = { sil, lit, snow, yb });
   }
@@ -1810,10 +2429,26 @@ export function makeRenderer(scene) {
     const sx = clamp(a / tpl.a, 0.8, 1.25) * (hh < 0.5 ? -1 : 1);
     ctx.setTransform(kk * unit * sx, 0, 0, kk * unit, X * kk - cam.ox, Yg * kk - cam.oy);
     const px = 1 / (k * unit);   // one device pixel, in template units (at the detail level)
-    // a haze of twigs: from afar this is all there is of the crown
+    // a haze of twigs, soft at the edge: from afar this is all there is of the crown
     const winter = season === "winter";
-    ctx.fillStyle = k < 1 ? (winter ? "rgba(120,106,100,.5)" : "rgba(128,100,86,.52)") : k < 2.5 ? (winter ? "rgba(120,106,100,.3)" : "rgba(130,100,84,.3)") : (winter ? "rgba(122,108,102,.17)" : "rgba(132,102,86,.18)");
-    ctx.beginPath(); ctx.ellipse(0, tpl.ccy, tpl.rx * 0.9, tpl.ry * 0.88, 0, 0, TAU); ctx.fill();
+    const haze = softSprite(winter ? "haze-w" : "haze");
+    if (k < 0.4) {
+      // from afar the haze is a few pixels across: a flat blot of its average tone looks the same and costs a tenth
+      // of a scaled sprite; the trunk is under a third of a pixel
+      ctx.fillStyle = winter ? "rgba(120,106,100,.47)" : "rgba(130,100,84,.47)";
+      ctx.beginPath(); ctx.ellipse(0, tpl.ccy, tpl.rx * 0.8, tpl.ry * 0.79, 0, 0, TAU); ctx.fill();
+      if (k * unit * Math.abs(sx) * tpl.tw[0] * 2 >= 0.35) { ctx.fillStyle = "#5d4a3e"; ctx.fill(tpl.trunk); }
+      return;
+    }
+    if (haze) {
+      const a0 = ctx.globalAlpha;
+      ctx.globalAlpha = a0 * (k < 1 ? 0.62 : k < 2.5 ? 0.4 : 0.24);
+      ctx.drawImage(haze, -tpl.rx * 0.96, tpl.ccy - tpl.ry * 0.95, tpl.rx * 1.92, tpl.ry * 1.9);
+      ctx.globalAlpha = a0;
+    } else {
+      ctx.fillStyle = k < 1 ? "rgba(128,100,86,.5)" : k < 2.5 ? "rgba(130,100,84,.3)" : "rgba(132,102,86,.18)";
+      ctx.beginPath(); ctx.ellipse(0, tpl.ccy, tpl.rx * 0.9, tpl.ry * 0.88, 0, 0, TAU); ctx.fill();
+    }
     ctx.fillStyle = "#5d4a3e"; ctx.fill(tpl.trunk);
     if (k < 0.6) return;
     ctx.lineCap = "round"; ctx.lineJoin = "round";
@@ -1893,7 +2528,15 @@ export function makeRenderer(scene) {
   }
   const wallTop = (b) => (b.roof && b.roof !== "flat" && b.obb ? b.h - b.rh : b.h);
 
+  // LANDMARK HOOK (draw/decorate): a landmark may draw itself entirely, or add geometry after the standard building
   function drawBuilding(ctx, r, cam, i, style) {
+    const b = data.buildings[i];
+    if (b.hidden) return;
+    if (b.lm != null && LM.draw(api, ctx, r, cam, i, style)) return;
+    drawBuildingStd(ctx, r, cam, i, style);
+    if (b.lm != null) LM.decorate(api, ctx, r, cam, i, style);
+  }
+  function drawBuildingStd(ctx, r, cam, i, style) {
     const b = data.buildings[i];
     if (b.hidden) return;
     const st = styleOf(i);
@@ -1950,8 +2593,10 @@ export function makeRenderer(scene) {
     }
 
     // roof
+    if (DBG.on) DBG.part = 1;
     if (pitched) drawPitchedRoof(ctx, r, cam, i, b, st, snow, outline, lineW, k);
     else drawFlatRoof(ctx, r, cam, i, b, st, rings, top, k, snow, outline, lineW, base);
+    if (DBG.on) DBG.part = 0;   // (a landmark's own pieces, drawn next, carry their own lights)
   }
 
   // Facade details on one wall: a stone plinth, a cornice, string courses, windows (bands of them from afar, each one
@@ -2010,14 +2655,18 @@ export function makeRenderer(scene) {
     const idBase = strHashInt(b.id) + wv.c * 131 + wv.ri * 7919;
     if (f === "parking") {
       // open decks: a dark band per level
-      ctx.beginPath();
+      const g = mode === 2 && litBatch ? litBatch[3] : ctx;
+      if (g === ctx) ctx.beginPath();
       for (let fl = 0; fl < floors; fl++) {
         const z0 = base + fl * fhh + fhh * 0.38, z1 = base + fl * fhh + fhh * 0.86;
         if (mode === 2 && nHash(strHashInt(b.id) + fl * 7) < 0.35) continue;
-        quad(ctx, x1, y1, x2, y2, 0.02, 0.98, z0, z1);
+        quad(g, x1, y1, x2, y2, 0.02, 0.98, z0, z1);
+        if (g !== ctx) litUsed[3] = true;
       }
-      ctx.fillStyle = mode === 2 ? "rgba(255, 238, 200, .75)" : "rgba(48, 52, 58, .55)";
-      ctx.fill();
+      if (g === ctx) {
+        ctx.fillStyle = mode === 2 ? LIT_PARK : "rgba(48, 52, 58, .55)";
+        ctx.fill();
+      }
       if (mode === 1 && k >= 3) {
         // columns between the openings
         ctx.beginPath();
@@ -2045,7 +2694,8 @@ export function makeRenderer(scene) {
       if (mode === 2) {
         const on = 0.34;
         for (let pass = 0; pass < 3; pass++) {
-          ctx.beginPath();
+          const g = litBatch ? litBatch[pass] : ctx;
+          if (g === ctx) ctx.beginPath();
           let any = false;
           for (let fl = 0; fl < floors; fl++) for (let w = 0; w < nb; w++) {
             const hsh = nHash(idBase + fl * 977 + w * 31);
@@ -2053,10 +2703,11 @@ export function makeRenderer(scene) {
             const cl = hsh < on * 0.22 ? 0 : hsh < on * 0.62 ? 1 : 2;
             if (cl !== pass) continue;
             const t0 = pad + ((1 - 2 * pad) * w) / nb, t1 = pad + ((1 - 2 * pad) * (w + 1)) / nb;
-            quad(ctx, x1, y1, x2, y2, t0 + 0.04 / L, t1 - 0.04 / L, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
+            quad(g, x1, y1, x2, y2, t0 + 0.04 / L, t1 - 0.04 / L, base + fl * fhh + fhh * z0f, base + fl * fhh + fhh * z1f);
             any = true;
           }
-          if (any) { ctx.fillStyle = ["#cfe4ff", "#ffd889", "#ffc46b"][pass]; ctx.fill(); }
+          if (!any) continue;
+          if (g === ctx) { ctx.fillStyle = LIT[pass]; ctx.fill(); } else litUsed[pass] = true;
         }
         return;
       }
@@ -2099,18 +2750,19 @@ export function makeRenderer(scene) {
     if (mode === 2) {
       const on = st.kind === "hospital" ? 0.72 : f === "house" || f === "apt" ? 0.5 : st.kind === "campus" ? 0.36 : 0.3;
       for (let pass = 0; pass < 3; pass++) {
-        ctx.beginPath();
+        const g = litBatch ? litBatch[pass] : ctx;
+        if (g === ctx) ctx.beginPath();
         let any = false;
         for (let fl = 0; fl < floors; fl++) {
           if (fl === 0 && store) {
             // shop fronts: most of them lit
-            if (pass === 1 && nHash(idBase + 3) < 0.75) { quad(ctx, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); any = true; }
+            if (pass === 1 && nHash(idBase + 3) < 0.75) { quad(g, x1, y1, x2, y2, 0.06, 0.94, base + 0.35, base + Math.min(3, fhh * 0.82)); any = true; }
             continue;
           }
           const z0 = base + fl * fhh + fhh * z0f, z1 = base + fl * fhh + fhh * z1f;
           for (let w = 0; w < count; w++) {
             if (fl === 0 && w === doorSlot) {
-              if (pass === 1 && (front || nHash(idBase + 9) < 0.7)) { const t0 = pad + span * w + (span * (1 - (front ? 0.3 : 0.7))) / 2; quad(ctx, x1, y1, x2, y2, t0, t0 + span * (front ? 0.3 : 0.7), base, base + Math.min(2.6, fhh * 0.7)); any = true; }
+              if (pass === 1 && (front || nHash(idBase + 9) < 0.7)) { const t0 = pad + span * w + (span * (1 - (front ? 0.3 : 0.7))) / 2; quad(g, x1, y1, x2, y2, t0, t0 + span * (front ? 0.3 : 0.7), base, base + Math.min(2.6, fhh * 0.7)); any = true; }
               continue;
             }
             const hsh = nHash(idBase + fl * 977 + w * 31);
@@ -2118,11 +2770,12 @@ export function makeRenderer(scene) {
             const cl = hsh < on * 0.22 ? 0 : hsh < on * 0.62 ? 1 : 2;
             if (cl !== pass) continue;
             const t0 = pad + span * w + (span * (1 - ww)) / 2;
-            quad(ctx, x1, y1, x2, y2, t0, t0 + span * ww, z0, z1);
+            quad(g, x1, y1, x2, y2, t0, t0 + span * ww, z0, z1);
             any = true;
           }
         }
-        if (any) { ctx.fillStyle = ["#cfe4ff", "#ffd889", "#ffc46b"][pass]; ctx.fill(); }
+        if (!any) continue;
+        if (g === ctx) { ctx.fillStyle = LIT[pass]; ctx.fill(); } else litUsed[pass] = true;
       }
       return;
     }
@@ -2154,8 +2807,8 @@ export function makeRenderer(scene) {
           if (sill) { quad(ctx, x1, y1, x2, y2, t0 - fw * 1.6, t1 + fw * 1.6, z0 - 0.2, z0); quad(ctx, x1, y1, x2, y2, t0 - fw, t1 + fw, z1, z1 + 0.16); }
         }
       }
+      // frames and sills share one fill (the frame's colour where there are frames)
       ctx.fillStyle = frame || sill; ctx.fill();
-      if (frame && sill && frame !== sill) { /* frames and sills share a colour: one fill */ }
     }
     ctx.beginPath();
     for (let fl = 0; fl < floors; fl++) {
@@ -2202,6 +2855,7 @@ export function makeRenderer(scene) {
 
   // A front porch: a deck, posts and a little roof, along the middle of the front wall.
   function drawPorch(ctx, r, cam, i, b, st, wv, he, k) {
+    if (DBG.on) DBG.part = 2;
     const f = b.p[wv.ri];
     const ax = f[2 * wv.c], ay = f[2 * wv.c + 1], bx = f[2 * wv.a], by = f[2 * wv.a + 1];
     const L = wv.L, tx = (bx - ax) / L, ty = (by - ay) / L, nx = wv.nx, ny = wv.ny;
@@ -2233,6 +2887,8 @@ export function makeRenderer(scene) {
   }
 
   // ---------------------------------------------------------------- roofs
+  // set while the night lights paint a roof to rub out what it hides: only its outline counts, not what lies on it
+  let erasing = false;
   // Flat roofs: membrane, gravel, tar or a green roof; a coping round the parapet with its shadow inside; seams; then
   // what stands on top: plant rooms, air handlers with fans, skylights, solar arrays (never in a courtyard).
   function drawFlatRoof(ctx, r, cam, i, b, st, rings, top, k, snow, outline, lineW, base) {
@@ -2241,21 +2897,22 @@ export function makeRenderer(scene) {
     let rc = st.roof;
     if (snow > 0.15) rc = mx(rc, "#f5f7f9", Math.min(0.9, snow * 1.1));
     ctx.fillStyle = rc; ctx.fill("evenodd");
-    if (k >= 1 && snow < 0.4) {
-      if (st.roofKind === "gravel") screenTexture(ctx, "gravel", cam.k);
-      else if (st.roofKind === "green") screenTexture(ctx, "sedum", cam.k);
+    if (k >= 1 && snow < 0.4 && !erasing) {
+      // texels of the tile level's pixels (k is cam.lod), so a redraw over a moving bus matches the tile
+      if (st.roofKind === "gravel") screenTexture(ctx, "gravel", k);
+      else if (st.roofKind === "green") screenTexture(ctx, "sedum", k);
     }
     if (outline) { ctx.strokeStyle = sh(rc, 0.72); ctx.lineWidth = lineW; ctx.stroke(); }
     const hgt = b.h - base;
-    if (k < 2 || hgt < 2.5) return;
-    // the parapet's coping: a light line along the edge
-    ctx.strokeStyle = st.kind === "house" || st.kind === "small" ? sh(rc, 1.1) : mx(rc, "#ffffff", 0.35);
-    ctx.lineWidth = Math.min(0.32, 1.4 / k); ctx.stroke();
-    if (st.kind === "house" || st.kind === "small" || st.kind === "parking") {
-      if (st.kind === "parking" && k >= 3) parkingDeckLines(ctx, r, i, b, top);
-      return;
+    if (k >= 2 && hgt >= 2.5) {
+      // the parapet's coping: a light line along the edge
+      ctx.strokeStyle = st.kind === "house" || st.kind === "small" ? sh(rc, 1.1) : mx(rc, "#ffffff", 0.35);
+      ctx.lineWidth = Math.min(0.32, 1.4 / k); ctx.stroke();
     }
-    if (k >= 3) {
+    if (st.kind === "parking") { if (k >= 0.8) deckCars(ctx, r, cam, i, b, k, snow); return; }
+    if (k < 2 || hgt < 2.5) return;
+    if (st.kind === "house" || st.kind === "small") return;
+    if (k >= 3 && !erasing) {
       // the parapet's shadow inside the edge, and membrane seams, kept to the roof by a clip
       ctx.save();
       ctx.clip("evenodd");
@@ -2283,17 +2940,73 @@ export function makeRenderer(scene) {
     }
     ctx.strokeStyle = st.roofKind === "metal" ? "rgba(90,95,100,.22)" : "rgba(120,110,95,.16)"; ctx.lineWidth = 0.07; ctx.stroke();
   }
-  function parkingDeckLines(ctx, r, i, b, top) {
-    const o = obbFor(i);
-    if (!o || o.W < 14) return;
-    const ux = Math.cos(o.ang), uy = Math.sin(o.ang), vx = -uy, vy = ux;
-    ctx.beginPath();
-    for (const v of [-o.W / 2 + 5.4, o.W / 2 - 5.4]) for (let u = -o.L / 2 + 2; u < o.L / 2 - 2; u += 2.7) {
-      projInto(PQ, 0, o.cx + ux * u + vx * (v - Math.sign(v) * 0.2), o.cy + uy * u + vy * (v - Math.sign(v) * 0.2), b.h, r);
-      projInto(PQ, 2, o.cx + ux * u + vx * (v + Math.sign(v) * 4.6), o.cy + uy * u + vy * (v + Math.sign(v) * 4.6), b.h, r);
-      ctx.moveTo(PQ[0], PQ[1]); ctx.lineTo(PQ[2], PQ[3]);
+  // The top deck of a parking garage: rows of stalls (against each parapet, back to back down the middle of a wide
+  // deck, 6.5 m aisles between), painted lines, and cars in some of them. Laid out once per garage in its own frame.
+  function deckSlots(i) {
+    const key = "g" + i;
+    let out = slotCache.get(key);
+    if (out) return out;
+    const b = data.buildings[i], o = obbFor(i), res = [];
+    if (o && o.W >= 11 && o.L >= 12) {
+      const ux = Math.cos(o.ang), uy = Math.sin(o.ang), vx = -uy, vy = ux;
+      const rows = [];
+      let v = -o.W / 2 + 0.5, back = false;
+      while (v + DEPTH <= o.W / 2 - 0.5) {
+        rows.push([v + DEPTH / 2, back ? 1 : -1]);
+        v += DEPTH;
+        // after a stall row facing the parapet comes an aisle; after one facing the aisle, a row back to back with it
+        if (back) back = false;
+        else { v += 6.5; back = true; }
+      }
+      const fill = 0.3 + 0.45 * nHash(strHashInt(b.id) + 19);
+      for (const [c, face] of rows) for (let u = -o.L / 2 + PITCH / 2 + 1.2; u < o.L / 2 - PITCH / 2 - 1.2; u += PITCH) {
+        const cx = o.cx + ux * u + vx * c, cy = o.cy + uy * u + vy * c;
+        let ok = ringsEdgeDist(b.p, cx, cy) > 1.2;
+        for (let q = 0; q < 4 && ok; q++) {
+          const du = (q & 1 ? 1 : -1) * (PITCH / 2 - 0.2), dv = (q & 2 ? 1 : -1) * (DEPTH / 2 - 0.1);
+          if (!ptInRings(b.p, cx + ux * du + vx * dv, cy + uy * du + vy * dv)) ok = false;
+        }
+        if (!ok) continue;
+        const seed = nHash((Math.round(cx * 10) * 73856093) ^ (Math.round(cy * 10) * 19349663));
+        res.push(cx, cy, Math.atan2(vy * face, vx * face), seed < fill ? seed / fill : 2, 1);
+      }
     }
-    ctx.strokeStyle = "rgba(250,248,240,.6)"; ctx.lineWidth = 0.1; ctx.stroke();
+    out = new Float32Array(res);
+    slotCache.set(key, out);
+    return out;
+  }
+  function deckCars(ctx, r, cam, i, b, k, snow) {
+    const arr = deckSlots(i);
+    if (!arr.length) return;
+    const o = geo.ROTS[r], z = b.h;
+    // lines and shadows in the deck's own plane
+    setWorld(ctx, cam, r, z);
+    if (k >= 2 && snow < 0.5) {
+      ctx.beginPath();
+      for (let s = 0; s < arr.length; s += 5) {
+        const x = arr[s], y = arr[s + 1], ca = Math.cos(arr[s + 2]), sa = Math.sin(arr[s + 2]);
+        for (const e of [-1, 1]) {
+          const bx = x - sa * e * PITCH / 2, by = y + ca * e * PITCH / 2;
+          ctx.moveTo(bx - ca * (DEPTH / 2 - 0.1), by - sa * (DEPTH / 2 - 0.1)); ctx.lineTo(bx + ca * (DEPTH / 2 - 0.4), by + sa * (DEPTH / 2 - 0.4));
+        }
+      }
+      ctx.lineCap = "butt"; ctx.lineWidth = 0.12; ctx.strokeStyle = "rgba(248,246,238,.7)"; ctx.stroke();
+    }
+    const sx = SH_U * o.R[0] + SH_V * o.D[0], sy = SH_U * o.R[1] + SH_V * o.D[1];
+    const order = [];
+    ctx.beginPath();
+    for (let s = 0; s < arr.length; s += 5) {
+      if (arr[s + 3] > 1) continue;
+      order.push(s);
+      const x = arr[s] + sx * 0.7, y = arr[s + 1] + sy * 0.7, ca = Math.cos(arr[s + 2]), sa = Math.sin(arr[s + 2]);
+      const l = 2.45, w = 1.05;
+      ctx.moveTo(x + ca * l - sa * w, y + sa * l + ca * w); ctx.lineTo(x + ca * l + sa * w, y + sa * l - ca * w);
+      ctx.lineTo(x - ca * l + sa * w, y - sa * l - ca * w); ctx.lineTo(x - ca * l - sa * w, y - sa * l + ca * w); ctx.closePath();
+    }
+    ctx.fillStyle = "rgba(38,50,60,.2)"; ctx.fill();
+    setScreen(ctx, cam);
+    order.sort((p, q) => depthOf(arr[q], arr[q + 1], r) - depthOf(arr[p], arr[p + 1], r));
+    for (const s of order) drawCar(ctx, r, arr[s], arr[s + 1], arr[s + 2], arr[s + 3], k, z);
   }
 
   // Rooftop clutter, laid out once per building in its own frame (along its rectangle), so it lines up with the walls.
@@ -2427,7 +3140,12 @@ export function makeRenderer(scene) {
     }
   }
 
-  function drawPitchedRoof(ctx, r, cam, i, b, st, snow, outline, lineW, k) {
+  // A pitched roof's faces that face the camera (gable walls first, then the slopes), projected once per rotation.
+  const pitchedCache = new Map();
+  function pitchedGeom(i, r, b) {
+    const key = i * 4 + r;
+    let g = pitchedCache.get(key);
+    if (g) return g;
     const [cx, cy, ang, L, W] = b.obb;
     const ov = 0.35;
     const lx = Math.cos(ang), ly = Math.sin(ang), wx = -ly, wy = lx;
@@ -2459,14 +3177,21 @@ export function makeRenderer(scene) {
         faces.push({ pts, vis: viewDot(nx, ny, nz), roof: true, nu: nx * o.R[0] + ny * o.R[1], nd: nx * o.D[0] + ny * o.D[1] });
       }
     }
-    // gable walls first, then the slopes
+    // gable walls first, then the slopes; only those facing the camera
     faces.sort((a, b2) => (a.roof === b2.roof ? 0 : a.roof ? 1 : -1));
+    const shown = faces.filter((fc) => fc.vis < 0).map((fc) => ({ pts: fc.pts, roof: fc.roof, light: lightOf(fc.nu, fc.nd) }));
+    g = { faces: shown, ridge: [P(-ridgeHalf, 0, h), P(ridgeHalf, 0, h)], lx, ly, ridgeHalf, L, W, ang, cx, cy, h };
+    pitchedCache.set(key, g);
+    return g;
+  }
+  function drawPitchedRoof(ctx, r, cam, i, b, st, snow, outline, lineW, k) {
+    const g = pitchedGeom(i, r, b);
+    const { lx, ly, ridgeHalf, L, W, ang, cx, cy, h } = g;
     const rc = st.roof;
-    for (const fc of faces) {
-      if (fc.vis >= 0) continue;
+    for (const fc of g.faces) {
       ctx.beginPath(); ctx.moveTo(fc.pts[0][0], fc.pts[0][1]); for (let q = 1; q < fc.pts.length; q++) ctx.lineTo(fc.pts[q][0], fc.pts[q][1]);
       ctx.closePath();
-      const light = lightOf(fc.nu, fc.nd);
+      const light = fc.light;
       let col;
       if (fc.roof) { col = sh(rc, 0.78 + 0.42 * light); if (snow > 0.15) col = mx(col, "#f6f8fa", Math.min(0.92, snow * 1.15)); }
       else col = sh(st.wall, 0.7 + 0.36 * light);
@@ -2494,7 +3219,7 @@ export function makeRenderer(scene) {
     }
     if (outline) {
       // the ridge
-      const a = P(-ridgeHalf, 0, h), c = P(ridgeHalf, 0, h);
+      const a = g.ridge[0], c = g.ridge[1];
       ctx.strokeStyle = sh(rc, snow > 0.3 ? 0.9 : 0.62); ctx.lineWidth = lineW * 1.3;
       ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(c[0], c[1]); ctx.stroke();
     }
@@ -2963,7 +3688,200 @@ export function makeRenderer(scene) {
     }
   }
 
+  // ================================================================ outlines (shared by the night lights and silhouette)
+  // What of a building can hide what stands behind it, in screen metres: its camera-facing walls (far to near, in the
+  // order of visibleWalls for ordinary buildings), the solid outline of its roof, and the roof's courtyard holes. Every
+  // polygon winds the same way on the screen as ctx.rect() does (clockwise, y down), so a list of them fills as one union
+  // under the nonzero rule.
+  const outlines = new Map();
+  function orientPoly(p) {
+    let a = 0;
+    for (let q = 0, n = p.length; q < n; q += 2) { const j = (q + 2) % n; a += p[q] * p[j + 1] - p[j] * p[q + 1]; }
+    if (a >= 0) return p;
+    const out = new Float32Array(p.length);
+    for (let q = 0, n = p.length / 2; q < n; q++) { out[2 * q] = p[2 * (n - 1 - q)]; out[2 * q + 1] = p[2 * (n - 1 - q) + 1]; }
+    return out;
+  }
+  // the convex hull of a flat list of screen points, as a polygon
+  function hullPoly(pts) {
+    const list = [];
+    for (let q = 0; q < pts.length; q += 2) list.push([pts[q], pts[q + 1]]);
+    const h = hull2(list);
+    return orientPoly(new Float32Array(h.flat()));
+  }
+  // a box standing on a ground quad (q: 4 corners), from z0 to z1: its screen outline
+  function boxHull(q, z0, z1, r) {
+    const pts = new Float64Array(16);
+    for (let c = 0; c < 4; c++) { projInto(pts, 2 * c, q[2 * c], q[2 * c + 1], z0, r); projInto(pts, 8 + 2 * c, q[2 * c], q[2 * c + 1], z1, r); }
+    return hullPoly(pts);
+  }
+  function outlineOf(i, r) {
+    const key = i * 4 + r;
+    let ol = outlines.get(key);
+    if (ol !== undefined) return ol;
+    const b = data.buildings[i];
+    ol = null;
+    if (!b.hidden) {
+      const st = styleOf(i), rings = scene.forRot(r).objRings[i];
+      const walls = [], roof = [], holes = [];
+      const g = st.kind === "bowl" ? bowlOf(i) : null;
+      if (g) {
+        // the facade bays that face us, and the rim all round (the stands inside it hide everything behind)
+        for (const it of bowlFor(g, r)) if (it.p.kind === "facade") walls.push(orientPoly(Float32Array.from(it.P)));
+        const rimP = new Float32Array(g.N * 2);
+        for (let j = 0; j < g.N; j++) { const a = (j / g.N) * TAU; projInto(rimP, 2 * j, g.cx + Math.cos(a) * g.rout[j], g.cy + Math.sin(a) * g.rout[j], g.rim + 1.1, r); }
+        roof.push(orientPoly(rimP));
+        for (const p of g.pieces) {
+          if (p.kind === "press" || p.kind === "board") roof.push(boxHull(rectQuad(p.x, p.y, p.ang, p.hx, p.hy), p.z0, p.z1, r));
+          else if (p.kind === "rotunda") roof.push(boxHull(rectQuad(p.x, p.y, 0, p.rad, p.rad), 0, p.z1 + 1.2, r));
+        }
+      } else if (st.kind === "bleachers") {
+        const s = standOf(i), f = b.p[0], F = rings[0], n = f.length / 2;
+        for (const wv of visibleWalls(i, r)) {
+          if (wv.ri !== 0) continue;
+          const za = s.zAt(f[2 * wv.c], f[2 * wv.c + 1]) * C, zb = s.zAt(f[2 * wv.a], f[2 * wv.a + 1]) * C;
+          walls.push(orientPoly(new Float32Array([F[2 * wv.c], F[2 * wv.c + 1], F[2 * wv.a], F[2 * wv.a + 1], F[2 * wv.a], F[2 * wv.a + 1] - zb, F[2 * wv.c], F[2 * wv.c + 1] - za])));
+        }
+        const seat = new Float32Array(n * 2);
+        for (let q = 0; q < n; q++) projInto(seat, 2 * q, f[2 * q], f[2 * q + 1], s.zAt(f[2 * q], f[2 * q + 1]), r);
+        roof.push(orientPoly(seat));
+      } else {
+        const pitched = b.roof && b.roof !== "flat" && b.obb;
+        const top = wallTop(b) * C, bot = (b.mh || 0) * C;
+        for (const wv of visibleWalls(i, r)) {
+          const f = rings[wv.ri];
+          const x1 = f[2 * wv.c], y1 = f[2 * wv.c + 1], x2 = f[2 * wv.a], y2 = f[2 * wv.a + 1];
+          walls.push(orientPoly(new Float32Array([x1, y1 - bot, x2, y2 - bot, x2, y2 - top, x1, y1 - top])));
+        }
+        if (pitched) roof.push(pitchedHull(b, r));
+        else {
+          const lift = (f) => { const p = new Float32Array(f.length); for (let q = 0; q < f.length; q += 2) { p[q] = f[q]; p[q + 1] = f[q + 1] - top; } return p; };
+          roof.push(orientPoly(lift(rings[0])));
+          for (let q = 1; q < rings.length; q++) holes.push(lift(rings[q]));
+        }
+      }
+      ol = { walls, roof, holes };
+    }
+    outlines.set(key, ol);
+    return ol;
+  }
+  // A pitched roof's outline: the hull of its eaves (with the overhang, as drawPitchedRoof draws them) and its ridge.
+  function pitchedHull(b, r) {
+    const [cx, cy, ang, L, W] = b.obb;
+    const ov = 0.35, lx = Math.cos(ang), ly = Math.sin(ang), wx = -ly, wy = lx;
+    const hl = L / 2 + ov, hw = W / 2 + ov, eave = b.h - b.rh;
+    const shape = b.roof === "hipped" || b.roof === "half-hipped" || b.roof === "mansard" ? "hipped" : b.roof === "pyramidal" ? "pyramidal" : "gabled";
+    const ridgeHalf = shape === "gabled" ? hl : shape === "hipped" ? Math.max(0, L / 2 - W / 2) : 0;
+    const pts = new Float64Array(12);
+    let o = 0;
+    for (const [a, c, z] of [[-hl, -hw, eave - 0.25], [hl, -hw, eave - 0.25], [hl, hw, eave - 0.25], [-hl, hw, eave - 0.25], [-ridgeHalf, 0, b.h], [ridgeHalf, 0, b.h]]) {
+      projInto(pts, o, cx + lx * a + wx * c, cy + ly * a + wy * c, z, r); o += 2;
+    }
+    return hullPoly(pts);
+  }
+  // roof clutter tall enough to show over the roof's back edge: its boxes' outlines (when the tiles draw it)
+  const itemOutlines = new Map();
+  function roofItemOutlines(i, r) {
+    const key = i * 4 + r;
+    let out = itemOutlines.get(key);
+    if (out) return out;
+    out = [];
+    for (const it of roofItemsOf(i, r)) {
+      if (it.type === "solar" || it.type === "sky") continue;
+      out.push(boxHull(rectQuad(it.cx, it.cy, it.ang, it.hx, it.hy), it.z, it.z + it.h, r));
+    }
+    itemOutlines.set(key, out);
+    return out;
+  }
+  // does drawFlatRoof put clutter on this building's roof at this level of detail?
+  function roofItemsShown(b, st, k) {
+    return k >= 2 && !(b.roof && b.roof !== "flat" && b.obb) && b.h - (b.mh || 0) >= 2.5 && st.kind !== "house" && st.kind !== "small" && st.kind !== "parking" && st.kind !== "bowl" && st.kind !== "bleachers";
+  }
+  // append a polygon (screen metres) to a path, as device pixels for the scale s and offset (ox, oy)
+  function polyOut(p, f, s, ox, oy) {
+    p.moveTo(f[0] * s - ox, f[1] * s - oy);
+    for (let q = 2; q < f.length; q += 2) p.lineTo(f[q] * s - ox, f[q + 1] * s - oy);
+    p.closePath();
+  }
+  function quadOut(p, s, ox, oy, ax, ay, bx, by, cx, cy, dx, dy) {
+    // four corners in any order round the quad: wound like rect()
+    const a = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+    if (a < 0) { let t = bx; bx = dx; dx = t; t = by; by = dy; dy = t; }
+    p.moveTo(ax * s - ox, ay * s - oy); p.lineTo(bx * s - ox, by * s - oy); p.lineTo(cx * s - ox, cy * s - oy); p.lineTo(dx * s - ox, dy * s - oy); p.closePath();
+  }
+
+  /**
+   * Append object id's visible outline to path (a Path2D, or a 2D context's current path), in device pixels for the
+   * camera { k, lod?, ox, oy }: exactly the shapes drawObject paints at that level of detail. See the notes at the top.
+   */
+  function silhouette(path, r, cam, id, style) {
+    const s = cam.k, ox = cam.ox, oy = cam.oy, lod = cam.lod || cam.k;
+    style = style || currentStyle;
+    if (id < B) {
+      const ol = outlineOf(id, r);
+      if (!ol) return path;
+      for (const f of ol.walls) polyOut(path, f, s, ox, oy);
+      for (const f of ol.roof) polyOut(path, f, s, ox, oy);
+      const b = data.buildings[id], st = styleOf(id);
+      if (roofItemsShown(b, st, lod)) for (const f of roofItemOutlines(id, r)) polyOut(path, f, s, ox, oy);
+      // LANDMARK HOOK (silhouette): a landmark's extra pieces (towers, roofs on top) hide what is behind them too
+      if (b.lm != null) LM.silhouette(api, path, r, cam, id);
+      return path;
+    }
+    const o = geo.ROTS[r];
+    if (id < B + T) {
+      const t = id - B, tr = data.trees;
+      const x = tr[5 * t], y = tr[5 * t + 1], rad = tr[5 * t + 2], h = tr[5 * t + 3], fl = tr[5 * t + 4];
+      const X = x * o.R[0] + y * o.R[1], Yg = -(x * o.D[0] + y * o.D[1]) * S;
+      const canAdd = typeof path.addPath === "function" && hasMatrix;
+      if (fl & 1) {
+        const yb = Yg - h * 0.17 * C, yt = Yg - h * C;
+        if (lod < 0.7 || !canAdd) { quadOut(path, s, ox, oy, X - rad, yb, X, yt, X, yt, X + rad, yb); return path; }
+        quadOut(path, s, ox, oy, X - 0.17, Yg - h * 0.2 * C, X + 0.17, Yg - h * 0.2 * C, X + 0.17, Yg, X - 0.17, Yg);
+        const tpl = coneTemplate(Math.floor(nHash(t * 40503 + 11) * 4));
+        path.addPath(tpl.sil, new DOMMatrix([s * rad, 0, 0, s * h * C, X * s - ox, Yg * s - oy]));
+        return path;
+      }
+      const hh2 = nHash(t * 40503 + 11);
+      if (treeBare(t, style)) {
+        // a bare tree hides only its trunk (the twigs are a thin haze)
+        const unit = h * C, a = rad / unit;
+        let bucket = 0;
+        for (let q = 1; q < BARE_A.length; q++) if (Math.abs(BARE_A[q] - a) < Math.abs(BARE_A[bucket] - a)) bucket = q;
+        const tpl = bareTemplate(bucket, Math.floor(hh2 * 4));
+        const sx = clamp(a / tpl.a, 0.8, 1.25) * (nHash(t * 2654435761 + 7) < 0.5 ? -1 : 1) * unit;
+        const tw = tpl.tw, lean = tpl.lean, fork = tpl.fork;
+        quadOut(path, s, ox, oy, X - tw[0] * sx, Yg, X + tw[0] * sx, Yg, X + (lean + tw[1]) * sx, Yg + fork * unit, X + (lean - tw[1]) * sx, Yg + fork * unit);
+        return path;
+      }
+      const cy = Yg - Math.max(h - rad, h * 0.55) * C;
+      if (lod < 0.7 || !canAdd) { path.moveTo((X + rad) * s - ox, cy * s - oy); path.arc(X * s - ox, cy * s - oy, rad * s, 0, TAU); path.closePath(); if (lod < 0.7) return path; }
+      const tw = Math.max(0.12, rad * 0.07);
+      quadOut(path, s, ox, oy, X - tw, Yg, X + tw, Yg, X + tw * 0.6, cy, X - tw * 0.6, cy);
+      if (canAdd) path.addPath(leafTemplate(Math.floor(hh2 * 6)).sil, new DOMMatrix([s * rad, 0, 0, s * rad, X * s - ox, cy * s - oy]));
+      return path;
+    }
+    // a lamp post (none drawn below 1.2 px/m)
+    if (lod < 1.2) return path;
+    const l = id - B - T, x = data.lamps[2 * l], y = data.lamps[2 * l + 1];
+    const X = x * o.R[0] + y * o.R[1], Y = -(x * o.D[0] + y * o.D[1]) * S;
+    quadOut(path, s, ox, oy, X - 0.075, Y - 5.5 * C, X + 0.075, Y - 5.5 * C, X + 0.075, Y, X - 0.075, Y);
+    if (lod >= 3) {
+      quadOut(path, s, ox, oy, X - 0.13, Y - 0.5 * C, X + 0.13, Y - 0.5 * C, X + 0.13, Y, X - 0.13, Y);
+      path.moveTo((X + 0.2) * s - ox, (Y - 5.72 * C) * s - oy); path.ellipse(X * s - ox, (Y - 5.72 * C) * s - oy, 0.2 * s, 0.26 * s, 0, 0, TAU); path.closePath();
+      quadOut(path, s, ox, oy, X - 0.24, Y - 5.86 * C, X, Y - 6.15 * C, X, Y - 6.15 * C, X + 0.24, Y - 5.86 * C);
+    } else quadOut(path, s, ox, oy, X - 0.25, Y - 5.9 * C, X + 0.25, Y - 5.9 * C, X + 0.25, Y - 5.9 * C + 0.32, X - 0.25, Y - 5.9 * C + 0.32);
+    return path;
+  }
+
   // ================================================================ night lights (a transparent layer, added on top)
+  const SPECK = ["rgba(255,214,150,.85)", "rgba(255,226,170,.85)", "rgba(255,200,130,.85)"];
+  const LIT = ["#cfe4ff", "#ffd889", "#ffc46b"], LIT_PARK = "rgba(255, 238, 200, .75)";
+  // While set, drawWindows (mode 2) and speckle add their lit quads to these paths (three window colours, the parking
+  // decks' glow, three speck colours) instead of filling them: one building's windows in a handful of fills.
+  let litBatch = null;
+  const litUsed = [false, false, false, false, false, false, false];
+  const LIT_FILL = [...LIT, LIT_PARK, ...SPECK];
   function drawLights(ctx, r, cam, X0, Y0, X1, Y1, style) {
     const k = cam.k;
     const ids = scene.query(r, "objects", X0 - 12, Y0 - 12, X1 + 12, Y1 + 12);
@@ -2978,41 +3896,94 @@ export function makeRenderer(scene) {
       const rad = 9;
       if (pool) ctx.drawImage(pool, X - rad, Y - rad * S, rad * 2, rad * 2 * S);
     }
+    // construction sites: a floodlight's pool between the gate and the site office, and the office's lit windows
+    if (k >= 0.5) for (const i of scene.query(r, "areas", X0 - 12, Y0 - 12, X1 + 12, Y1 + 12)) {
+      if (data.areas[i].k !== "cons") continue;
+      const P = sitePlan(i, r), b = P.boxes[0];
+      if (!b) continue;
+      const [X, Y] = geo.proj((b.cx + P.gate[0]) / 2, (b.cy + P.gate[1]) / 2, 0, r), rad = 14;
+      if (pool) { ctx.globalAlpha = 0.85; ctx.drawImage(pool, X - rad, Y - rad * S, rad * 2, rad * 2 * S); ctx.globalAlpha = 1; }
+      if (k >= 1.2) cabinWindows(ctx, r, rectQuad(b.cx, b.cy, Math.atan2(P.uy, P.ux), b.S.L / 2, b.S.W / 2), "#ffd28a");
+    }
+    const blot = (f) => { ctx.moveTo(f[0], f[1]); for (let q = 2; q < f.length; q += 2) ctx.lineTo(f[q], f[q + 1]); ctx.closePath(); };
     // then every object back to front: it blots out the light behind it, then adds its own
     for (const i of ids) {
+      if (DBG.on) { DBG.id = i < B ? i : -1; DBG.part = 3; }
       if (i < B) {
         const b = data.buildings[i];
         if (b.hidden) continue;
         const st = styleOf(i);
+        const ol = outlineOf(i, r);
+        if (!ol) continue;
         const rings = Sr.objRings[i];
         const walls = visibleWalls(i, r);
-        const pitched = b.roof && b.roof !== "flat" && b.obb;
-        const top = (pitched ? b.h - b.rh * 0.3 : b.h) * C, bot = (b.mh || 0) * C;
-        ctx.globalCompositeOperation = "destination-out";
-        ctx.fillStyle = "#000";
-        ctx.beginPath();
-        for (const wv of walls) {
-          const f = rings[wv.ri];
-          ctx.moveTo(f[2 * wv.c], f[2 * wv.c + 1] - bot); ctx.lineTo(f[2 * wv.a], f[2 * wv.a + 1] - bot);
-          ctx.lineTo(f[2 * wv.a], f[2 * wv.a + 1] - top); ctx.lineTo(f[2 * wv.c], f[2 * wv.c + 1] - top); ctx.closePath();
-        }
-        const f0 = rings[0];
-        ctx.moveTo(f0[0], f0[1] - top); for (let q = 2; q < f0.length; q += 2) ctx.lineTo(f0[q], f0[q + 1] - top); ctx.closePath();
-        ctx.fill("nonzero");
-        ctx.globalCompositeOperation = "source-over";
-        if (k < 1) continue;
-        if (st.kind === "bowl") { bowlLights(ctx, r, i, b, st, k); continue; }
-        if (st.kind === "bleachers") continue;
-        const front = st.kind === "house" && k >= 2 ? frontOf(i, r) : null;
-        let frontWall = null;
         const base = b.mh || 0, he2 = wallTop(b);
-        for (const wv of walls) {
-          const f = rings[wv.ri];
-          const isFront = front && wv.ri === 0 && wv.nx * front[0] + wv.ny * front[1] > 0.8 && (!frontWall || wv.L > frontWall.L);
-          if (isFront) frontWall = wv;
-          if (he2 - base < 1.6) continue;
-          drawWindows(ctx, b, st, wv, f[2 * wv.c], f[2 * wv.c + 1], f[2 * wv.a], f[2 * wv.a + 1], 2, k, isFront ? 1 : 0);
+        const special = st.kind === "bowl" || st.kind === "bleachers";
+        // windows: each one (as the day tiles lay them out) from 1 px/m, a sparse speckle from 0.5 px/m
+        const lit = !special && he2 - base >= 1.6 ? (k >= 1 ? 2 : k >= 0.5 ? 3 : 0) : 0;
+        ctx.fillStyle = "#000";
+        let frontWall = null;
+        if (!lit) {
+          ctx.globalCompositeOperation = "destination-out";
+          ctx.beginPath(); for (const f of ol.walls) blot(f); ctx.fill("nonzero");
+        } else {
+          // walls far to near, exactly as the base tiles draw them: each rubs out the windows of the walls behind it
+          // (notches, the far side of an L), then lights its own
+          const front = st.kind === "house" && k >= 2 ? frontOf(i, r) : null;
+          // walls that don't overlap one another (any convex footprint) need no order among themselves: rub them all
+          // out at once, and gather all their windows into a few paths
+          const batch = !walls.overlap && typeof Path2D !== "undefined";
+          if (batch) {
+            ctx.globalCompositeOperation = "destination-out";
+            ctx.beginPath(); for (const f of ol.walls) blot(f); ctx.fill("nonzero");
+            ctx.globalCompositeOperation = "source-over";
+            litBatch = [];
+            for (let q = 0; q < 7; q++) { litBatch.push(new Path2D()); litUsed[q] = false; }
+          }
+          for (let w = 0; w < walls.length; w++) {
+            const wv = walls[w], f = rings[wv.ri];
+            if (!batch) {
+              ctx.globalCompositeOperation = "destination-out";
+              ctx.fillStyle = "#000";
+              ctx.beginPath(); blot(ol.walls[w]); ctx.fill();
+              ctx.globalCompositeOperation = "source-over";
+            }
+            // the front door goes where the day tiles put it (they weigh every wall, edge-on ones too)
+            const isFront = front && wv.ri === 0 && wv.nx * front[0] + wv.ny * front[1] > 0.8 && (!frontWall || wv.L > frontWall.L);
+            if (isFront) frontWall = wv;
+            // a wall seen nearly edge-on is a sliver: its lit windows would be bright dashes where the day's dark ones
+            // don't show at all
+            if (wv.nd > -0.12) continue;
+            if (lit === 3) { speckle(ctx, b, st, wv, f[2 * wv.c], f[2 * wv.c + 1], f[2 * wv.a], f[2 * wv.a + 1], k); continue; }
+            drawWindows(ctx, b, st, wv, f[2 * wv.c], f[2 * wv.c + 1], f[2 * wv.a], f[2 * wv.a + 1], 2, k, isFront ? 1 : 0);
+          }
+          if (batch) {
+            for (let q = 0; q < 7; q++) if (litUsed[q]) { ctx.fillStyle = LIT_FILL[q]; ctx.fill(litBatch[q]); }
+            litBatch = null;
+          }
         }
+        // Then whatever the day tiles paint over the walls hides the lights behind it, this building's own included: a
+        // house's porch, and the roof with everything that stands on it (plant rooms, air handlers, the cars on a
+        // parking deck, a chimney). They are painted exactly as by day, but rubbing out; courtyards stay open.
+        ctx.globalCompositeOperation = "destination-out";
+        if (special) {
+          ctx.beginPath(); for (const f of ol.roof) blot(f); for (const f of ol.holes) blot(f);
+          ctx.fill(ol.holes.length ? "evenodd" : "nonzero");
+        } else {
+          erasing = true;
+          if (frontWall && k >= 2 && frontWall.L > 4.5 && he2 - base > 2.6) drawPorch(ctx, r, cam, i, b, st, frontWall, he2, k);
+          const outline = k >= 0.8, lineW = Math.min(0.12, 0.9 / k), snow = style.snow || 0;
+          if (b.roof && b.roof !== "flat" && b.obb) drawPitchedRoof(ctx, r, cam, i, b, st, snow, outline, lineW, k);
+          else drawFlatRoof(ctx, r, cam, i, b, st, rings, he2 * C, k, snow, outline, lineW, base);
+          erasing = false;
+          setScreen(ctx, cam);
+          if (DBG.on) DBG.part = 3;
+        }
+        ctx.globalCompositeOperation = "source-over";
+        if (st.kind === "bowl") { if (k >= 0.5) bowlLights(ctx, r, i, b, st, k); continue; }
+        // LANDMARK HOOK (lights): a landmark's own pieces hide what is behind them and show their own lights
+        if (b.lm != null) { LM.lights(api, ctx, r, cam, i, style); ctx.globalCompositeOperation = "source-over"; }
+        if (!lit) continue;
         if (frontWall && head && frontWall.L > 4.5 && nHash(strHashInt(b.id) + 41) < 0.7) {
           // a porch light by the front door
           const f = rings[0];
@@ -3021,13 +3992,22 @@ export function makeRenderer(scene) {
           ctx.drawImage(head, x - 1.1, y - 1.1, 2.2, 2.2);
         }
       } else if (i < B + T) {
-        const t = i - B, tr = data.trees;
-        const x = tr[5 * t], y = tr[5 * t + 1], rad = tr[5 * t + 2], h = tr[5 * t + 3];
-        const [X, Yg] = geo.proj(x, y, 0, r);
-        const cy = Yg - Math.max(h - rad, h * 0.55) * C;
+        // a tree dims the lights behind it: its crown (exactly the day's shape) mostly, a bare one's twigs a little
+        const t = i - B;
         ctx.globalCompositeOperation = "destination-out";
-        ctx.globalAlpha = treeBare(t, style) ? 0.35 : 0.8;
-        ctx.beginPath(); ctx.arc(X, cy, rad, 0, TAU); ctx.fill();
+        if (treeBare(t, style)) {
+          const tr = data.trees, x = tr[5 * t], y = tr[5 * t + 1], rad = tr[5 * t + 2], h = tr[5 * t + 3];
+          const [X, Yg] = geo.proj(x, y, 0, r);
+          ctx.globalAlpha = 0.35;
+          ctx.beginPath(); ctx.arc(X, Yg - Math.max(h - rad, h * 0.55) * C, rad, 0, TAU); ctx.fill();
+        }
+        // (a bare tree's silhouette is its trunk; from afar a crown is a disc, which the context's own path can hold)
+        const p = k >= 0.7 && typeof Path2D !== "undefined" ? new Path2D() : null;
+        ctx.globalAlpha = 0.8;
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        if (p) { silhouette(p, r, cam, i, style); ctx.fill(p); }
+        else { ctx.beginPath(); silhouette(ctx, r, cam, i, style); ctx.fill(); }
+        setScreen(ctx, cam);
         ctx.globalAlpha = 1;
         ctx.globalCompositeOperation = "source-over";
       } else if (k >= 1) {
@@ -3038,15 +4018,46 @@ export function makeRenderer(scene) {
       }
     }
   }
+  // From mid-distance (0.5–1 px/m) a window is under a pixel: a sparse speckle of lit ones stands in, about one per 9 m
+  // of wall (more on tall walls) at varied heights, ~45 % of them on. Deterministic per building and wall.
+  function speckle(ctx, b, st, wv, x1, y1, x2, y2, k) {
+    const base = b.mh || 0, he = wallTop(b), hgt = he - base;
+    if (hgt < 2.5 || wv.L < 3 || st.facade === "small") return;
+    const on = st.kind === "hospital" ? 0.62 : st.kind === "ind" ? 0.22 : st.facade === "parking" ? 0.6 : 0.45;
+    const n = Math.max(1, Math.round((wv.L / (st.kind === "hospital" ? 7 : 9)) * clamp(hgt / 10, 1, 4)));
+    const idBase = strHashInt(b.id) + wv.c * 131 + wv.ri * 7919;
+    // about a device pixel and a half across and a little less tall, on a floor's row of windows; laid in the wall's
+    // plane and kept inside the wall (a speck must not hang off a narrow wall's end, over whatever is beside it)
+    const floors = Math.max(1, Math.round(hgt / st.fh)), fhh = hgt / floors;
+    const dt = Math.min(1, 1.5 / k / Math.max(1e-6, Math.abs(x2 - x1))), dz = Math.min(fhh, 1.25 / k / C);
+    for (let c = 0; c < SPECK.length; c++) {
+      const g = litBatch ? litBatch[4 + c] : ctx;
+      if (g === ctx) ctx.beginPath();
+      let any = false;
+      for (let s = 0; s < n; s++) {
+        const hs = nHash(idBase + s * 31 + 5);
+        if (hs >= on || Math.floor((hs / on) * 7) % SPECK.length !== c) continue;
+        const t = clamp((s + 0.5 + (nHash(idBase + s * 17 + 3) - 0.5) * 0.6) / n - dt / 2, 0, 1 - dt);
+        const fl = Math.min(floors - 1, Math.floor(nHash(idBase + s * 7 + 11) * floors));
+        const zm = base + fl * fhh + fhh * (st.z0f + st.z1f) / 2;
+        const z0 = clamp(zm - dz / 2, base, he - dz);
+        quad(g, x1, y1, x2, y2, t, t + dt, z0, z0 + dz);
+        any = true;
+      }
+      if (!any) continue;
+      if (g === ctx) { ctx.fillStyle = SPECK[c]; ctx.fill(); } else litUsed[4 + c] = true;
+    }
+  }
   // at night the stadium's arcade glows here and there, and the concourse lights ring the rim
   function bowlLights(ctx, r, i, b, st, k) {
     const g = bowlOf(i);
     if (!g) return;
     const list = bowlFor(g, r);
-    const head = softSprite("head");
+    const head = softSprite("head"), o = geo.ROTS[r];
     for (const it of list) {
       const p = it.p;
-      if (p.kind === "facade" && nHash(p.j * 7 + 3) < 0.55) facadeArches(ctx, it.P, g, k, it.fill, nHash(p.j * 13 + 1) < 0.5 ? "#ffd889" : "#ffc46b");
+      // (not on bays seen almost edge-on: there a lit arch is a bright sliver, where the day's dark one hardly shows)
+      if (p.kind === "facade" && nHash(p.j * 7 + 3) < 0.55 && p.nx * o.D[0] + p.ny * o.D[1] < -0.22) facadeArches(ctx, it.P, g, k, it.fill, nHash(p.j * 13 + 1) < 0.5 ? "#ffd889" : "#ffc46b");
       else if (p.kind === "rim" && head && p.j % 3 === 0) {
         const P2 = it.P;
         const x = (P2[4] + P2[6]) / 2, y = (P2[5] + P2[7]) / 2 - 1.2 * C;
@@ -3101,5 +4112,7 @@ export function makeRenderer(scene) {
     ctx.restore();
   }
 
-  return { renderTile, drawObjects, drawObject, styleOf, setWorld, setScreen };
+  // LANDMARK API: the toolkit landmarks.js draws with (add to it as needed; keep existing members stable)
+  const api = { data, scene, geo, S, C, shade, mix, nHash, strHash, setScreen, setWorld, styleOf, prism, quad, rectQuad, projInto, visibleWalls, drawWindows, outlineOf, drawBuildingStd };
+  return { renderTile, drawObjects, drawObject, styleOf, setWorld, setScreen, treeBare, silhouette };
 }

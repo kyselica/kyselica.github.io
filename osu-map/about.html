@@ -14,8 +14,14 @@
 </head>
 <body>
 <script>
-  try { document.body.dataset.ui = localStorage.getItem("smallosu.ui") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); } catch (e) { document.body.dataset.ui = "light"; }
-  if (document.body.dataset.ui === "dark") document.querySelector('meta[name="theme-color"]').content = "#1c1a17";
+  // the map's panel theme; when storage is blocked the OS preference still decides
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("smallosu.ui"); } catch (e) { /* not remembered */ }
+    if (t !== "dark" && t !== "light") t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.body.dataset.ui = t;
+    if (t === "dark") document.querySelector('meta[name="theme-color"]').content = "#1c1a17";
+  })();
 </script>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
   <symbol id="i-mark" viewBox="0 0 32 32"><path style="fill:var(--mk-top,#dfe3bf);stroke:var(--mk-edge,#2a2622)" stroke-width="1.3" stroke-linejoin="round" d="M16 5 29 11.5 16 18 3 11.5z"/><path style="fill:var(--mk-l,#b3202a)" d="M3 11.5 16 18v7.5L3 19z"/><path style="fill:var(--mk-r,#861820)" d="M16 18 29 11.5V19l-13 6.5z"/><path style="fill:var(--mk-oval,#a9c77f)" d="M16 9.4c3.1 0 5.4 1 5.4 2.1s-2.3 2.2-5.4 2.2-5.4-1-5.4-2.2 2.3-2.1 5.4-2.1z"/></symbol>
@@ -50,7 +56,7 @@
 
   <h2>How it's made</h2>
   <ol class="steps">
-    <li><b>OpenStreetMap geometry.</b> Every building, street, path, tree, lamp post and patch of grass comes from <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">OpenStreetMap</a>, the map the world edits together. A small build script turns it into one compact file of footprints, heights, roof shapes and road widths.</li>
+    <li><b>OpenStreetMap geometry.</b> Every building, street, path, lamp post and patch of grass comes from <a href="https://www.openstreetmap.org/" target="_blank" rel="noopener">OpenStreetMap</a>, the map the world edits together, and so do most of the trees. A small build script turns it into one compact file of footprints, heights, roof shapes and road widths, and plants generated trees in woods and leafy back gardens where the map draws none.</li>
     <li><b>An illustration, drawn in your browser.</b> Nothing here is a pre-rendered picture. The page projects that geometry into an isometric view (a camera tilted 30° down, in four directions) and paints it with a warm, hand-picked palette: brick and limestone walls, lit windows, soft shadows, the season's trees.</li>
     <li><b>Tiles in the background.</b> The map is cut into tiles that are painted by web workers on separate threads, so dragging stays smooth while new streets are drawn. Buses and people are drawn on top each frame, and buildings that stand in front of them are redrawn so they pass behind.</li>
     <li><b>Live buses.</b> Campus bus positions, routes and stops come from the Ohio State CABS feed every few seconds. Evenings and weekends only a route or two run, so a quiet map is often an honest one.</li>
@@ -80,5 +86,15 @@
 
   <footer>Small OSU is an unofficial fan project and is not affiliated with The Ohio State University. <a href="./">Back to the map</a>.</footer>
 </main>
+<script>
+  // The map links here with its view in the hash (about.html#lat,lon,metres,rot), so every way back returns to that
+  // same place and turn instead of replaying the first-visit glide.
+  (function () {
+    var h = location.hash;
+    if (!/^#-?\d+\.\d+,-?\d+\.\d+,\d/.test(h)) return;
+    var links = document.querySelectorAll('a[href="./"]');
+    for (var i = 0; i < links.length; i++) links[i].setAttribute("href", "./" + h);
+  })();
+</script>
 </body>
 </html>

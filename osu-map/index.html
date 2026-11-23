@@ -15,7 +15,14 @@
 <body>
 <script>
   // The panel theme before anything paints (ui.js keeps it in sync afterwards), so a dark-theme reader never sees a flash.
-  try { document.body.dataset.ui = localStorage.getItem("smallosu.ui") || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"); } catch (e) { document.body.dataset.ui = "light"; }
+  // Storage may throw (blocked cookies): then the OS preference still decides. The browser chrome follows at once too.
+  (function () {
+    var t = null;
+    try { t = localStorage.getItem("smallosu.ui"); } catch (e) { /* not remembered */ }
+    if (t !== "dark" && t !== "light") t = matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+    document.body.dataset.ui = t;
+    if (t === "dark") document.querySelector('meta[name="theme-color"]').content = "#1c1a17";
+  })();
 </script>
 
 <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
@@ -45,7 +52,7 @@
   </defs>
 </svg>
 
-<canvas id="map" aria-label="Illustrated map of the Ohio State campus. Drag to move, scroll or pinch to zoom, Q and E to turn."></canvas>
+<canvas id="map" role="img" aria-label="Illustrated map of the Ohio State campus. Drag to move, scroll or pinch to zoom, Q and E to turn."></canvas>
 
 <header class="bar" id="bar">
   <a class="brand" href="./" aria-label="Small OSU: back to the Oval" title="Back to the Oval">
@@ -56,12 +63,13 @@
     <div class="tool tool-search">
       <div class="search" role="search">
         <svg class="ico search-ico" aria-hidden="true"><use href="#i-search"/></svg>
-        <input id="search-q" type="text" inputmode="search" enterkeyhint="go" placeholder="Search buildings, streets, stops…" autocomplete="off" autocapitalize="off" spellcheck="false" role="combobox" aria-expanded="false" aria-controls="search-results" aria-autocomplete="list" aria-label="Search the map">
+        <input id="search-q" type="text" inputmode="search" enterkeyhint="go" placeholder="Search buildings, streets, stops…" data-short="Search buildings, stops…" autocomplete="off" autocapitalize="off" spellcheck="false" role="combobox" aria-expanded="false" aria-controls="search-results" aria-autocomplete="list" aria-label="Search the map">
         <kbd class="search-kbd" aria-hidden="true">/</kbd>
         <button class="search-cancel" type="button">Cancel</button>
       </div>
       <button class="tool-btn search-open" type="button" id="btn-search" aria-label="Search" title="Search (/)"><svg class="ico" aria-hidden="true"><use href="#i-search"/></svg><span class="tool-label">Search</span></button>
       <div class="panel search-panel" id="search-panel" hidden>
+        <div class="search-hint" id="search-hint"></div>
         <ul id="search-results" class="results" role="listbox" aria-label="Search results"></ul>
       </div>
     </div>
@@ -87,7 +95,7 @@
 
 <div class="map-btns" id="map-btns" role="toolbar" aria-label="View" aria-orientation="vertical">
   <div class="btn-group">
-    <button class="sq" type="button" id="btn-theme" aria-label="Dark panels" aria-pressed="false" data-tip="Dark panels"><svg class="ico i-moon" aria-hidden="true"><use href="#i-moon"/></svg><svg class="ico i-sun" aria-hidden="true"><use href="#i-sun"/></svg></button>
+    <button class="sq" type="button" id="btn-theme" aria-label="Dark panels" data-tip="Dark panels"><svg class="ico i-moon" aria-hidden="true"><use href="#i-moon"/></svg><svg class="ico i-sun" aria-hidden="true"><use href="#i-sun"/></svg></button>
   </div>
   <div class="btn-group">
     <button class="sq" type="button" id="btn-zoom-in" aria-label="Zoom in" data-tip="Zoom in (+)"><svg class="ico" aria-hidden="true"><use href="#i-plus"/></svg></button>
@@ -98,18 +106,17 @@
     <button class="sq" type="button" id="btn-rot-r" aria-label="Turn the map right" data-tip="Turn right (E)"><svg class="ico" aria-hidden="true"><use href="#i-rot-r"/></svg></button>
   </div>
   <div class="btn-group" id="fs-group">
-    <button class="sq" type="button" id="btn-fs" aria-label="Full screen" aria-pressed="false" data-tip="Full screen"><svg class="ico i-fs" aria-hidden="true"><use href="#i-fs"/></svg><svg class="ico i-fs-exit" aria-hidden="true"><use href="#i-fs-exit"/></svg></button>
+    <button class="sq" type="button" id="btn-fs" aria-label="Full screen" data-tip="Full screen"><svg class="ico i-fs" aria-hidden="true"><use href="#i-fs"/></svg><svg class="ico i-fs-exit" aria-hidden="true"><use href="#i-fs-exit"/></svg></button>
   </div>
 </div>
 
-<div id="cards" class="cards" aria-label="Details"></div>
+<div id="cards" class="cards"></div>
 <div id="status" class="status" aria-live="off"></div>
 <footer class="credits" id="credits">
   <span class="cr-full">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors · Bus data: <a href="https://ttm.osu.edu/cabs" target="_blank" rel="noopener">Ohio State CABS</a> · Weather: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo</a> · <a href="about.html">Unofficial</a></span>
   <span class="cr-short">© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> · <a href="about.html">Unofficial</a></span>
 </footer>
 <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
-<canvas id="rot-fade" class="rot-fade" aria-hidden="true"></canvas>
 <div id="ui-root"></div>
 
 <div id="loading" role="status" aria-live="polite">

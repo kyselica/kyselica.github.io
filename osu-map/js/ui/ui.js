@@ -6,7 +6,6 @@
 
 const STORE = "smallosu.";
 const OVAL = { lat: 39.9995, lon: -83.0148 };
-const CAMPUS = { lat: 40.0026, lon: -83.0178 };
 const WALK_M_PER_MIN = 80;            // a relaxed walking pace, straight line
 const FT = 3.28084, SQFT = 10.7639;
 const MAX_CARDS = 3;
@@ -109,13 +108,17 @@ function inRing(f, x, y) {
   return c;
 }
 
-/** How well a normalised name answers a normalised query (0 = not at all). */
+/**
+ * How well a normalised name answers a normalised query (0 = not at all). A query that ends on a word boundary ("bus" in
+ * "bus testing facility") beats one that stops mid-word ("bus" in "busch house"), which is most likely a different word.
+ */
 function textScore(qn, qt, name) {
   if (!name) return 0;
   if (name === qn) return 100;
-  if (name.startsWith(qn)) return 86 - Math.min(14, (name.length - qn.length) * 0.25);
+  const midWord = (end) => (end < name.length && name[end] !== " " ? 10 : 0);
+  if (name.startsWith(qn)) return 86 - Math.min(14, (name.length - qn.length) * 0.25) - midWord(qn.length);
   const at = name.indexOf(" " + qn);
-  if (at >= 0) return 72 - Math.min(10, at * 0.25) - Math.min(8, (name.length - qn.length) * 0.12);
+  if (at >= 0) return 72 - Math.min(10, at * 0.25) - Math.min(8, (name.length - qn.length) * 0.12) - midWord(at + 1 + qn.length);
   if (qt.length > 1 && qt.every((t) => name.startsWith(t) || name.includes(" " + t))) return 60 - Math.min(10, name.length * 0.1);
   if (qn.length >= 3 && name.includes(qn)) return 36;
   return 0;
@@ -152,6 +155,21 @@ export function init(app) {
   const cards = new Map();               // id → handle
   let cardSeq = 0, cardRect = null, cardsDirty = true;
 
+  // Focus. A card opened from the keyboard (Enter on a search result, a route, a nearby stop) takes focus on its title,
+  // so it is announced and can be read and closed at once; closing it from the keyboard hands focus back to where the
+  // reader came from. Pointer readers are left alone: their focus never jumps.
+  let keyAt = -Infinity, focusOrigin = null;
+  window.addEventListener("keydown", (e) => { if (!["Shift", "Control", "Alt", "Meta"].includes(e.key)) keyAt = performance.now(); }, true);
+  document.addEventListener("pointerdown", () => { keyAt = -Infinity; }, true);
+  const fromKeyboard = () => performance.now() - keyAt < 1000;
+  const canFocus = (el) => !!el && el.isConnected && !el.closest(".closing, [hidden]") && el.getClientRects().length > 0;
+  function handBackFocus(h) {
+    if (canFocus(h._origin)) { focusQuietly(h._origin); return; }
+    const t = topCard();
+    if (t) { t.titleEl.focus({ preventScroll: true }); return; }
+    focusQuietly(isPhone() ? $("btn-search") : qEl);
+  }
+
   function oldestCard() {
     const els = cardsEl.children;
     for (let i = els.length - 1; i >= 0; i--) { const h = els[i]._handle; if (h && cards.get(h.id) === h) return h; }
@@ -174,7 +192,7 @@ export function init(app) {
     el.setAttribute("role", "dialog");
     el.setAttribute("aria-labelledby", tid);
     el.innerHTML = `<div class="card-grip" aria-hidden="true"></div><header class="card-head"><span class="card-chip" hidden></span>` +
-      `<div class="card-titles"><h2 class="card-title" id="${tid}"></h2><p class="card-sub"></p></div>` +
+      `<div class="card-titles"><h2 class="card-title" id="${tid}" tabindex="-1"></h2><p class="card-sub"></p></div>` +
       `<button class="card-x" type="button" aria-label="Close">${icon("close")}</button></header><div class="card-body"></div>`;
     const titleEl = el.querySelector(".card-title"), subEl = el.querySelector(".card-sub"), chipEl = el.querySelector(".card-chip");
     const bodyEl = el.querySelector(".card-body");
@@ -209,21 +227,30 @@ export function init(app) {
       if (full || "onClose" in o) st.onClose = typeof o.onClose === "function" ? o.onClose : null;
     };
 
+    const headEl = el.querySelector(".card-head");
     const h = {
-      id, el,
+      id, el, titleEl,
       get anchor() { return st.anchor; },
       get open() { return cards.get(id) === h; },
       update(next) {
         if (!h.open || next == null) return h;
-        if (typeof next === "string" || next instanceof Node) apply({ body: next }, false); else apply(next, false);
+        if (typeof next === "string" || next instanceof Node) apply({ body: next }, false);
+        else { apply(next, false); if ("title" in next || "subtitle" in next) measureFold(h); }
         cardsDirty = true;
         return h;
       },
       close() { closeHandle(h); },
-      _st: st, _apply: apply,
+      _st: st, _apply: apply, _head: headEl, _origin: null,
     };
     el._handle = h;
     el.querySelector(".card-x").addEventListener("click", () => h.close());
+    // desktop: an older card squeezed down to its header comes back to the top of the stack when its header is clicked
+    headEl.addEventListener("click", (e) => {
+      if (isPhone() || e.target.closest("button, a") || cardsEl.firstElementChild === el || !h.open) return;
+      cardsEl.prepend(el);
+      cardsDirty = true;
+      revealAnchor(h);
+    });
     el.addEventListener("animationend", () => { cardsDirty = true; });
     attachSheetDrag(h);
     return h;
@@ -240,21 +267,35 @@ export function init(app) {
     if (cardsEl.firstChild !== h.el) cardsEl.prepend(h.el);
     if (fresh) h.el.classList.remove("full");
     while (cards.size > MAX_CARDS) closeHandle(oldestCard());
+    measureFold(h);
     cardsDirty = true;
+    if (fromKeyboard()) {
+      const was = document.activeElement;
+      // reopening a card from inside itself (a bus picked on a stop's card) keeps where the reader first came from
+      h._origin = focusOrigin || (was && was !== body && !h.el.contains(was) ? was : h._origin);
+      h.titleEl.focus({ preventScroll: true });
+    }
     app.emit("card-open", id);
     revealAnchor(h);
     return h;
+  }
+  /** an older card shrinks no lower than its header (see .card + .card in app.css) */
+  function measureFold(h) {
+    const hh = h._head.offsetHeight;
+    if (hh) h.el.style.setProperty("--fold-h", `${hh + 2}px`);
   }
 
   function closeHandle(h) {
     if (!h || cards.get(h.id) !== h) return;
     cards.delete(h.id);
     const el = h.el;
+    const hadFocus = el.contains(document.activeElement);
     if (reducedMotion() || !el.isConnected) el.remove();
     else {
       el.classList.add("closing");
       setTimeout(() => el.remove(), 240);
     }
+    if (hadFocus && fromKeyboard()) handBackFocus(h);
     cardsDirty = true;
     try { if (h._st.onClose) h._st.onClose(); } catch (e) { console.error("[ui] card onClose", e); }
     app.emit("card-close", h.id);
@@ -460,9 +501,11 @@ export function init(app) {
     const routes = routeList().filter((r) => r && r.code != null);
     const counts = vehicleCounts();
     const running = [...counts.values()].reduce((a, b) => a + b, 0);
-    const live = !!(t && t.ok);
-    const upd = t && t.updated instanceof Date && !isNaN(t.updated) ? `updated ${timeFmt.format(t.updated).toLowerCase()}` : "";
-    let html = `<div class="panel-head"><h2>Campus buses</h2>${t ? `<span class="live-tag${live ? "" : " off"}">${live ? "Live" : "Offline"}</span>` : ""}<p>${esc(upd)}</p></div>`;
+    const live = !!(t && t.ok), mock = !!(t && t.mock);
+    // ?buses=mock is synthetic: no pulsing "live" tag, and no feed time (it would be wall-clock beside a simulated clock)
+    const upd = !mock && t && t.updated instanceof Date && !isNaN(t.updated) ? `updated ${timeFmt.format(t.updated).toLowerCase()}` : "";
+    const tag = mock ? "Mock" : live ? "Live" : "Offline";
+    let html = `<div class="panel-head"><h2>Campus buses</h2>${t ? `<span class="live-tag${live && !mock ? "" : " off"}">${tag}</span>` : ""}<p>${esc(upd)}</p></div>`;
     if (!t) html += `<p class="panel-empty">Waiting for the bus feed…</p>`;
     else if (!routes.length) html += `<p class="panel-empty">${live ? "No routes are listed right now." : "Couldn't reach the CABS feed just now. It will try again shortly."}</p>`;
     else {
@@ -482,8 +525,10 @@ export function init(app) {
   routesPanel && routesPanel.addEventListener("click", (e) => {
     const b = e.target.closest(".rt");
     if (!b) return;
+    // close first: from the keyboard (detail 0) focus goes back to the Routes button, which the route's card then
+    // remembers as the place to return to
+    closePanel(e.detail === 0);
     flyToRoute(b.dataset.code);
-    closePanel();
   });
   function flyToRoute(code) {
     const t = app.transit;
@@ -550,7 +595,7 @@ export function init(app) {
 
   // ============================================================================================== search
   const providers = [];
-  const qEl = $("search-q"), searchPanel = $("search-panel"), resultsEl = $("search-results");
+  const qEl = $("search-q"), searchPanel = $("search-panel"), resultsEl = $("search-results"), hintEl = $("search-hint");
   const searchTool = qEl && qEl.closest(".tool-search");
   let results = [], active = -1, searchOpen = false;
 
@@ -562,15 +607,79 @@ export function init(app) {
       try { const r = fn(raw); if (Array.isArray(r)) for (const it of r) if (it && it.label && typeof it.go === "function") all.push(it); } catch (e) { console.warn("[ui] search provider", e); }
     }
     all.sort((a, b) => (+b.score || 0) - (+a.score || 0));
-    // several modules may know the same place (labels.js names buildings too): keep the best of each label + kind
-    const seen = new Set(), out = [];
+    // several modules may know the same place (labels.js names buildings too): keep the best of each label + kind,
+    // borrowing a position from a dropped twin when the kept one has none
+    const seen = new Map(), out = [];
     for (const it of all) {
       const k = String(it.key || `${it.label}|${it.kind || ""}`).toLowerCase();
-      if (seen.has(k)) continue;
-      seen.add(k);
-      out.push(it);
+      const kept = seen.get(k);
+      if (kept) { if (!Number.isFinite(kept.x) && Number.isFinite(it.x)) { kept.x = it.x; kept.y = it.y; } continue; }
+      const copy = { ...it };
+      seen.set(k, copy);
+      out.push(copy);
+    }
+    return tellApart(out);
+  }
+
+  /**
+   * Same-named results (five Starbucks, two wings of University Hospital) would read identically: give each its distance
+   * and direction from the middle of the view and, when it has no address, the street it is on, and list them nearest
+   * first in the slot of the best-ranked one. Only results that carry a ground position (optional x, y) take part.
+   */
+  const COMPASS8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  function tellApart(list) {
+    const groups = new Map();
+    for (const it of list) {
+      if (!Number.isFinite(it.x) || !Number.isFinite(it.y)) continue;
+      const k = String(it.label).toLowerCase();
+      (groups.get(k) || groups.set(k, []).get(k)).push(it);
+    }
+    const [vx, vy] = view.centreGround();
+    let changed = false;
+    for (const g of groups.values()) {
+      if (g.length < 2) continue;
+      changed = true;
+      for (const it of g) {
+        const dx = it.x - vx, dy = it.y - vy, d = Math.hypot(dx, dy);
+        const dist = d < 300 ? `${fmtInt(Math.round((d * FT) / 50) * 50)} ft` : `${(d / 1609.34).toFixed(1)} mi`;
+        const away = d < 60 ? "here" : `${dist} ${COMPASS8[Math.round(((Math.atan2(dx, dy) * 180) / Math.PI + 360) / 45) % 8]}`;
+        it._d = d;
+        // what tells them apart goes first, so a narrow screen's ellipsis cuts the shared part
+        it.sub = [away, it.addr ? "" : streetNear(it.x, it.y), it.sub].filter(Boolean).join(" · ");
+      }
+      g.sort((a, b) => a._d - b._d);
+    }
+    if (!changed) return list;
+    const out = [], placed = new Set();
+    for (const it of list) {
+      const g = Number.isFinite(it._d) ? groups.get(String(it.label).toLowerCase()) : null;
+      if (!g) { out.push(it); continue; }
+      if (placed.has(g)) continue;
+      placed.add(g);
+      out.push(...g);
     }
     return out;
+  }
+  /** the name of the street nearest ground (x, y), within a block, or "" */
+  const streetCache = new Map();
+  let namedRoads = null;                 // [{ n, pts, bb }], built on first use
+  function streetNear(x, y) {
+    const ck = `${Math.round(x)},${Math.round(y)}`;
+    if (streetCache.has(ck)) return streetCache.get(ck);
+    if (!namedRoads) namedRoads = (data.roads || []).filter((r) => r && r.n && r.pts && r.pts.length >= 4).map((r) => ({ n: r.n, pts: r.pts, bb: ringBox(r.pts) }));
+    let best = 90, name = "";
+    for (const r of namedRoads) {
+      if (x < r.bb[0] - best || x > r.bb[2] + best || y < r.bb[1] - best || y > r.bb[3] + best) continue;
+      const f = r.pts;
+      for (let k = 2; k < f.length; k += 2) {
+        const ax = f[k - 2], ay = f[k - 1], bx = f[k] - ax, by = f[k + 1] - ay;
+        const L = bx * bx + by * by, t = L ? clamp(((x - ax) * bx + (y - ay) * by) / L, 0, 1) : 0;
+        const d = Math.hypot(x - ax - bx * t, y - ay - by * t);
+        if (d < best) { best = d; name = r.n; }
+      }
+    }
+    streetCache.set(ck, name);
+    return name;
   }
 
   const KIND_ICON = { building: "building", landmark: "building", street: "street", road: "street", place: "place", poi: "place", park: "park", area: "park", stop: "stop", route: "bus", bus: "bus", vehicle: "bus", weather: "sun", sky: "sun" };
@@ -579,6 +688,8 @@ export function init(app) {
     if (i < 0) return esc(L);
     return esc(L.slice(0, i)) + "<mark>" + esc(L.slice(i, i + raw.length)) + "</mark>" + esc(L.slice(i + raw.length));
   }
+  // the hint and the "Try" chips sit beside the listbox, not in it: a listbox may hold only options
+  const setHint = (html) => { if (hintEl) hintEl.innerHTML = html; };
   function renderResults() {
     if (!resultsEl) return;
     const raw = qEl.value.trim();
@@ -586,12 +697,14 @@ export function init(app) {
     qEl.removeAttribute("aria-activedescendant");
     if (!raw) {
       results = [];
-      resultsEl.innerHTML = `<li class="res-hint" role="presentation">Buildings, streets, places, bus stops and routes. Try:</li>` +
-        `<li class="res-try" role="presentation">${TRY.map((t) => `<button type="button" class="chip-btn" data-try="${esc(t)}">${esc(t)}</button>`).join("")}</li>`;
+      resultsEl.replaceChildren();
+      setHint(`<p class="res-hint">Buildings, streets, places, bus stops and routes. Try:</p>` +
+        `<div class="res-try">${TRY.map((t) => `<button type="button" class="chip-btn" data-try="${esc(t)}">${esc(t)}</button>`).join("")}</div>`);
       return;
     }
     results = search(raw).slice(0, 9);
-    if (!results.length) { resultsEl.innerHTML = `<li class="res-hint" role="presentation">Nothing on the map matches “${esc(raw)}”.</li>`; return; }
+    if (!results.length) { resultsEl.replaceChildren(); setHint(`<p class="res-hint" role="status">Nothing on the map matches “${esc(raw)}”.</p>`); return; }
+    setHint("");
     resultsEl.innerHTML = results.map((r, i) => {
       const kind = String(r.kind || "place"), c = safeColor(r.color);
       const tint = c ? ` tinted" style="--c:${c};--fg:${textOn(c)}` : "";
@@ -613,8 +726,11 @@ export function init(app) {
     const r = results[i];
     if (!r) return;
     qEl.value = r.label;
+    // a card this opens from the keyboard hands focus back here when it closes (on phones the field itself goes away)
+    focusOrigin = isPhone() ? $("btn-search") : qEl;
     closeSearch(true);
     try { r.go(); } catch (e) { console.warn("[ui] search result", e); }
+    focusOrigin = null;
   }
   function openSearch() {
     if (!qEl || searchOpen) return;
@@ -641,18 +757,35 @@ export function init(app) {
     qEl.focus();
     qEl.select();
   }
+  /** Esc in search: close the list but keep the reader in the field (on phones the field goes away: its button instead). */
+  function escapeSearch() {
+    closeSearch(false);
+    if (isPhone()) focusQuietly($("btn-search"));
+    else if (document.activeElement !== qEl) focusQuietly(qEl);
+  }
+  /** Focus without the side effects of a reader's focus (the search field opening its list). */
+  let quietFocus = false;
+  function focusQuietly(el) {
+    if (!el) return;
+    quietFocus = true;
+    try { el.focus({ preventScroll: true }); } finally { quietFocus = false; }
+  }
   if (qEl) {
-    qEl.addEventListener("focus", () => { openSearch(); qEl.select(); });
-    qEl.addEventListener("input", renderResults);
+    qEl.addEventListener("focus", () => { if (!quietFocus) openSearch(); qEl.select(); });
+    // the field can hold focus with its list closed (after Esc, or when a card hands focus back): a click reopens it
+    qEl.addEventListener("click", () => { if (!searchOpen) openSearch(); });
+    // typing into a field whose list was closed with Esc opens it again
+    qEl.addEventListener("input", () => (searchOpen ? renderResults() : openSearch()));
     qEl.addEventListener("keydown", (e) => {
       if (e.key === "ArrowDown") { if (!searchOpen) openSearch(); setActive(active + 1); e.preventDefault(); }
       else if (e.key === "ArrowUp") { setActive(active - 1); e.preventDefault(); }
-      else if (e.key === "Enter") { choose(active >= 0 ? active : 0); e.preventDefault(); }
-      else if (e.key === "Escape") { closeSearch(true); e.preventDefault(); e.stopPropagation(); }
+      else if (e.key === "Enter") { if (!searchOpen) openSearch(); choose(active >= 0 ? active : 0); e.preventDefault(); }
+      // a second Esc (the list already closed) goes on to the page: it closes the top card
+      else if (e.key === "Escape" && searchOpen) { escapeSearch(); e.preventDefault(); e.stopPropagation(); }
     });
     // pointerdown + preventDefault keeps focus in the field, so the list doesn't close before the click lands
-    resultsEl.addEventListener("pointerdown", (e) => { if (e.target.closest(".res, .chip-btn")) e.preventDefault(); });
-    resultsEl.addEventListener("click", (e) => {
+    searchPanel.addEventListener("pointerdown", (e) => { if (e.target.closest(".res, .chip-btn")) e.preventDefault(); });
+    searchPanel.addEventListener("click", (e) => {
       const tr = e.target.closest("[data-try]");
       if (tr) { qEl.value = tr.dataset.try; renderResults(); qEl.focus(); return; }
       const li = e.target.closest(".res");
@@ -660,7 +793,13 @@ export function init(app) {
     });
     resultsEl.addEventListener("pointermove", (e) => { const li = e.target.closest(".res"); if (li && +li.dataset.i !== active) setActive(+li.dataset.i); });
     $("btn-search") && $("btn-search").addEventListener("click", focusSearch);
-    searchTool.querySelector(".search-cancel").addEventListener("click", () => closeSearch(true));
+    searchTool.querySelector(".search-cancel").addEventListener("click", () => { closeSearch(true); focusQuietly($("btn-search")); });
+    // the long placeholder fits the wide field and the phone's full-width one; the icons-only bar gets the short one
+    const midMQ = matchMedia("(min-width: 641px) and (max-width: 1060px)");
+    const longPh = qEl.placeholder, shortPh = qEl.dataset.short || longPh;
+    const fitPlaceholder = () => { qEl.placeholder = midMQ.matches ? shortPh : longPh; };
+    fitPlaceholder();
+    midMQ.addEventListener?.("change", fitPlaceholder);
   }
 
   // ---------------------------------------------------------------- the UI's own search index: buildings, streets, places
@@ -688,25 +827,31 @@ export function init(app) {
     }
     for (const list of byName.values()) {
       list.sort((a, b) => b.area - a.area);
+      // a wing drawn as its own footprint usually carries no address: it shares the building's
+      const listAddr = list.map((e) => B[e.i].a).find(Boolean);
       list.forEach((e, k) => {
         const b = B[e.i];
         const type = b.am ? humanise(b.am) : humanise(b.k);
+        const addr = b.a || listAddr;
         // bigger, more campus-like and nearer the Oval ranks higher among equally good name matches
         const big = Math.min(8, Math.log10(1 + e.area) * 1.8);
         const campusy = /university|college|dormitory|stadium|sports|hospital|library|civic|public|museum|theatre/.test(`${b.k} ${b.am || ""}`) ? 4 : 0;
         const central = Math.max(0, 4 - Math.hypot(e.cx - oval[0], e.cy - oval[1]) / 400);
         index.push({
-          label: b.n, n: norm(b.n), kind: "building", sub: b.a ? `${type} · ${b.a}` : type, bonus: 1 + big + campusy + central,
+          label: b.n, n: norm(b.n), kind: "building", sub: addr ? `${type} · ${addr}` : type, bonus: 1 + big + campusy + central, x: e.cx, y: e.cy, addr: !!addr,
           key: k ? `${b.n}|building|${Math.round(e.cx)},${Math.round(e.cy)}` : null,
           go: () => { flyToGround(e.cx, e.cy, clamp(Math.sqrt(e.area) * 6, 240, 900), { z: b.h * 0.5 }); showBuilding(e.i, { pin: true }); },
         });
       });
     }
-    // the short names people use
-    const byLabel = new Map(index.map((it) => [it.label, it]));
+    // the short names people use; a building people have a nickname for is a famous one, whatever OSM calls its type
+    const byLabel = new Map();
+    for (const it of index) if (!byLabel.has(it.label)) byLabel.set(it.label, it);
     for (const [alias, name] of Object.entries(ALIASES)) {
       const it = byLabel.get(name);
-      if (it) (it.alt || (it.alt = [])).push(norm(alias));
+      if (!it) continue;
+      if (!it.alt) { it.alt = []; it.bonus += 6; }
+      it.alt.push(norm(alias));
     }
     // landmarks the data leaves unnamed
     for (const L of LANDMARKS) {
@@ -714,7 +859,7 @@ export function init(app) {
       L.x = x; L.y = y;
       L.bi = B.findIndex((b) => b && b.p && b.p[0] && !b.n && inRing(b.p[0], x, y));
       index.push({
-        label: L.n, n: norm(L.n), alt: L.aka.map(norm), kind: "building", sub: L.type, bonus: 14,
+        label: L.n, n: norm(L.n), alt: L.aka.map(norm), kind: "building", sub: L.type, bonus: 14, x, y,
         go: () => { flyToGround(x, y, L.m, { z: 10 }); if (L.bi >= 0) showBuilding(L.bi, { pin: true }); else showPlace({ name: L.n, type: L.type, x, y }); },
       });
     }
@@ -730,7 +875,7 @@ export function init(app) {
       const bb = ringBox(a.p[0]), ext = Math.max(bb[2] - bb[0], bb[3] - bb[1]);
       const type = humanise(a.k);
       index.push({
-        label: a.n, n: k, kind: a.k === "plaza" ? "place" : "park", sub: type, bonus: a.k === "park" || a.k === "water" ? 6 : 3,
+        label: a.n, n: k, kind: a.k === "plaza" ? "place" : "park", sub: type, bonus: a.k === "park" || a.k === "water" ? 6 : 3, x: cx, y: cy,
         key: prev ? `${a.n}|area|${Math.round(cx)}` : null,
         go: () => { flyToGround(cx, cy, clamp(ext * 2.4, 280, 2400)); showPlace({ name: a.n, type, x: cx, y: cy, acres: ringArea(a.p[0]) / 4046.86 }); },
       });
@@ -743,7 +888,7 @@ export function init(app) {
       if (bNear(k, p.x, p.y)) continue;
       const type = humanise(p.k) + (p.cu ? ` · ${cap(String(p.cu).split(";")[0].replace(/_/g, " "))}` : "");
       index.push({
-        label: p.n, n: k, kind: "place", sub: type, bonus: /library|museum|theatre|memorial|artwork/.test(p.k) ? 2 : 0,
+        label: p.n, n: k, kind: "place", sub: type, bonus: /library|museum|theatre|memorial|artwork/.test(p.k) ? 2 : 0, x: p.x, y: p.y,
         key: `${p.n}|place|${Math.round(p.x)},${Math.round(p.y)}`,
         go: () => { flyToGround(p.x, p.y, 260); showPlace({ name: p.n, type, x: p.x, y: p.y, poi: true }); },
       });
@@ -781,7 +926,7 @@ export function init(app) {
       if (it.alt) for (const a of it.alt) sc = Math.max(sc, textScore(qn, qt, a) - 3);
       if (it.n.startsWith("the ")) sc = Math.max(sc, textScore(qn, qt, it.n.slice(4)) - 1);
       // the other modules score 0..1, so ours are scaled onto the same range
-      if (sc > 0) out.push({ label: it.label, sub: it.sub, kind: it.kind, key: it.key || undefined, score: Math.min(1, (sc + it.bonus) / 110), go: it.go });
+      if (sc > 0) out.push({ label: it.label, sub: it.sub, kind: it.kind, key: it.key || undefined, x: it.x, y: it.y, addr: it.addr, score: Math.min(1, (sc + it.bonus) / 110), go: it.go });
     }
     out.sort((a, b) => b.score - a.score);
     return out.slice(0, 14);
@@ -973,6 +1118,10 @@ export function init(app) {
       }
     },
   });
+  // Cards whose layer already marks the thing on the map (buses.js rings the selected bus or stop and labels it with a
+  // route pill right at the anchor): only the leader is drawn, and it stops short so the pill stays readable.
+  const SELF_MARKED = new Set(["transit"]);
+  const LEADER_GAP = 18;
   app.addLayer({
     id: "ui-marks", z: 95,
     draw(ctx, f) {
@@ -988,12 +1137,14 @@ export function init(app) {
     g2s(a.x, a.y, a.z || 0);
     const ax = P[0], ay = P[1];
     if (ax < -30 || ay < -30 || ax > view.w + 30 || ay > view.h + 30) return;
+    const marked = SELF_MARKED.has(top.id) || a.mark === false;
     if (!isPhone()) {
       if (cardsDirty || !cardRect) { cardRect = top.el.getBoundingClientRect(); cardsDirty = false; }
       const r = cardRect;
-      if (ax > r.right + 36) {
+      const ex = marked ? ax - LEADER_GAP : ax;
+      if (ex > r.right + 36) {
         // a dotted leader from the card's edge, level with the anchor where it can be
-        const x0 = r.right + 2, y0 = clamp(ay, r.top + 26, r.bottom - 20), mx = (x0 + ax) / 2;
+        const x0 = r.right + 2, y0 = clamp(ay, r.top + 26, r.bottom - 20), mx = (x0 + ex) / 2;
         ctx.save();
         ctx.setLineDash(LEADER_DASH);
         ctx.lineCap = "round";
@@ -1001,11 +1152,12 @@ export function init(app) {
         ctx.strokeStyle = "rgba(42, 38, 34, .55)";
         ctx.beginPath();
         ctx.moveTo(x0, y0);
-        ctx.bezierCurveTo(mx, y0, mx, ay, ax, ay);
+        ctx.bezierCurveTo(mx, y0, mx, ay, ex, ay);
         ctx.stroke();
         ctx.restore();
       }
     }
+    if (marked) return;
     // the marker: a soft pulse, then a ring
     if (!still) {
       const ph = ((t / 1600) % 1);
@@ -1084,7 +1236,7 @@ export function init(app) {
   function setTheme(t, save) {
     body.dataset.ui = t;
     if (themeBtn) {
-      themeBtn.setAttribute("aria-pressed", String(t === "dark"));
+      // the label, the tooltip and the icon all name what a press will do; aria-pressed as well would read backwards
       const l = t === "dark" ? "Light panels" : "Dark panels";
       themeBtn.setAttribute("aria-label", l);
       themeBtn.dataset.tip = l;
@@ -1107,7 +1259,7 @@ export function init(app) {
     });
     document.addEventListener("fullscreenchange", () => {
       const on = !!document.fullscreenElement;
-      fsBtn.setAttribute("aria-pressed", String(on));
+      fsBtn.classList.toggle("on", on);       // swaps the icon; the label names the action, as the theme button's does
       fsBtn.setAttribute("aria-label", on ? "Leave full screen" : "Full screen");
       fsBtn.dataset.tip = on ? "Leave full screen" : "Full screen";
     });
@@ -1120,34 +1272,6 @@ export function init(app) {
     closeCard();
     if (view.rot) view.setRotation(0);
     view.flyTo(OVAL, { m: app.mobile ? 420 : 760 });
-  });
-
-  // ---------------------------------------------------------------- a quarter turn crossfades instead of snapping
-  const fade = $("rot-fade");
-  let fctx = null, fadeState = 0, fadeT0 = 0, fadeDir = 1, lastRot = view.rot;
-  app.on("rotate", (r) => {
-    const d = ((r - lastRot + 4) % 4) === 1 ? 1 : -1;
-    lastRot = r;
-    cardsDirty = true;
-    if (!fade || reducedMotion() || fadeState === 2) return;
-    const c = app.canvas;
-    try {
-      if (fade.width !== c.width || fade.height !== c.height) { fade.width = c.width; fade.height = c.height; }
-      fctx = fctx || fade.getContext("2d");
-      fctx.drawImage(c, 0, 0);       // the canvas still holds the last frame of the old view
-    } catch { return; }
-    fade.classList.remove("go");
-    fade.style.transform = "";
-    fade.classList.add("on");
-    fadeT0 = performance.now(); fadeDir = d; fadeState = 1;
-  });
-  app.on("frame", () => {
-    if (fadeState !== 1) return;
-    if (performance.now() - fadeT0 < 1100 && !app.tiles.complete(view)) return;   // hold the old view while the new tiles draw
-    fadeState = 2;
-    fade.classList.add("go");
-    fade.style.transform = `rotate(${-fadeDir * 3}deg) scale(1.025)`;
-    setTimeout(() => { fade.classList.remove("on", "go"); fade.style.transform = ""; fade.width = fade.height = 0; fadeState = 0; }, 470);
   });
 
   // ============================================================================================== share and the URL
@@ -1182,6 +1306,7 @@ export function init(app) {
     if (!hashOn || !hashDirty || view.anim || performance.now() - lastViewChange < 450) return;
     hashDirty = false;
     const h = viewParts();
+    carryView(h);
     if (h === lastHash) return;
     lastHash = h;
     const sp = new URLSearchParams(location.search);
@@ -1189,6 +1314,9 @@ export function init(app) {
     const qs = sp.toString();
     try { history.replaceState(history.state, "", `${location.pathname}${qs ? "?" + qs : ""}#${h}`); } catch { /* sandboxed */ }
   }, 250);
+  // the About page's links back to the map carry this view in the hash, so returning lands here, not on the intro
+  function carryView(h) { for (const a of aboutLinks) a.setAttribute("href", `about.html#${h}`); }
+  const aboutLinks = [...document.querySelectorAll('a[href^="about.html"]')];
   window.addEventListener("hashchange", () => {
     const m = /^(-?\d+\.\d+),(-?\d+\.\d+),(\d+(?:\.\d+)?)(?:,(\d))?/.exec(location.hash.slice(1));
     if (!m || location.hash.slice(1) === lastHash) return;
@@ -1206,7 +1334,7 @@ export function init(app) {
       return;
     }
     if (e.key !== "Escape") return;
-    if (searchOpen) { closeSearch(true); return; }
+    if (searchOpen) { escapeSearch(); return; }
     if (openPanelName) { closePanel(true); return; }
     const t = topCard();
     if (t) { t.close(); e.preventDefault(); }
@@ -1225,15 +1353,37 @@ export function init(app) {
   });
 
   // ============================================================================================== loading and the first glide
+  // Core opens a first visit (no view in the URL) over the whole campus and says so in app.intro; once that overview is
+  // drawn we glide down to the Oval, unless the reader has already set off somewhere: the search box, the buttons and
+  // the keys all work while the map is still drawing.
   const loading = $("loading");
-  const intro = !app.params.has("at") && !/^#-?\d/.test(location.hash) && !app.params.has("nointro") && !reducedMotion() && !(app.status && app.status.loaded);
-  let introCancelled = false;
-  if (intro) {
-    // start over the whole campus; the ready event lands on this cheap overview, then we glide down to the Oval
-    view.flyTo(CAMPUS, { m: isPhone() ? 3400 : 4600, instant: true });
-    const cancel = () => { introCancelled = true; };
-    app.canvas.addEventListener("pointerdown", cancel, { once: true });
-    app.canvas.addEventListener("wheel", cancel, { once: true, passive: true });
+  let intro = app.intro && !reducedMotion() ? "waiting" : "off";     // waiting → gliding → off
+  let introAnim = null;
+  const overview = { X: view.X, Y: view.Y, s: view.s, rot: view.rot };
+  const stopIntro = () => {
+    // a key or a tap in the middle of the glide leaves the view where it is (the glide owns view.anim until then)
+    if (intro === "gliding" && view.anim === introAnim) view.anim = null;
+    intro = "off";
+  };
+  if (intro !== "off") {
+    app.canvas.addEventListener("pointerdown", stopIntro, { once: true });
+    app.canvas.addEventListener("wheel", stopIntro, { once: true, passive: true });
+    app.on("card-open", stopIntro);
+    window.addEventListener("hashchange", stopIntro, { once: true });
+    window.addEventListener("keydown", (e) => {
+      const typing = e.target && (e.target.tagName === "INPUT" || e.target.isContentEditable);
+      if (!typing && !e.metaKey && !e.ctrlKey && !e.altKey && /^(Arrow\w+|[-+=_qQeE])$/.test(e.key)) stopIntro();
+    }, true);
+  }
+  // anything else that moved the view (a route, the zoom or turn buttons, the brand link) shows up as a view that has
+  // left the overview core set
+  const leftOverview = () => view.rot !== overview.rot || Math.abs(view.s / overview.s - 1) > 1e-3 ||
+    Math.hypot(view.X - overview.X, view.Y - overview.Y) * view.s > 2;
+  function startIntro() {
+    if (intro !== "waiting" || cards.size || leftOverview()) { intro = "off"; return; }
+    view.flyTo(OVAL, { m: app.mobile ? 420 : 760, duration: 3400 });
+    introAnim = view.anim;
+    intro = "gliding";
   }
   let readyDone = false;
   const onReady = () => {
@@ -1241,10 +1391,12 @@ export function init(app) {
     readyDone = true;
     setTimeout(() => { if (loading) loading.hidden = true; }, 700);
     hashOn = true;
+    carryView(viewParts());      // the view may never move (a reload of a shared link), and About should still lead back
     // build the search index while the reader is still looking, so the first keystroke answers at once
     const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 1500));
     idle(() => { if (!index) buildIndex(); }, { timeout: 5000 });
-    if (intro && !introCancelled) setTimeout(() => { if (!introCancelled) view.flyTo(OVAL, { m: app.mobile ? 420 : 760, duration: 3400 }); }, 350);
+    // a beat for the loading screen to fade; if ui.js arrived after the first full frame this still glides
+    if (intro === "waiting") setTimeout(startIntro, 350);
   };
   if (app.status && app.status.loaded) onReady(); else app.on("ready", onReady);
   // never leave the reader behind a drawing screen if the map is merely slow

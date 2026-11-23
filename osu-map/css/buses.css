@@ -75,6 +75,8 @@ body[data-ui="dark"] .bus-late { background: rgba(240, 170, 80, .16); color: #f0
 }
 .bus-btn:hover { background: var(--hover, rgba(58, 45, 30, .065)); }
 .bus-btn.on { background: var(--scarlet, #b3202a); border-color: var(--scarlet, #b3202a); color: #fff !important; }
+/* the dark theme lightens --scarlet; keep the "Following" fill deep enough for white text (AA) */
+body[data-ui="dark"] .bus-btn.on { background: #b3202a; border-color: #b3202a; }
 .bus-btn.on::before { content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: #fff; vertical-align: 1px; animation: bus-blink 1.6s ease-in-out infinite; }
 
 /* ---------------------------------------------------------------- route: a strip map of its stops */

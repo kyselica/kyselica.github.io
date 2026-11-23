@@ -1,12 +1,14 @@
 // Live CABS buses: Ohio State's campus bus system on the map.
 //
-// Data (no key, CORS open): https://content.osu.edu/v2/bus. The route list is re-read every 30 min, each route's shape and
-// stops once, and every route's vehicles every ~8 s, staggered so requests trickle rather than burst. Polling pauses while
-// the tab is hidden and backs off exponentially on errors; a local snapshot stands in for routes and stops when the API is
-// down. ?buses=mock drives synthetic buses through the very same ingest pipeline, so everything is testable at any hour.
+// Data (no key, CORS open): https://content.osu.edu/v2/bus. The route list and each route's shapes and stops are re-read
+// every 30 min (a route's sooner when a bus reports a pattern we lack), and every route's vehicles every ~8 s,
+// staggered so requests trickle rather than burst. Polling pauses while the tab is hidden and backs off exponentially
+// on errors; a local snapshot stands in for routes and stops when the API is down. ?buses=mock drives synthetic buses
+// through the very same ingest pipeline, so everything is testable at any hour.
 //
 // Units, checked against the live API: pattern "length" and vehicle "distance" are FEET along the pattern (decoded
-// polylines measure 1.00–1.02 × length·0.3048), so distances are scaled by each pattern's measured length / length.
+// polylines measure 1.00–1.02 × length·0.3048), so distances are scaled by each pattern's measured length / length,
+// then mapped onto the cleaned line we draw and drive (see dropSpurs).
 //
 // Layers: "routes" z 10 (route lines on the ground: cached overlay tiles with the buildings and trees that stand on them
 // painted back over, so lines run under things like the streets do) · "stops" z 20 · "buses" z 50 (3D buses, back to
@@ -25,7 +27,9 @@ const STALE_MS = 3 * 60 * 1000, DROP_MS = 10 * 60 * 1000;
 const FT = 0.3048, MPH = 0.44704;
 const SNAP_M = 40;        // farther than this from its pattern, a bus is off route and placed where it says it is
 const AHEAD_M = 120;      // dead reckoning never runs further than this past the last report
-const JUMP_M = 600;       // a correction bigger than this fades the bus over instead of driving it there
+const CATCH_M = 150;      // a bus further than this behind its report fades over instead of driving there
+const BACK_M = 60, HOLD_M = 25;   // nor does one this far ahead of it reverse (a stopped one: HOLD_M); less, it holds
+const QUIET_MS = 25000;   // a fix after this long unlisted (a hidden tab, failing polls) is of unknown age
 const LANE = 1.6;         // buses keep right of the route's centre line
 const BUS = { L: 12, W: 2.55, H: 2.85, clear: 0.32 };   // a 40-ft transit bus; H is the body above its ground clearance
 const MARKER_S = 1.2;     // below this scale a bus is a round route marker
@@ -58,7 +62,13 @@ export function init(app) {
   const { geo, view } = app;
   const { SIN_T, COS_T } = geo;
   const UI = () => app.ui || null;
-  const mockMode = /^mock$/i.test(app.params.get("buses") || "");
+  // The map is a slab cut out of the city; a route that runs off it (AIR goes to the airport) is drawn up to its edge,
+  // and its buses and stops out there are not drawn at all.
+  const W = app.data.world;
+  const offSlab = (x, y) => (W ? Math.max(W.x0 - x, x - W.x1, W.y0 - y, y - W.y1) : -1);
+  // ?buses=mock: synthetic buses; ?buses=mock-nospeed: the shuttle sends no speed or heading, as it once did
+  const mockMode = /^mock(-nospeed)?$/i.test(app.params.get("buses") || "");
+  const mockNoSpeed = mockMode && /nospeed/i.test(app.params.get("buses"));
   const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
   linkCss();
 
@@ -66,7 +76,7 @@ export function init(app) {
   const routes = [];                 // public, in API order: { code, name, color, darkColor, patterns, stops, … }
   const routeBy = new Map();
   const stops = new Map();           // id → { id, name, lat, lon, routes: [codes], x, y }
-  let stopList = [];
+  let stopList = [], slabStops = [];   // every stop (for search), and those on the slab (drawn)
   const vehicles = [];               // public: one stable object per bus
   const tracks = new Map();          // id → the bus's motion model (pub is its public object)
   let geomVer = 0;
@@ -109,21 +119,86 @@ export function init(app) {
   }
 
   // ------------------------------------------------------------------------------------------------ patterns
+  // CABS polylines often run a few metres out to a stop and straight back (63 such reversals of 3–18 m across the
+  // network). Drawn with a side offset a reversal flares into a big arrowhead, and driven it makes the bus shuffle
+  // sideways and back, so a vertex where the line turns back on itself with both legs short is dropped, repeatedly
+  // (nested out-and-backs fold away too), and so is a vertex left within a metre of the one before. Longer reversals,
+  // a real turnaround at the end of a street, stay.
+  const SPUR_M = 40, SPUR_COS = -0.866;   // both legs shorter than this, and a turn sharper than 150°
+  function dropSpurs(xs) {
+    let idx = Array.from({ length: xs.length / 2 }, (_, i) => i);
+    for (let changed = true; changed && idx.length > 2;) {
+      changed = false;
+      const out = [idx[0]];
+      for (let k = 1; k < idx.length - 1; k++) {
+        const a = out[out.length - 1], b = idx[k], c = idx[k + 1];
+        const ax = xs[2 * b] - xs[2 * a], ay = xs[2 * b + 1] - xs[2 * a + 1], bx = xs[2 * c] - xs[2 * b], by = xs[2 * c + 1] - xs[2 * b + 1];
+        const la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+        if (la < 1 || (la < SPUR_M && lb < SPUR_M && ax * bx + ay * by < SPUR_COS * la * lb)) { changed = true; continue; }
+        out.push(b);
+      }
+      const last = idx[idx.length - 1], prev = out[out.length - 1];
+      if (out.length > 1 && Math.hypot(xs[2 * last] - xs[2 * prev], xs[2 * last + 1] - xs[2 * prev + 1]) < 1) { out.pop(); changed = true; }
+      out.push(last);
+      idx = out;
+    }
+    return idx;
+  }
+  // piecewise-linear map of v from the breakpoints src to dst (both ascending), carried on 1:1 past either end
+  function remap(src, dst, v) {
+    const n = src.length;
+    if (v <= src[0]) return dst[0] + (v - src[0]);
+    if (v >= src[n - 1]) return dst[n - 1] + (v - src[n - 1]);
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (src[m] <= v) lo = m; else hi = m; }
+    const L = src[hi] - src[lo];
+    return dst[lo] + (L > 0 ? ((v - src[lo]) / L) * (dst[hi] - dst[lo]) : 0);
+  }
+  /** metres along the drawn pattern for the API's "distance" (feet along its raw polyline), and back */
+  const fromFeet = (p, ft) => remap(p.rawCum, p.cum, ft * p.scale);
+  const toFeet = (p, d) => remap(p.cum, p.rawCum, d) / p.scale;
+
   function makePattern(raw, route) {
     const enc = raw && typeof raw.encodedPolyline === "string" ? raw.encodedPolyline : "";
     if (!enc) return null;
     let pts;
     try { pts = decodePolyline(enc); } catch { return null; }
-    const ll = [], xs = [];
+    const ll0 = [], xs = [];
     for (const [lat, lon] of pts) {
       if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat - geo.origin.lat) > 0.3 || Math.abs(lon - geo.origin.lon) > 0.3) continue;
       const [x, y] = geo.toXY(lat, lon), n = xs.length;
       if (n && Math.hypot(x - xs[n - 2], y - xs[n - 1]) < 0.3) continue;
-      ll.push([lat, lon]); xs.push(x, y);
+      ll0.push([lat, lon]); xs.push(x, y);
     }
-    const n = xs.length / 2;
+    if (xs.length < 4) return null;
+    // the raw polyline's own length, which the API's distances are measured along
+    const rawAt = [0];
+    let rawLen = 0;
+    for (let i = 2; i < xs.length; i += 2) rawAt.push(rawLen += Math.hypot(xs[i] - xs[i - 2], xs[i + 1] - xs[i - 1]));
+    // A loop: the ends meet, or the API calls it circular. The WMC shuttle's polyline is sometimes served ~180 m short
+    // of closing on itself; left open, a stretch of its line would be missing and a bus would stop at the end and
+    // reappear at the start, so the loop is closed: along the streets that join the two ends (a straight leg would cut
+    // up to 60 m across the hospital blocks), else straight. The API's distances never reach into the added leg.
+    const k = xs.length;
+    const gap = Math.hypot(xs[0] - xs[k - 2], xs[1] - xs[k - 1]);
+    const circular = /circ|loop/i.test(String(raw.direction || ""));
+    const closed = gap < 30 || (circular && gap < 600);
+    const patched = closed && gap >= 30;
+    if (closed && gap >= 1) {
+      const leg = patched ? streetLeg(xs) : null;
+      const add = leg ? [...leg, xs[0], xs[1]] : [xs[0], xs[1]];
+      for (let i = 0; i < add.length; i += 2) {
+        const n = xs.length;
+        rawAt.push(rawAt[rawAt.length - 1] + Math.hypot(add[i] - xs[n - 2], add[i + 1] - xs[n - 1]));
+        xs.push(add[i], add[i + 1]); ll0.push(geo.toLatLon(add[i], add[i + 1]));
+      }
+    }
+    const keep = dropSpurs(xs);
+    const ll = keep.map((i) => ll0[i]), xyL = [], rawL = [];
+    for (const i of keep) { xyL.push(xs[2 * i], xs[2 * i + 1]); rawL.push(rawAt[i]); }
+    const n = xyL.length / 2;
     if (n < 2) return null;
-    const xy = Float64Array.from(xs), cum = new Float64Array(n);
+    const xy = Float64Array.from(xyL), cum = new Float64Array(n), rawCum = Float64Array.from(rawL);
     const bbox = [Infinity, Infinity, -Infinity, -Infinity];
     for (let i = 0; i < n; i++) {
       if (i) cum[i] = cum[i - 1] + Math.hypot(xy[2 * i] - xy[2 * i - 2], xy[2 * i + 1] - xy[2 * i - 1]);
@@ -133,10 +208,86 @@ export function init(app) {
     const len = cum[n - 1];
     if (len < 20) return null;
     const lengthFt = +raw.length;
-    // reported feet → metres along *our* polyline; a nonsense length (WMC says 1) falls back to plain feet
-    const scale = lengthFt > 0 && Math.abs(len / FT / lengthFt - 1) < 0.2 ? len / lengthFt : FT;
-    const closed = Math.hypot(xy[0] - xy[2 * n - 2], xy[1] - xy[2 * n - 1]) < 30;
-    return { id: cleanText(raw.id, 24), direction: cleanText(raw.direction, 20), pts: ll, xy, cum, n, len, lengthFt: lengthFt > 1 ? lengthFt : len / FT, scale, closed, bbox, route, stopsAlong: [], slow: [], rs: null, dest: "" };
+    // reported feet → metres along the raw polyline; a nonsense length (WMC says 1) falls back to plain feet
+    const scale = lengthFt > 0 && Math.abs(rawLen / FT / lengthFt - 1) < 0.2 ? rawLen / lengthFt : FT;
+    return { id: cleanText(raw.id, 24), direction: cleanText(raw.direction, 20), pts: ll, xy, cum, rawCum, n, len, lengthFt: lengthFt > 1 ? lengthFt : rawLen / FT, scale, closed, patched, bbox, route, stopsAlong: [], slow: [], rs: null, dest: "" };
+  }
+
+  // The way along the street graph from the end of an unclosed loop xs (flat x, y) back to its start, as flat x, y
+  // points: the shortest (one-way rules aside: it only draws a missing piece), joining the streets ahead of the line's
+  // end and leaving them before the line's start so neither join doubles back. Null when no junction is near both
+  // ends, or the way round is long.
+  let driveAdj = null;
+  function streetLeg(xs) {
+    const G = app.data && app.data.drive;
+    if (!G || !Array.isArray(G.edges) || !G.nodes) return null;
+    const N = G.nodes.length / 2, k = xs.length;
+    if (!driveAdj) {
+      driveAdj = Array.from({ length: N }, () => []);
+      G.edges.forEach((e, i) => { if (e[0] < N && e[1] < N) { driveAdj[e[0]].push(i); driveAdj[e[1]].push(i); } });
+    }
+    const x0 = xs[k - 2], y0 = xs[k - 1], x1 = xs[0], y1 = xs[1];
+    // the line's heading as it ends and as it starts
+    const ex = x0 - xs[k - 4], ey = y0 - xs[k - 3], el = Math.hypot(ex, ey) || 1;
+    const sx = xs[2] - x1, sy = xs[3] - y1, sl = Math.hypot(sx, sy) || 1;
+    // the nearest junction within 80 m (the graph only has nodes where streets meet) that is not behind (sign +1), or
+    // not ahead of (sign −1), the point along (dx, dy)
+    const nearest = (x, y, dx, dy, sign) => {
+      let best = 80 * 80, at = -1;
+      for (let i = 0; i < N; i++) {
+        const nx = G.nodes[2 * i] - x, ny = G.nodes[2 * i + 1] - y, d2 = nx * nx + ny * ny;
+        if (d2 < best && sign * (nx * dx + ny * dy) >= -3) { best = d2; at = i; }
+      }
+      return at;
+    };
+    const a = nearest(x0, y0, ex / el, ey / el, 1), b = nearest(x1, y1, sx / sl, sy / sl, -1);
+    if (a < 0 || b < 0) return null;
+    // Dijkstra, with a small binary heap of [cost, node]
+    const dist = new Float64Array(N).fill(Infinity), via = new Int32Array(N).fill(-1), heap = [[0, a]];
+    dist[a] = 0;
+    const push = (c, i) => { heap.push([c, i]); let j = heap.length - 1; while (j > 0) { const p = (j - 1) >> 1; if (heap[p][0] <= heap[j][0]) break; [heap[p], heap[j]] = [heap[j], heap[p]]; j = p; } };
+    const pop = () => {
+      const top = heap[0], last = heap.pop();
+      if (heap.length) {
+        heap[0] = last;
+        for (let j = 0; ;) {
+          const l = 2 * j + 1, r = l + 1;
+          let m = j;
+          if (l < heap.length && heap[l][0] < heap[m][0]) m = l;
+          if (r < heap.length && heap[r][0] < heap[m][0]) m = r;
+          if (m === j) break;
+          [heap[m], heap[j]] = [heap[j], heap[m]]; j = m;
+        }
+      }
+      return top;
+    };
+    const limit = 3 * Math.hypot(x1 - x0, y1 - y0) + 150;
+    while (heap.length) {
+      const [c, i] = pop();
+      if (c > dist[i]) continue;
+      if (i === b || c > limit) break;
+      for (const ei of driveAdj[i]) {
+        const e = G.edges[ei], j = e[0] === i ? e[1] : e[0], nc = c + (+e[2] || 0);
+        if (nc < dist[j]) { dist[j] = nc; via[j] = ei; push(nc, j); }
+      }
+    }
+    if (!(dist[b] <= limit)) return null;
+    // walk back from b, laying each edge's own points in the direction of travel
+    const legs = [];
+    for (let i = b; i !== a;) {
+      const e = G.edges[via[i]], pts = e[3], from = e[0] === i ? e[1] : e[0];
+      const seg = [];
+      for (let q = 0; q < pts.length; q += 2) seg.push(pts[q], pts[q + 1]);
+      if (e[0] !== from) { const rev = []; for (let q = seg.length - 2; q >= 0; q -= 2) rev.push(seg[q], seg[q + 1]); legs.unshift(rev); } else legs.unshift(seg);
+      i = from;
+    }
+    const out = [];
+    for (const s of legs) for (let q = 0; q < s.length; q += 2) {
+      const n = out.length;
+      if (n && Math.hypot(s[q] - out[n - 2], s[q + 1] - out[n - 1]) < 1) continue;
+      out.push(s[q], s[q + 1]);
+    }
+    return out.length ? out : null;
   }
 
   /** the point d metres along pattern p (wrapping round a loop) and the direction of travel there */
@@ -196,7 +347,15 @@ export function init(app) {
     r.ink = luma(r.color) > 0.62 ? "#2a2622" : "#ffffff";
   }
   function applyRouteDetail(r, data, source) {
-    const pats = (Array.isArray(data.patterns) ? data.patterns : []).map((p) => makePattern(p, r)).filter(Boolean);
+    // details are re-read during service; an unchanged answer leaves everything (and the cached line tiles) alone
+    const sig = JSON.stringify([data.patterns, data.stops]);
+    if (source === "api" && r.detail === "api" && sig === r.sig) return;
+    r.sig = sig;
+    // a loop we had whole is kept over a later answer that comes back cut short (the API alternates between the two)
+    const pats = (Array.isArray(data.patterns) ? data.patterns : []).map((raw) => {
+      const p = makePattern(raw, r);
+      return (p && p.patched && r.patterns.find((o) => o.id === p.id && !o.patched)) || p;
+    }).filter(Boolean);
     if (pats.length) r.patterns = pats;
     const ids = [];
     for (const s of Array.isArray(data.stops) ? data.stops : []) {
@@ -224,6 +383,7 @@ export function init(app) {
     for (const r of routes) for (const id of r.stops) { const st = stops.get(id); if (st && !st.routes.includes(r.code)) st.routes.push(r.code); }
     for (const [id, st] of stops) if (!st.routes.length) stops.delete(id);
     stopList = [...stops.values()];
+    slabStops = stopList.filter((st) => offSlab(st.x, st.y) <= 0);
     for (const r of routes) placeStops(r);
     buildCorridors();
     geomVer++;
@@ -348,11 +508,13 @@ export function init(app) {
     for (let i = 0; i < m; i++) {
       const o = rs.off[i] * sp;
       let nx = -rs.dy[i], ny = rs.dx[i];
-      if (i > 0 && o !== 0) {
-        // mitre with the previous direction so the offset line keeps its distance round corners
+      // mitre with the previous direction so the offset line keeps its distance round corners; past a right angle the
+      // mitre point runs out along the line (to twice the offset at a hairpin) and draws a spike, so a sharp turn
+      // keeps its plain normal and the round line joins cover the corner
+      if (i > 0 && o !== 0 && rs.dx[i] * rs.dx[i - 1] + rs.dy[i] * rs.dy[i - 1] > 0) {
         let mx = nx - rs.dy[i - 1], my = ny + rs.dx[i - 1];
         const ml = Math.hypot(mx, my);
-        if (ml > 1e-6) { mx /= ml; my /= ml; const f = 1 / Math.max(0.5, mx * nx + my * ny); nx = mx * f; ny = my * f; }
+        if (ml > 1e-6) { mx /= ml; my /= ml; const f = 1 / Math.max(0.7, mx * nx + my * ny); nx = mx * f; ny = my * f; }
       }
       tmp[2 * i] = rs.x[i] + nx * o; tmp[2 * i + 1] = rs.y[i] + ny * o;
     }
@@ -409,7 +571,7 @@ export function init(app) {
 
   // ------------------------------------------------------------------------------------------------ network
   const net = { list: { next: 0, fails: 0, busy: false }, per: new Map(), lastOk: 0, fails: 0, started: Date.now(), hiddenAt: 0, resumedAt: 0, listOk: false };
-  const routeNet = (code) => { let s = net.per.get(code); if (!s) net.per.set(code, (s = { vNext: 0, vFails: 0, vBusy: false, dNext: 0, dFails: 0, dBusy: false })); return s; };
+  const routeNet = (code) => { let s = net.per.get(code); if (!s) net.per.set(code, (s = { vNext: 0, vFails: 0, vBusy: false, dNext: 0, dLast: 0, dFails: 0, dBusy: false })); return s; };
   const backoff = (base, fails, max) => Math.min(max, base * Math.pow(2, Math.min(fails, 6))) * (0.8 + Math.random() * 0.4);
 
   async function getJSON(url, ms = 10000) {
@@ -463,12 +625,21 @@ export function init(app) {
     } finally { net.list.busy = false; }
   }
 
+  // A route's shapes and stops: read once, then again with every list refresh, and sooner (at most every 2 min) when
+  // a bus reports a pattern we have not got — the API adds patterns during service ("Last Pick Up At …").
+  const DETAIL_SOON_MS = 2 * 60 * 1000;
+  function wantDetail(r) {
+    const s = routeNet(r.code);
+    s.dNext = Math.min(s.dNext, Math.max(Date.now(), s.dLast + DETAIL_SOON_MS));
+  }
   async function loadDetail(r, s) {
     s.dBusy = true;
+    s.dLast = Date.now();
     try {
       const j = await getJSON(`${API}/routes/${encodeURIComponent(r.code)}`);
       applyRouteDetail(r, j.data, "api");
       s.dFails = 0;
+      s.dNext = Date.now() + LIST_MS;
     } catch {
       s.dFails++;
       s.dNext = Date.now() + backoff(10000, s.dFails, 10 * 60000);
@@ -499,7 +670,7 @@ export function init(app) {
           skewSet = true;
         }
       }
-      if (routeBy.get(r.code) === r) ingest(r, list);
+      if (routeBy.get(r.code) === r) sweep(r, ingest(r, list));
       s.vFails = 0; net.lastOk = Date.now(); net.fails = 0;
       s.vNext = nextSlot(r);
       ok = true;
@@ -519,15 +690,16 @@ export function init(app) {
     routes.forEach((r, i) => {
       const s = routeNet(r.code);
       if (!s.vNext) s.vNext = t + 400 + i * 260;   // the first round comes quickly, then settles into its phase
-      if (r.detail !== "api" && !s.dBusy && t >= s.dNext) loadDetail(r, s);
+      if (!s.dBusy && t >= s.dNext) loadDetail(r, s);
       if (!s.vBusy && t >= s.vNext) pollVehicles(r, s);
     });
   }
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) { net.hiddenAt = Date.now(); return; }
-    // we chose not to look while hidden: that time does not count against the buses' freshness
+    // we chose not to look while hidden: that time does not count against the buses' freshness, but every bus has to
+    // be confirmed by the next good poll of its route, or it fades out (service may have ended meanwhile)
     const away = net.hiddenAt ? Date.now() - net.hiddenAt : 0;
-    for (const T of tracks.values()) T.seen += away;
+    for (const T of tracks.values()) { T.seen += away; T.unconfirmed = true; }
     net.resumedAt = Date.now();
     let i = 0;
     for (const s of net.per.values()) if (!s.vBusy) s.vNext = Date.now() + 150 + i++ * 200;
@@ -537,13 +709,16 @@ export function init(app) {
   function makeTrack(id) {
     return {
       id, route: null, key: "", service: "", mph: 0, dest: "", delayed: false, preds: [], updMs: 0, seen: 0, apiHeading: NaN,
+      src: null, listedAt: 0, miss: 0, unconfirmed: false, goneAt: 0,   // which route's poll lists it, and when it last did
+      fixAt: 0, vObs: NaN,           // when its position last changed (our clock), and its speed between the last two fixes
       mode: 0,                       // 0 not placed · 1 on its pattern · 2 off route
       pat: null, shownD: 0, tgtD: 0, repD: 0, capD: 0, v: 0, vT: 0,
       offD: 0, offDV: 0, offX: 0, offY: 0, offXV: 0, offYV: 0, w: 3,   // the decaying correction (critically damped)
       repPat: null, repRaw: 0, repAt: 0, repX: 0, repY: 0,
       bx: 0, by: 0, x: 0, y: 0, fx: 0, fy: 1, hdg: 0, hdgT: 0, lane: 0,
       appear: 0, alpha: 1, stale: false, age: 0,
-      sx: 0, sy: 0, depth: 0, bb0: 0, bb1: 0, bb2: 0, bb3: 0, occ: 0, occB: false, drawn: false,
+      sx: 0, sy: 0, depth: 0, bb0: 0, bb1: 0, bb2: 0, bb3: 0, hw: 0, occ: 0, occB: false, drawn: false,
+      pl: [0, 0, 0, 0], plF: -1,     // the route pill's box (CSS px) and the frame it was drawn in
       pub: { id, routeCode: "", lat: 0, lon: 0, heading: 0, destination: "", predictions: [], updated: null, speed: 0, x: 0, y: 0, stale: false, delayed: false },
     };
   }
@@ -572,17 +747,24 @@ export function init(app) {
     return out;
   }
 
+  // one successful poll of a route: returns the ids it listed
   function ingest(route, list) {
-    const nowP = performance.now(), nowD = Date.now(), sNow = serverNow();
+    const nowP = performance.now(), nowD = Date.now(), sNow = serverNow(), ids = new Set();
     for (const raw of list) {
       if (!raw || typeof raw !== "object") continue;
       const lat = +raw.latitude, lon = +raw.longitude;
       if (!Number.isFinite(lat) || !Number.isFinite(lon) || Math.abs(lat - geo.origin.lat) > 0.3 || Math.abs(lon - geo.origin.lon) > 0.3) continue;
       const id = cleanText(raw.id ?? raw.bus_id, 40);
       if (!id) continue;
+      ids.add(id);
       const r = routeBy.get(cleanText(raw.routeCode, 10).toUpperCase()) || route;
       let T = tracks.get(id);
       if (!T) { T = makeTrack(id); tracks.set(id, T); }
+      // after a silence (a hidden tab, polls failing) the bus may be anywhere: a big correction then fades it over
+      // rather than racing it there
+      T.quiet = T.listedAt > 0 && nowP - T.listedAt > QUIET_MS;
+      T.listedAt = nowP; T.src = route; T.miss = 0; T.unconfirmed = false;
+      T.goneAt = 0;   // back in the feed (a layover, a glitch): it simply carries on
       T.route = r;
       T.seen = nowD;
       T.service = cleanText(raw.service, 16) || r.service;
@@ -596,15 +778,34 @@ export function init(app) {
       const double = T.service === "double";
       if (key !== T.key) {
         T.key = key;
+        T.fixAt = nowD;
         place(T, r, raw, lat, lon, nowP, double);
-      } else if (!double && T.mph < 0.5) {
-        T.vT = 0;   // same fix, but it now says it has stopped: slow down where we are rather than jump
+      } else if (double ? nowD - T.fixAt > 20000 : T.mph < 0.5) {
+        // same fix, but it now says it has stopped (or the shuttle, which may send no speed, has not moved for a
+        // while): slow down where we are rather than jump
+        T.vT = 0;
       }
       const pub = T.pub;
       pub.routeCode = r.code; pub.lat = lat; pub.lon = lon; pub.destination = T.dest; pub.speed = T.mph; pub.delayed = T.delayed;
       pub.predictions = Array.isArray(raw.predictions) ? raw.predictions : [];
       pub.updated = new Date(T.updMs);
     }
+    return ids;
+  }
+  // The buses a good poll of their route left out. Two misses in a row (one, for a bus not yet confirmed since the
+  // tab came back) mean it has left service: it stops counting at once and fades out. A bus whose route's polls are
+  // failing is left to the 3- and 10-minute freshness timers instead.
+  function sweep(route, ids) {
+    for (const T of tracks.values()) {
+      if (T.src !== route || ids.has(T.id) || T.goneAt) continue;
+      if (++T.miss >= 2 || T.unconfirmed) markGone(T);
+    }
+  }
+  function markGone(T) {
+    if (T.goneAt) return;
+    T.goneAt = Date.now();
+    T.stale = true; T.preds = [];
+    T.pub.stale = true; T.pub.predictions = [];
   }
 
   function place(T, r, raw, lat, lon, nowP, double) {
@@ -613,9 +814,10 @@ export function init(app) {
     if (r && r.patterns.length) {
       const pid = cleanText(raw.patternId, 24);
       const byId = pid ? r.patterns.find((p) => p.id === pid) : null;
+      if (pid && !byId && !mockMode) wantDetail(r);   // a pattern added since we read the route
       const distFt = +raw.distance;
       if (byId && distFt > 0 && distFt <= byId.lengthFt * 1.05 + 150) {
-        const dd = distFt * byId.scale;
+        const dd = fromFeet(byId, distFt);
         pointAt(byId, dd, P);
         if (Math.hypot(P.x - x, P.y - y) <= SNAP_M) { pat = byId; d = dd; }
       }
@@ -649,7 +851,13 @@ export function init(app) {
       if (pat.closed) dd = wrapDelta(dd, pat.len);
       if (dt > 3 && dt < 120 && dd > -15) vObs = Math.max(0, dd) / dt;
     }
-    const vT = Number.isFinite(vRep) ? (vRep < 0.4 ? 0 : Number.isFinite(vObs) ? 0.5 * vRep + 0.5 * vObs : vRep) : Number.isFinite(vObs) ? vObs * 0.9 : 0;
+    // Dead reckoning speed. The API's speed is the moment of the fix: a bus braking for a stop or a light still says
+    // 8 m/s, and running on at that overshoots. The average since the last fix is the better guide, so it bounds the
+    // reported speed; a bus that has just pulled away (slow average, brisk now) still gets half its reported speed.
+    let vT;
+    if (Number.isFinite(vRep)) vT = vRep < 0.4 ? 0 : Number.isFinite(vObs) ? Math.min(vRep, Math.max(1.15 * vObs, 0.5 * vRep)) : vRep;
+    else vT = Number.isFinite(vObs) ? vObs * 0.9 : 0;
+    T.vObs = vObs;
     const movedX = x - T.repX, movedY = y - T.repY;
     const hadFix = T.repAt > 0;
     T.repPat = pat; T.repRaw = d; T.repAt = nowP; T.repX = x; T.repY = y;
@@ -672,29 +880,26 @@ export function init(app) {
     const shownBX = T.bx, shownBY = T.by;   // where the bus is drawn (before its lane offset)
     const vNow = T.mode === 1 ? curV + T.offDV : 0;
     T.vT = clamp(vT, 0, 20);
+    const stopped = T.vT <= 1, far = Math.hypot(shownBX - x, shownBY - y);
     if (pat) {
-      let delta;
-      if (T.mode === 1 && T.pat === pat) {
-        delta = d - T.shownD;
-        if (pat.closed) delta = wrapDelta(delta, pat.len);
-        if (Math.abs(delta) > JUMP_M) return jumpTo(T, pat, d);
-        T.repD = T.shownD + delta;
-      } else {
+      // how far the report is ahead of the drawn bus along the pattern (negative: behind it), when that is known
+      let delta = NaN;
+      const same = T.mode === 1 && T.pat === pat;
+      // (on a new pattern, where the drawn bus lies on it near the report: a terminus loop can pass it twice)
+      if (!same) projectOn(pat, shownBX, shownBY, d, Q);
+      const base = same ? T.shownD : Q.dist < 25 ? Q.d : NaN;
+      if (Number.isFinite(base)) { delta = d - base; if (pat.closed) delta = wrapDelta(delta, pat.len); }
+      if (fadeOver(T, Number.isFinite(delta) ? delta : far, stopped)) return jumpTo(T, pat, d);
+      // A stopped bus reported a little behind where it is drawn (dead reckoning ran on as it pulled in): it stays
+      // where it is. Backing a bus up the street reads far worse than being a few metres out.
+      if (delta < 0 && stopped) delta = 0;
+      if (same) T.repD = T.shownD + delta;
+      else {
         // a new pattern (the end of the line, or back on route): carry on from where the bus is drawn
-        projectOn(pat, shownBX, shownBY, NaN, Q);
-        delta = d - Q.d;
-        if (pat.closed) delta = wrapDelta(delta, pat.len);
-        if (Math.hypot(shownBX - x, shownBY - y) > JUMP_M) return jumpTo(T, pat, d);
-        if (Q.dist < 25 && Math.abs(delta) < JUMP_M) {
-          T.pat = pat; T.shownD = Q.d; T.repD = Q.d + delta;
-          pointAt(pat, Q.d, P);
-          setXYOffset(T, shownBX - P.x, shownBY - P.y);
-        } else {
-          T.pat = pat; T.shownD = T.repD = d; delta = 0;
-          pointAt(pat, d, P);
-          setXYOffset(T, shownBX - P.x, shownBY - P.y);
-        }
-        T.mode = 1;
+        T.pat = pat; T.mode = 1;
+        if (Number.isFinite(delta)) { T.shownD = base; T.repD = base + delta; pointAt(pat, base, P); }
+        else { T.shownD = T.repD = d; pointAt(pat, d, P); }
+        setXYOffset(T, shownBX - P.x, shownBY - P.y);
       }
       T.tgtD = T.repD;
       T.capD = capAt(pat, T.repD);
@@ -703,20 +908,26 @@ export function init(app) {
       T.v = Math.max(T.v, 0);
       T.offDV = vNow - T.v * capFactor(T);
       const gap = Math.max(Math.abs(T.offD), Math.hypot(T.offX, T.offY));
-      // A critically damped correction of size g over T seconds peaks at ~1.73·g/T relative to the target, so T grows
-      // with the gap: small corrections settle in ~1.5 s, a big catch-up never runs more than ~20 m/s faster than the
-      // bus, and sliding back (a report behind the drawn bus) never reverses faster than ~7 m/s.
-      T.w = 4.7 / (T.offD > 1 ? clamp(T.offD / 4, 2, 12) : clamp(gap / 12, 1.5, 8));
+      // A critically damped correction of size g over Tc seconds peaks at ~1.73·g/Tc relative to the target, so Tc
+      // grows with the gap: small corrections settle in ~1.5 s and a catch-up never runs more than ~20 m/s faster
+      // than the bus. A bus ahead of its report is held where it is (updateTrack) and eases on as the report passes.
+      T.w = 4.7 / (T.offD > 1 ? clamp(T.offD / 4, 2, 12) : Math.max(1.5, gap / 11.5));
     } else {
-      if (Math.hypot(shownBX - x, shownBY - y) > JUMP_M) return jumpTo(T, null, 0, x, y);
+      if (fadeOver(T, far, false)) return jumpTo(T, null, 0, x, y);
       T.mode = 2; T.pat = null;
       T.offD = T.offDV = 0;
       setXYOffset(T, shownBX - x, shownBY - y);
-      T.w = 4.7 / clamp(Math.hypot(T.offX, T.offY) / 20, 1.5, 4);
+      T.w = 4.7 / Math.max(1.5, far / 11.5);
     }
   }
+  // Is a correction of `ahead` metres (the report less the drawn bus; negative: behind it) better faded over than
+  // driven? Driving suits the usual few tens of metres; a big catch-up would race across campus, a correction after a
+  // silence is of unknown age, and a stopped bus should not reverse more than a couple of bus lengths.
+  function fadeOver(T, ahead, stopped) {
+    return ahead > CATCH_M || ahead < -BACK_M || (stopped && ahead < -HOLD_M) || (T.quiet && Math.abs(ahead) > 40);
+  }
   function setXYOffset(T, ox, oy) { T.offX = ox; T.offY = oy; T.offXV = 0; T.offYV = 0; }
-  // far off: fade in at the new place rather than drive across campus
+  // far off: fade in at the new place rather than drive there
   function jumpTo(T, pat, d, x, y) {
     T.offD = T.offDV = T.offX = T.offY = T.offXV = T.offYV = 0;
     if (pat) { T.mode = 1; T.pat = pat; T.shownD = T.tgtD = T.repD = d; T.capD = capAt(pat, d); }
@@ -728,13 +939,14 @@ export function init(app) {
   const capFactor = (T) => clamp((T.capD - T.tgtD) / 30, 0, 1);
   // How far dead reckoning may run from a report at d: up to AHEAD_M, but no further than the next stop, since a bus
   // usually stops there. If it didn't, the next report has it catch up; that reads better than backing out of a stop.
+  // Any stop still ahead counts, however close: a bus reported a few metres short of a stop is pulling into it.
   function capAt(p, d) {
     let cap = d + AHEAD_M;
     const list = p.stopsAlong;
     if (!list.length) return cap;
     const dd = p.closed ? ((d % p.len) + p.len) % p.len : d;
     let next = -1;
-    for (const s of list) if (s.d > dd + 12) { next = s.d - dd; break; }
+    for (const s of list) if (s.d > dd + 1) { next = s.d - dd; break; }
     if (next < 0 && p.closed) next = list[0].d + p.len - dd;
     if (next > 0) cap = Math.min(cap, d + next + 4);
     return cap;
@@ -771,8 +983,10 @@ export function init(app) {
       T.offDV += (k1 * T.offD + k2 * T.offDV) * dt;
       T.offD += T.offDV * dt;
       let sd = T.tgtD + T.offD;
-      // a bus that is moving never backs up: it waits for its report to catch up with it
-      if (T.vT > 1 && sd < T.shownD && dt > 0) { sd = T.shownD; T.offD = sd - T.tgtD; T.offDV = -vEff; }
+      // a bus never backs up: it waits for its report to catch up with it (a report far behind it was faded over,
+      // and one a little behind a stopped bus was taken as where it is: see retarget). This also covers a bus that
+      // was ahead of its report when a repeat of the same fix said it had stopped.
+      if (sd < T.shownD && dt > 0) { sd = T.shownD; T.offD = sd - T.tgtD; T.offDV = -vEff; }
       if (!p.closed) sd = clamp(sd, 0, p.len);
       T.shownD = sd;
       pointAt(p, sd, P);
@@ -802,12 +1016,14 @@ export function init(app) {
     T.x = T.bx + T.fy * T.lane; T.y = T.by - T.fx * T.lane;
     T.appear = Math.min(1, T.appear + dt / 0.8);
     // freshness: since the API last listed it, and since the bus itself last reported (just back from a hidden tab,
-    // give the first polls a moment before calling anything stale)
+    // give the first polls a moment before calling anything stale). A bus the feed has dropped fades right out.
     let age = Math.max(Date.now() - T.seen, serverNow() - T.updMs);
     if (Date.now() - net.resumedAt < 20000) age = Math.min(age, STALE_MS - 1);
     T.age = age;
-    T.stale = age > STALE_MS;
-    T.alpha = age < STALE_MS ? 1 : age < STALE_MS + 60000 ? 1 - (0.65 * (age - STALE_MS)) / 60000 : age < DROP_MS - 20000 ? 0.35 : Math.max(0, (0.35 * (DROP_MS - age)) / 20000);
+    T.stale = !!T.goneAt || age > STALE_MS;
+    const alpha = T.goneAt ? 0 : age < STALE_MS ? 1 : age < STALE_MS + 60000 ? 1 - (0.65 * (age - STALE_MS)) / 60000 : age < DROP_MS - 20000 ? 0.35 : Math.max(0, (0.35 * (DROP_MS - age)) / 20000);
+    // eased, so a step (the end of the resume grace, a bus dropped) is a fade rather than a pop
+    T.alpha += (alpha - T.alpha) * (dt > 0 ? 1 - Math.exp(-dt / 0.6) : 1);
     const pub = T.pub;
     pub.x = T.x; pub.y = T.y; pub.heading = Math.round(((T.hdg % 360) + 360) % 360); pub.stale = T.stale;
   }
@@ -840,7 +1056,9 @@ export function init(app) {
 
   // ------------------------------------------------------------------------------------------------ mock buses
   // Synthetic buses that drive every pattern at city-bus pace: they pull away gently, slow for corners, stop at their
-  // stops for a quarter of a minute and lay over at the end of the line. Reports come out in the API's own shape.
+  // stops for a quarter of a minute and lay over at the end of the line. A route with a single one-way pattern has its
+  // buses run back to the start out of service, gone from the feed meanwhile, as the real ones do. Reports come out in
+  // the API's own shape (the shuttle's too: no pattern, distance or predictions, epoch-second timestamps).
   const mock = new Map();   // code → { list, t, pats }
   function mockFor(r) {
     if (!r.patterns.length) return null;
@@ -859,12 +1077,15 @@ export function init(app) {
     }
     const rand = rng(hashStr(r.code) + 7);
     const n = 2 + (hashStr(r.code) % 2);
+    // ids by the order routes first got buses, which never changes: by route index, a route the live list puts in
+    // front (AIR) would take ids another route's buses already have
+    const base = 7000 + mock.size * 10;
     const cycle = r.patterns.reduce((s, p) => s + p.len, 0);
     const list = [];
     for (let i = 0; i < n; i++) {
       let pos = ((i + 0.2 + rand() * 0.5) / n) * cycle, pi = 0;
       while (pi < r.patterns.length - 1 && pos > r.patterns[pi].len) pos -= r.patterns[pi++].len;
-      list.push({ id: String(7000 + r.idx * 10 + i + 1), pi, d: Math.min(pos, r.patterns[pi].len - 5), v: 4, dwell: 0, si: 0, cruise: 8.4 + rand() * 2.6, late: rand() < 0.18, rand });
+      list.push({ id: String(base + i + 1), pi, d: Math.min(pos, r.patterns[pi].len - 5), v: 4, dwell: 0, away: 0, si: 0, cruise: 8.4 + rand() * 2.6, late: rand() < 0.18, rand });
     }
     for (const b of list) b.si = firstSlow(r.patterns[b.pi], b.d);
     m = { list, t: performance.now(), pats: r.patterns };
@@ -874,6 +1095,7 @@ export function init(app) {
   const firstSlow = (p, d) => { let i = 0; while (i < p.slow.length && p.slow[i].d < d + 0.5) i++; return i; };
   function mockStep(r, b, dt) {
     let p = r.patterns[b.pi];
+    if (b.away > 0) { b.away -= dt; return; }
     if (b.dwell > 0) { b.dwell -= dt; b.v = 0; return; }
     let vmax = b.cruise;
     for (let j = b.si; j < p.slow.length; j++) {
@@ -890,7 +1112,9 @@ export function init(app) {
       break;
     }
     if (b.d >= p.len - 1.5) {
-      // the end of the pattern: lay over, then start the next one (a single one-way pattern starts over)
+      // the end of the pattern: lay over, then start the next one; at the end of a lone one-way pattern, drive back
+      // to its start out of service first
+      if (r.patterns.length === 1 && !p.closed) b.away = 30 + p.len / 11;
       b.pi = (b.pi + 1) % r.patterns.length; p = r.patterns[b.pi];
       b.d = 0; b.si = firstSlow(p, 0); b.dwell = 12 + b.rand() * 14; b.v = 0;
     }
@@ -909,16 +1133,18 @@ export function init(app) {
     const now = Date.now(), out = [];
     const double = r.service === "double";
     for (const b of m.list) {
+      if (b.away > 0) continue;   // out of service, on its way back to the start
       const p = r.patterns[b.pi];
       pointAt(p, b.d, P);
       const jitter = () => (b.rand() - 0.5) * 4;
       const [lat, lon] = geo.toLatLon(P.x + jitter(), P.y + jitter());
+      const blind = double && mockNoSpeed;
       const v = {
         routeCode: r.code, id: b.id, bus_id: `mock-${b.id}`, service: r.service || "clever", lastStop: "",
         latitude: lat, longitude: lon, delayed: b.late,
         destination: double ? "" : p.dest, patternId: double ? "" : p.id,
-        distance: double ? 0 : Math.round(b.d / p.scale), heading: double ? 0 : Math.round(((Math.atan2(P.tx, P.ty) * 180) / Math.PI + 360) % 360),
-        speed: double ? 0 : Math.round(b.v / MPH), updated: double ? String(Math.floor(now / 1000)) : new Date(Math.floor(now / 60000) * 60000).toISOString(),
+        distance: double ? 0 : Math.round(toFeet(p, b.d)), heading: blind ? 0 : Math.round(((Math.atan2(P.tx, P.ty) * 180) / Math.PI + 360) % 360),
+        speed: blind ? 0 : Math.round(b.v / MPH), updated: double ? String(Math.floor(now / 1000)) : new Date(Math.floor(now / 60000) * 60000).toISOString(),
       };
       if (!double) v.predictions = mockPredictions(r, b, now);
       out.push(v);
@@ -1019,7 +1245,7 @@ export function init(app) {
   function followStep(dt) {
     if (!follow.id) return;
     const T = tracks.get(follow.id);
-    if (!T || !T.mode) { follow.id = null; UI()?.toast?.("That bus has left service"); refreshCard(); return; }
+    if (!T || !T.mode || T.goneAt) { follow.id = null; UI()?.toast?.("That bus has left service"); refreshCard(); return; }
     if (view.pointers.size) { follow.id = null; refreshCard(); return; }   // the user took the map
     if (view.anim) return;                                                 // still flying there
     if (follow.phase === "track" && view.s === follow.lastS && (Math.abs(view.X - follow.lastX) > 0.01 || Math.abs(view.Y - follow.lastY) > 0.01)) {
@@ -1032,6 +1258,9 @@ export function init(app) {
     view.set(view.X + (X - view.X) * k, view.Y + (Y - view.Y) * k);
     follow.lastX = view.X; follow.lastY = view.Y; follow.lastS = view.s;
   }
+  // Turning the camera moves the view's screen coordinates at a stroke (same ground point, new projection), which the
+  // check above would take for a pan: the next step starts afresh instead.
+  app.on("rotate", () => { if (follow.id) follow.phase = "fly"; });
 
   // ------------------------------------------------------------------------------------------------ frame
   let lastP = performance.now();
@@ -1045,7 +1274,7 @@ export function init(app) {
       const wasStale = T.stale;
       updateTrack(T, dt, t0);
       if (T.stale !== wasStale && T.mode) dropped = true;
-      if (T.age > DROP_MS) {
+      if ((T.goneAt || T.age > DROP_MS) && T.alpha < 0.02) {
         tracks.delete(id); dropped = true;
         if (sel.kind === "bus" && sel.id === id) UI()?.closeCard?.("transit");
       }
@@ -1070,17 +1299,19 @@ export function init(app) {
   let lastDpr = view.dpr;
   window.addEventListener("resize", () => { if (view.dpr !== lastDpr) { lastDpr = view.dpr; OT.ver++; } });
   const tileKey = (set, dark, lines, poles, r, z, tx, ty) => `${set}${dark ? "|n" : ""}${lines ? "|L" : ""}${poles ? "|P" : ""}/${r}/${z}/${tx}/${ty}`;
-  const stopsOf = (set) => (set === "*" ? stopList : stopList.filter((st) => st.routes.includes(set)));
+  const stopsOf = (set) => (set === "*" ? slabStops : slabStops.filter((st) => st.routes.includes(set)));
 
   function strokeRoutes(g, set, L, box, dark) {
     g.lineJoin = "round"; g.lineCap = "round";
     let any = false;
+    g.save();
+    if (W) { g.beginPath(); g.rect(W.x0, W.y0, W.x1 - W.x0, W.y1 - W.y0); g.clip(); }
     g.beginPath();
     for (const r of routes) {
       if (set !== "*" && r.code !== set) continue;
       for (const p of r.patterns) { const ln = L.lines.get(p); if (ln && boxesMeet(L.box.get(p), box)) { linePath(g, ln); any = true; } }
     }
-    if (!any) return;
+    if (!any) { g.restore(); return; }
     g.strokeStyle = HALO; g.lineWidth = L.halo; g.stroke();
     for (let i = routes.length - 1; i >= 0; i--) {
       const r = routes[i];
@@ -1091,6 +1322,7 @@ export function init(app) {
       if (!has) continue;
       g.strokeStyle = dark ? r.darkColor : r.color; g.lineWidth = L.w; g.stroke();
     }
+    g.restore();
   }
   function linePath(g, ln) { g.moveTo(ln[0], ln[1]); for (let i = 2; i < ln.length; i += 2) g.lineTo(ln[i], ln[i + 1]); }
 
@@ -1318,11 +1550,12 @@ export function init(app) {
   function drawGround(ctx, lines) {
     const poles = app.layerEnabled("stops") && view.s >= POLE_S && stopList.length > 0;
     projectStops();
-    drawRoutes(ctx, 1, false, lines, poles);
     // after dark the routes' own dark-mode colours (lighter) take over, so the lines survive the night tint while
-    // everything that drives over them still covers them
-    const night = nightLevel();
-    if (night > 0.05) drawRoutes(ctx, Math.min(1, night * 1.1), true, lines, poles);
+    // everything that drives over them still covers them. Laid over the day set they cross-fade through dusk; once
+    // they are opaque the day set beneath would be hidden, so it is not drawn (nor are its tiles rendered).
+    const night = nightLevel(), a = night > 0.05 ? Math.min(1, night * 1.1) : 0;
+    if (a < 0.999) drawRoutes(ctx, 1, false, lines, poles);
+    if (a > 0) drawRoutes(ctx, a, true, lines, poles);
   }
   app.addLayer({
     id: "routes", z: 10,
@@ -1334,6 +1567,8 @@ export function init(app) {
     },
     hit(px, py) {
       if (!geomVer || view.s < 0.25) return null;
+      const [gx, gy] = view.screenToGround(px, py);
+      if (offSlab(gx, gy) > 0) return null;   // lines are not drawn off the map
       setCam();
       const L = level(app.tiles.levelFor(view));
       const tol = Math.max(app.mobile ? 9 : 5, (L.w * view.s) / 2 + 2);
@@ -1374,20 +1609,24 @@ export function init(app) {
       const st = sel.kind === "stop" && stops.get(sel.id);
       if (st && st.vis) {
         ctx.setTransform(cam.dpr, 0, 0, cam.dpr, 0, 0);
+        // the ring lies on the ground round the pole: whatever stands in front of it covers it, as it covers the pole
+        const rx = Math.max(10, cam.s * 2.2), ry = Math.max(5, cam.s * 1.1);
         ctx.strokeStyle = "rgba(179, 32, 42, .9)"; ctx.lineWidth = 2;
-        ctx.beginPath(); ctx.ellipse(st.px, st.py, Math.max(10, cam.s * 2.2), Math.max(5, cam.s * 1.1), 0, 0, Math.PI * 2); ctx.stroke();
+        ctx.beginPath(); ctx.ellipse(st.px, st.py, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+        app.occlude(ctx, st.x, st.y, [st.px - rx - 2, st.py - ry - 2, st.px + rx + 2, st.py + ry + 2], rx / cam.s);
         const box = paintStop(ctx, st, st.px, st.py, cam.s, false, true);
         app.occlude(ctx, st.x, st.y, box, 0.6);
       }
     },
     hit(px, py) {
-      const R = app.mobile ? 22 : 13;
+      const R = app.mobile ? 22 : 13, poles = view.s >= POLE_S;
       let best = R * R, id = null;
       for (const st of visStops) {
-        const top = view.s >= POLE_S ? poleTop(view.s) : 0;
+        const top = poles ? poleTop(view.s) : 0;
         const dx = px - st.px, dy = py - clamp(py, st.py - top - 6, st.py + 2);
         const d2 = dx * dx + dy * dy;
-        if (d2 < best) { best = d2; id = st.id; }
+        // a pole behind a building is rubbed out of the line tiles: there the building takes the click
+        if (d2 < best && !(poles && behindBuilding(st.x, st.y, 0.6, px, py))) { best = d2; id = st.id; }
       }
       return id ? { kind: "stop", id } : null;
     },
@@ -1401,8 +1640,8 @@ export function init(app) {
     projFrame = OT.frame;
     const hi = selectedRoute(), showAll = cam.s >= 0.32;
     visStops.length = 0;
-    for (const st of stopList) {
-      st.vis = false;
+    for (const st of stopList) st.vis = false;
+    for (const st of slabStops) {
       const onHi = hi ? st.routes.includes(hi) : false;
       if (!showAll && !onHi && !(sel.kind === "stop" && sel.id === st.id)) continue;
       const px = cam.a * st.x + cam.b * st.y + cam.c, py = cam.d * st.x + cam.e * st.y + cam.f;
@@ -1472,13 +1711,13 @@ export function init(app) {
 
   // ------------------------------------------------------------------------------------------------ layer: buses
   const visBuses = [];
-  let drawnFrame = -1;
+  let drawnFrame = -1, tagFrame = -1;   // the frames the buses and their tags were last drawn in
   function collectBuses() {
     visBuses.length = 0;
     const m = 40 + BUS.L * cam.s;
     for (const T of tracks.values()) {
       T.drawn = false;
-      if (!T.mode || T.alpha * T.appear <= 0.01) continue;
+      if (!T.mode || T.alpha * T.appear <= 0.01 || offSlab(T.x, T.y) > 0) continue;
       const sx = cam.a * T.x + cam.b * T.y + cam.c, sy = cam.d * T.x + cam.e * T.y + cam.f;
       if (sx < -m || sx > cam.w + m || sy < -m || sy > cam.h + m) continue;
       T.sx = sx; T.sy = sy; T.depth = T.x * cam.D0 + T.y * cam.D1;
@@ -1498,25 +1737,48 @@ export function init(app) {
       if (cam.s >= MARKER_S) {
         const night = nightLevel();
         for (const T of visBuses) {
-          if (isHi(T)) drawHalo(ctx, T, f.t);
+          if (isHi(T)) {
+            // the halo lies on the ground: what stands in front of it covers it (before the bus is drawn over both)
+            const R = drawHalo(ctx, T, f.t), rx = R * cam.s + 2, ry = R * cam.s * SIN_T + 2;
+            ctx.setTransform(cam.dpr, 0, 0, cam.dpr, 0, 0);
+            ctx.globalAlpha = 1;
+            app.occlude(ctx, T.x, T.y, [T.sx - rx, T.sy - ry, T.sx + rx, T.sy + ry], R);
+          }
           drawBus(ctx, T, night);
           T.drawn = true;
           ctx.setTransform(cam.dpr, 0, 0, cam.dpr, 0, 0);
           ctx.globalAlpha = 1;
           const hw = 0.5 * (BUS.L * Math.abs(T.fx * cam.R0 + T.fy * cam.R1) + BUS.W * Math.abs(T.fy * cam.R0 - T.fx * cam.R1));
+          T.hw = hw;
           T.occ = app.occlude(ctx, T.x, T.y, [T.bb0 - 1, T.bb1 - 1, T.bb2 + 1, T.bb3 + 1], hw);
           // the night glow (drawn above the tint, so not occluded) is held back only where a building is in front
           T.occB = night > 0.05 && T.occ > 0 && buildingInFront(T, hw);
         }
-      } else for (const T of visBuses) { T.bb0 = T.sx - 10; T.bb1 = T.sy - 10; T.bb2 = T.sx + 10; T.bb3 = T.sy + 10; }
+      } else for (const T of visBuses) { T.bb0 = T.sx - 10; T.bb1 = T.sy - 10; T.bb2 = T.sx + 10; T.bb3 = T.sy + 10; T.occ = 0; }
       perf.ms += performance.now() - t0; perf.n++;
     },
     hit(px, py) {
       const pad = app.mobile ? 10 : 4, R = (app.mobile ? 12 : 10) + pad;
+      if (view.s < MARKER_S) {
+        // far out a bus is a marker drawn over everything
+        for (let i = visBuses.length - 1; i >= 0; i--) {
+          const T = visBuses[i];
+          if (!T.goneAt && (px - T.sx) ** 2 + (py - T.sy) ** 2 < R * R) return { kind: "bus", id: T.id };
+        }
+        return null;
+      }
+      // the route pills float above everything (and above a bus hidden behind a building): they are tried first,
+      // in drawing order reversed, so the pill on top wins
+      for (let i = visBuses.length - 1; i >= 0; i--) {
+        const T = visBuses[i], b = T.pl;
+        if (!T.goneAt && T.plF === tagFrame && px >= b[0] - pad && px <= b[2] + pad && py >= b[1] - pad && py <= b[3] + pad) return { kind: "bus", id: T.id };
+      }
+      // then the buses themselves, nearest first; where a building stands in front of one, the building takes the click
       for (let i = visBuses.length - 1; i >= 0; i--) {
         const T = visBuses[i];
-        if (view.s < MARKER_S) { if ((px - T.sx) ** 2 + (py - T.sy) ** 2 < R * R) return { kind: "bus", id: T.id }; }
-        else if (px >= T.bb0 - pad && px <= T.bb2 + pad && py >= T.bb1 - pad && py <= T.bb3 + pad) return { kind: "bus", id: T.id };
+        if (T.goneAt || !T.drawn || px < T.bb0 - pad || px > T.bb2 + pad || py < T.bb1 - pad || py > T.bb3 + pad) continue;
+        if (T.occ > 0 && behindBuilding(T.x, T.y, T.hw, px, py)) continue;
+        return { kind: "bus", id: T.id };
       }
       return null;
     },
@@ -1524,13 +1786,15 @@ export function init(app) {
     onHover(t, e) { setHover(t ? "bus" : null, t && t.id, e); },
   });
 
-  function buildingInFront(T, hw) {
-    const r = view.rot, sc = app.scene;
-    const [X0, Y0] = view.fromScreen(T.bb0, T.bb1), [X1, Y1] = view.fromScreen(T.bb2, T.bb3);
-    for (const i of sc.query(r, "objects", X0, Y0, X1, Y1)) if (i < sc.B && sc.inFront(r, i, T.x, T.y, hw)) return true;
-    return false;
+  const buildingInFront = (T, hw) => app.inFront(T.x, T.y, [T.bb0, T.bb1, T.bb2, T.bb3], hw, { buildingsOnly: true }).length > 0;
+  /** is the pixel (px, py) on a building that stands in front of ground point (x, y)? Then the building is what shows
+   *  there, and it should take the click. */
+  function behindBuilding(x, y, hw, px, py) {
+    const b = app.pickBuilding(px, py);
+    return b >= 0 && app.inFront(x, y, [px - 1, py - 1, px + 1, py + 1], hw, { buildingsOnly: true }).includes(b);
   }
-  function nightLevel() { const W = app.weather; return W && Number.isFinite(W.night) ? clamp(W.night, 0, 1) : 0; }
+  // night as the sky layer sees it; with "Real sky & weather" switched off the map is in daylight, so buses are too
+  function nightLevel() { if (!app.layerEnabled("sky")) return 0; const W = app.weather; return W && Number.isFinite(W.night) ? clamp(W.night, 0, 1) : 0; }
 
   // a soft pool of light on the ground round the selected or followed bus, ringed in its route colour
   function drawHalo(ctx, T, t) {
@@ -1543,6 +1807,7 @@ export function init(app) {
     ctx.beginPath(); ctx.arc(T.x, T.y, R, 0, Math.PI * 2); ctx.fill();
     ctx.strokeStyle = rgba(col, 0.55); ctx.lineWidth = Math.max(0.35, 1.6 / cam.s);
     ctx.beginPath(); ctx.arc(T.x, T.y, R * 0.86, 0, Math.PI * 2); ctx.stroke();
+    return R;
   }
 
   // The bus: a box 12 × 2.55 × 2.85 m on 0.32 m of clearance. Each visible face is drawn in its own flat frame (u along
@@ -1745,11 +2010,12 @@ export function init(app) {
         if (a) stopLabel(ctx, a);
         if (b && b !== a) stopLabel(ctx, b);
       }
+      tagFrame = f.frame;
       if (app.layerEnabled("buses") && drawnFrame === f.frame) {
         if (s < MARKER_S) { const hr = selectedRoute(); for (const T of visBuses) drawMarker(ctx, T, hr); }
         else for (const T of visBuses) {
           const hov = hover.kind === "bus" && hover.id === T.id;
-          if (s < 5 || hov || isHi(T)) drawPill(ctx, T, hov);
+          if (s < 5 || hov || isHi(T)) { drawPill(ctx, T, hov); T.plF = f.frame; }
         }
       }
       if (hover.kind === "route" && app.layerEnabled("routes")) {
@@ -1820,6 +2086,7 @@ export function init(app) {
     const font = '650 10px Inter, system-ui, sans-serif';
     const tw = measure(ctx, font, text), w = tw + 10, h = 15;
     const x = T.sx, y = T.bb1 - 6;
+    T.pl[0] = x - w / 2; T.pl[1] = y - h; T.pl[2] = x + w / 2; T.pl[3] = y + 3.5;   // for hits
     ctx.globalAlpha = T.alpha * T.appear * (T.occ && !hov && !isHi(T) ? 0.75 : 1);
     ctx.fillStyle = "rgba(40, 28, 18, .22)";
     roundRectPath(ctx, x - w / 2, y - h + 1.2, w, h, 7.5); ctx.fill();
@@ -1841,6 +2108,8 @@ export function init(app) {
   function showCard(kind, id, { title, subtitle, color, anchor }) {
     const ui = UI();
     if (!ui || !ui.card) return;
+    // following lives on the followed bus's card: showing anything else in its place lets go of the bus
+    if (follow.id && !(kind === "bus" && id === follow.id)) setFollow(null);
     const body = document.createElement("div");
     body.className = `bus-card bus-card-${kind}`;
     body.addEventListener("click", onCardClick);
@@ -1851,6 +2120,8 @@ export function init(app) {
         if (!card || card.token !== token) return;
         card = null;
         sel.kind = sel.id = null;
+        // …and so does closing it: otherwise the camera stays locked to a bus with nothing on screen to say so
+        if (follow.id) setFollow(null);
       },
     });
     card = { kind, id, h, body, html: "", token, anchor };
@@ -1866,7 +2137,19 @@ export function init(app) {
     if (c.kind === "stop") html = stopHtml(c.id);
     else if (c.kind === "bus") html = busHtml(c.id);
     else if (c.kind === "route") html = routeHtml(c.id);
-    if (html !== c.html) { c.html = html; c.body.innerHTML = html; }
+    if (html === c.html) return;
+    // The body is rebuilt as the times tick; a keyboard (or screen-reader) user keeps their place: the button that had
+    // focus is found again by what it points at and focused anew.
+    const a = document.activeElement, focusSel = a && a !== c.body && c.body.contains(a) ? focusKey(a) : null;
+    c.html = html; c.body.innerHTML = html;
+    if (focusSel) c.body.querySelector(focusSel)?.focus({ preventScroll: true });
+  }
+  function focusKey(el) {
+    for (const k of ["act", "vehicle", "stop", "route"]) {
+      const v = el.dataset && el.dataset[k];
+      if (v != null) return `[data-${k}="${CSS.escape(v)}"]`;
+    }
+    return null;
   }
   const chip = (r, tag = "span", extra = "") => r ? `<${tag} class="bus-chip" style="--c:${r.color};--i:${r.ink}"${extra}>${esc(r.code)}</${tag}>` : "";
 
@@ -1889,11 +2172,16 @@ export function init(app) {
 
   function busHtml(id) {
     const T = tracks.get(id);
-    if (!T || !T.mode) return `<p class="bus-none">This bus has left service.</p>`;
+    if (!T || !T.mode || T.goneAt) return `<p class="bus-none">This bus has left service.</p>`;
     const r = T.route;
-    const moving = T.mph >= 1 ? `${Math.round(T.mph)} mph` : T.service === "double" ? "On its loop" : "Stopped";
-    const age = Math.max(0, serverNow() - T.updMs);
-    const fresh = T.stale ? "No recent signal" : age < 60000 ? "Updated just now" : `Updated ${Math.round(age / 60000)} min ago`;
+    // A speed of 1 mph is GPS jitter. The shuttle may send no speed at all: it is "on its loop" only while it is on
+    // its pattern and its fixes show it moving; parked off its loop it is parked.
+    const rolling = T.mode === 1 && T.vObs > 0.7 && Date.now() - T.fixAt < 30000;
+    const moving = T.mph >= 1.5 ? `${Math.round(T.mph)} mph` : T.service === "double" && rolling ? "On its loop" : T.mode === 2 ? "Parked" : "Stopped";
+    // The feed's "updated" can be cut to the minute (and lag it): a fix whose position changed moments ago, or one
+    // stamped within the last minute and a half, is "just now"
+    const age = Math.max(0, Math.min(serverNow() - T.updMs, T.fixAt ? Date.now() - T.fixAt : Infinity));
+    const fresh = T.stale ? "No recent signal" : age < 90000 ? "Updated just now" : `Updated ${Math.floor(age / 60000)} min ago`;
     const next = nextStopsOf(T);
     let rows = "";
     for (const p of next) {
@@ -1901,7 +2189,11 @@ export function init(app) {
       rows += `<li><button type="button" data-stop="${esc(p.stopId)}"><i style="--c:${r ? r.color : "#6d6e71"};--cd:${r ? r.darkColor : "#9b9c9f"}"></i><span>${esc(p.stopName || (stops.get(p.stopId) || {}).name || "Stop")}</span><b>${p.est ? "~" : ""}${esc(eta)}</b></button></li>`;
     }
     const following = follow.id === T.id;
-    return `<div class="bus-hero">${chip(r)}<span class="bus-to">${T.dest ? `to <b>${esc(T.dest)}</b>` : esc(r ? r.name : "Bus")}</span></div>
+    // where it is going: its destination sign, else (the shuttle sends none, and its name is the card's title) the
+    // next stop, else just that it is a loop
+    const to = T.dest ? `to <b>${esc(T.dest)}</b>` : next.length ? `next stop <b>${esc(next[0].stopName || (stops.get(next[0].stopId) || {}).name || "")}</b>`
+      : r && r.patterns.some((p) => p.closed) ? "Loop service" : "In service";
+    return `<div class="bus-hero">${chip(r)}<span class="bus-to">${to}</span></div>
       <div class="bus-facts"><span>${esc(moving)}</span><span>${esc(fresh)}</span>${T.delayed ? `<span class="bus-late">Delayed</span>` : ""}</div>
       ${rows ? `<div class="bus-sec">Next stops</div><ol class="bus-next">${rows}</ol>` : `<p class="bus-none">No upcoming stops reported</p>`}
       <div class="bus-actions"><button type="button" class="bus-btn${following ? " on" : ""}" data-act="follow" aria-pressed="${following}">${following ? "Following" : "Follow"}</button>${r ? `<button type="button" class="bus-btn" data-route="${esc(r.code)}">Route</button>` : ""}</div>`;
@@ -1953,7 +2245,7 @@ export function init(app) {
   }
   function openVehicle(id, { fly = true } = {}) {
     const T = tracks.get(String(id));
-    if (!T || !T.mode) { UI()?.toast?.("That bus isn't running right now"); return false; }
+    if (!T || !T.mode || T.goneAt) { UI()?.toast?.("That bus isn't running right now"); return false; }
     const r = T.route;
     showCard("bus", T.id, { title: r ? r.name : "Bus", subtitle: `Bus ${T.id}${mockMode ? " · mock" : ""}`, color: r ? r.color : null, anchor: { x: T.x, y: T.y, z: 7 } });
     if (fly && (!onScreen(T.x, T.y, 80) || view.s < 1.2)) view.flyTo({ x: T.x, y: T.y }, { m: Math.min(view.metresAcross(), app.mobile ? 320 : 520), offsetY: app.mobile ? -view.h * 0.2 : 0 });
@@ -1974,11 +2266,17 @@ export function init(app) {
     let X0 = Infinity, Y0 = Infinity, X1 = -Infinity, Y1 = -Infinity;
     for (const p of r.patterns) for (let i = 0; i < p.n; i++) {
       const x = p.xy[2 * i], y = p.xy[2 * i + 1];
+      if (offSlab(x, y) > 0) continue;   // the part of the route on the map
       const X = x * o.R[0] + y * o.R[1], Y = -(x * o.D[0] + y * o.D[1]) * SIN_T;
       if (X < X0) X0 = X; if (X > X1) X1 = X; if (Y < Y0) Y0 = Y; if (Y > Y1) Y1 = Y;
     }
     if (!(X1 > X0)) return;
-    const padL = app.mobile ? 20 : Math.min(380, view.w * 0.35), padR = 30, padT = app.mobile ? 70 : 80, padB = app.mobile ? view.h * 0.46 : 50;
+    // keep clear of the map buttons down the right and the bar along the top, measured (they differ on phones)
+    const canvasBox = app.canvas.getBoundingClientRect();
+    const btns = document.getElementById("map-btns")?.getBoundingClientRect(), bar = document.getElementById("bar")?.getBoundingClientRect();
+    const padR = btns && btns.width > 0 ? Math.max(30, canvasBox.right - btns.left + 12) : 30;
+    const padT = Math.max(app.mobile ? 70 : 80, bar && bar.height > 0 ? bar.bottom - canvasBox.top + 16 : 0);
+    const padL = app.mobile ? 20 : Math.min(380, view.w * 0.35), padB = app.mobile ? view.h * 0.46 : 50;
     const availW = Math.max(120, view.w - padL - padR), availH = Math.max(120, view.h - padT - padB);
     const s = clamp(Math.min(availW / (X1 - X0), availH / (Y1 - Y0)), view.minS, 6);
     // the route's centre goes to the centre of the free area
@@ -1994,7 +2292,7 @@ export function init(app) {
     flyToRoute, openStop, openVehicle, openRoute,
     follow: setFollow,
     departures: (id) => departuresAt(String(id)).map((d) => ({ routeCode: d.route ? d.route.code : "", vehicleId: d.T.id, destination: d.dest, at: new Date(d.at), delayed: d.delayed, estimated: d.est })),
-    debug: (id) => { const T = tracks.get(String(id)); return T && { capD: T.capD, w: T.w, offDV: T.offDV, mode: T.mode, occ: T.occ, drawn: T.drawn, shownD: T.shownD, tgtD: T.tgtD, repD: T.repD, offD: T.offD, v: T.v, vT: T.vT, alpha: T.alpha, age: T.age, pat: T.pat && T.pat.id }; },
+    debug: (id) => { const T = tracks.get(String(id)); return T && { capD: T.capD, w: T.w, offDV: T.offDV, mode: T.mode, occ: T.occ, drawn: T.drawn, shownD: T.shownD, tgtD: T.tgtD, repD: T.repD, offD: T.offD, v: T.v, vT: T.vT, alpha: T.alpha, appear: T.appear, age: T.age, gone: !!T.goneAt, pat: T.pat && T.pat.id }; },
     perf: () => ({ frameMs: perf.n ? perf.ms / perf.n : 0, tiles: OT.n, tileMs: OT.n ? OT.ms / OT.n : 0, cached: OT.cache.size }),
     resetPerf: () => { perf.ms = perf.n = 0; OT.ms = OT.n = 0; },
   };
@@ -2018,7 +2316,7 @@ export function init(app) {
     for (const r of routes) {
       const code = r.code.toLowerCase(), name = r.name.toLowerCase();
       let score = 0;
-      if (wantsAll) score = 0.5;
+      if (wantsAll) score = 0.9;   // "bus", "routes": the routes themselves, above names that merely start with "bus"
       else if (code === q) score = 0.97;
       else if (name.startsWith(q)) score = 0.88;
       else if (name.split(/\s+/).some((w) => w.startsWith(q))) score = 0.7;

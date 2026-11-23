@@ -61,22 +61,25 @@ export class Scene {
     S.objRings = new Array(B);        // building rings projected at z = 0
     S.objV = new Float32Array(N);     // depth of the object's anchor (centroid / base), for front tests
     S.objU = new Float32Array(N);
-    S.uv = new Array(B);              // building outer ring as [u, v] pairs, for front tests
+    S.uv = new Array(B);              // building outer ring as [u, v] pairs
+    S.uvRings = new Array(B);         // every ring (outer, then courtyards) as [u, v] pairs, for front tests
     const tr = data.trees, la = data.lamps;
+    const toUV = (f) => {
+      const uv = new Float32Array(f.length);
+      for (let k = 0; k < f.length; k += 2) { uv[k] = f[k] * R0 + f[k + 1] * R1; uv[k + 1] = f[k] * D0 + f[k + 1] * D1; }
+      return uv;
+    };
     for (let i = 0; i < B; i++) {
       const bd = data.buildings[i];
       if (bd.hidden) { S.objBB.set([1e9, 1e9, -1e9, -1e9], 4 * i); continue; }
       const rings = bd.p.map(projRing);
       S.objRings[i] = rings;
-      const bb = bbox([rings[0]], 1, bd.h * COS_T + 1, -bd.mh * COS_T + 1);
+      const bb = bbox([rings[0]], 1, Math.max(bd.h, bd.top || 0) * COS_T + 1, -bd.mh * COS_T + 1);   // top: a landmark's spire/ornament
       S.objBB.set(bb, 4 * i);
-      const f = bd.p[0], n = f.length / 2, uv = new Float32Array(f.length);
+      const uvs = bd.p.map(toUV), uv = uvs[0], n = uv.length / 2;
       let su = 0, sv = 0;
-      for (let k = 0; k < n; k++) {
-        const u = f[2 * k] * R0 + f[2 * k + 1] * R1, v = f[2 * k] * D0 + f[2 * k + 1] * D1;
-        uv[2 * k] = u; uv[2 * k + 1] = v; su += u; sv += v;
-      }
-      S.uv[i] = uv; S.objU[i] = su / n; S.objV[i] = sv / n;
+      for (let k = 0; k < n; k++) { su += uv[2 * k]; sv += uv[2 * k + 1]; }
+      S.uv[i] = uv; S.uvRings[i] = uvs; S.objU[i] = su / n; S.objV[i] = sv / n;
     }
     for (let k = 0; k < T; k++) {
       const i = B + k, x = tr[5 * k], y = tr[5 * k + 1], rad = tr[5 * k + 2], h = tr[5 * k + 3];
@@ -129,8 +132,13 @@ export class Scene {
       for (const i of c) {
         if (st[i] === id) continue;
         st[i] = id;
-        const bb = name === "objects" ? [S.objBB[4 * i], S.objBB[4 * i + 1], S.objBB[4 * i + 2], S.objBB[4 * i + 3]] : S[name][i].bb;
-        if (bb[2] < X0 || bb[0] > X1 || bb[3] < Y0 || bb[1] > Y1) continue;
+        if (name === "objects") {
+          const o = 4 * i, b = S.objBB;
+          if (b[o + 2] < X0 || b[o] > X1 || b[o + 3] < Y0 || b[o + 1] > Y1) continue;
+        } else {
+          const bb = S[name][i].bb;
+          if (bb[2] < X0 || bb[0] > X1 || bb[3] < Y0 || bb[1] > Y1) continue;
+        }
         out.push(i);
       }
     }
@@ -148,26 +156,41 @@ export class Scene {
       const rad = kind === 1 ? this.data.trees[5 * (i - this.B) + 2] : 0.5;
       return S.objV[i] < v - 0.3 && Math.abs(S.objU[i] - u) < rad + halfW;
     }
-    const uv = S.uv[i];
-    if (!uv) return false;
-    const bd = this.data.buildings[i];
+    const rings = S.uvRings[i];
+    if (!rings) return false;
+    const bd = this.data.buildings[i], xs = this._xs || (this._xs = []);
     for (const du of halfW > 0 ? [-halfW, 0, halfW] : [0]) {
       const uu = u + du;
-      let fv = Infinity, bv = -Infinity;
-      const n = uv.length / 2;
-      for (let k = 0, j = n - 1; k < n; j = k++) {
-        const ua = uv[2 * j], ub = uv[2 * k];
-        if ((ua <= uu && ub >= uu) || (ub <= uu && ua >= uu)) {
-          const t = ub === ua ? 0 : (uu - ua) / (ub - ua);
-          const vv = uv[2 * j + 1] + (uv[2 * k + 1] - uv[2 * j + 1]) * t;
-          if (vv < fv) fv = vv; if (vv > bv) bv = vv;
+      // where the vertical line u = uu crosses the footprint (all rings: an H, a U or a courtyard crosses it 4+ times).
+      // Half-open, so a vertex on the line counts once and the crossings pair up into the footprint's spans.
+      xs.length = 0;
+      for (const uv of rings) {
+        const n = uv.length / 2;
+        for (let k = 0, j = n - 1; k < n; j = k++) {
+          const ua = uv[2 * j], ub = uv[2 * k];
+          if ((ua <= uu) !== (ub <= uu)) xs.push(uv[2 * j + 1] + ((uv[2 * k + 1] - uv[2 * j + 1]) * (uu - ua)) / (ub - ua));
         }
       }
-      if (fv === Infinity) continue;
-      if (bv < v) return true;                  // the whole footprint is nearer than the point on this line
-      if (fv <= v && bd.mh > 2.2) return true;   // the point is under a canopy or a bridge-like part
+      if (!xs.length) continue;
+      xs.sort((a, b) => a - b);
+      // which span the point is in: on or just behind a span's near wall counts as in it (a door on the camera's side),
+      // on its far wall as behind it (a door round the back is hidden by the building)
+      let span = -1;
+      for (let k = 0; k + 1 < xs.length; k += 2) if (v >= xs[k] - 0.05 && v < xs[k + 1] - 0.05) { span = k; break; }
+      if (span > 0) return true;                                 // in a far wing: the near one is in front of it
+      if (span === 0) { if (bd.mh > 2.2) return true; continue; }   // under a canopy or a bridge-like part (else indoors)
+      if (xs[0] < v) return true;   // part of the footprint (a whole building, or its near wing) is nearer on this line
     }
     return false;
+  }
+
+  /** Does building i's footprint (courtyards excluded) contain the ground point (x, y)? E.g. a walker that is indoors. */
+  contains(i, x, y) {
+    const bd = this.data.buildings[i];
+    if (!bd) return false;
+    let inside = false;
+    for (const f of bd.p) if (pointIn(f, x, y)) inside = !inside;
+    return inside;
   }
 
   /** The front-most building at screen-metre point (X, Y), or -1. */
