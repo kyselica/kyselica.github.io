@@ -4249,5 +4249,10 @@ export function makeRenderer(scene) {
 
   // LANDMARK API: the toolkit landmarks.js draws with (add to it as needed; keep existing members stable)
   const api = { data, scene, geo, S, C, shade, mix, nHash, strHash, setScreen, setWorld, styleOf, prism, quad, rectQuad, projInto, visibleWalls, drawWindows, outlineOf, drawBuildingStd };
-  return { renderTile, drawObjects, drawObject, styleOf, setWorld, setScreen, treeBare, silhouette };
+  // floodlit landmarks (Lincoln and Morrill Towers' piers): which buildings, and their paint in its own colours, for the
+  // layer that lays it over the night tint (atmosphere.js "sky-uplights")
+  const uplitIds = () => LM.uplitIds(api);
+  const uplights = (ctx, r, cam, i) => LM.uplights(api, ctx, r, cam, i);
+  const uplightBeams = (ctx, r, cam, i, alpha) => LM.uplightBeams(api, ctx, r, cam, i, alpha);
+  return { renderTile, drawObjects, drawObject, styleOf, setWorld, setScreen, treeBare, silhouette, uplitIds, uplights, uplightBeams };
 }

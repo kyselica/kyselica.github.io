@@ -1117,6 +1117,69 @@ export function init(app) {
     fps() { return 0; },
   });
 
+  // ---------------------------------------------------------------- layer: floodlit landmarks (z 81)
+  // At night floodlights at their feet wash Lincoln and Morrill Towers' cream piers scarlet. The lights tiles can only
+  // add light, and red added to the blue night turns pink, so the paint (landmarks.js uplights) is laid over the night
+  // tint here, in its own colours, with everything the map draws in front of a tower rubbed out of it: the objects that
+  // come after it in the tiles' draw order, by their silhouettes. One small canvas per tower, redrawn only when the
+  // zoom, the turn or the season changes, or a pan brings more of a tower than it holds on screen.
+  const UPLIT = app.renderer.uplitIds();
+  const upCache = UPLIT.map(() => ({ c: null, g: null, ok: false, key: "", x0: 0, y0: 0, x1: 0, y1: 0 }));
+  const UP_PAD = 96;   // device px drawn beyond the screen's edge, so a short pan needn't redraw
+  let upStyle = 0;
+  app.on("style", () => { upStyle++; });
+  function uplitCanvas(C, i, r, k, lod, x0, y0, x1, y1) {
+    const g = devCanvas(C, x1 - x0, y1 - y0), cam = { k, lod, ox: x0, oy: y0 }, Sr = app.scene.forRot(r);
+    app.renderer.uplights(g, r, cam, i);
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.globalCompositeOperation = "destination-out";
+    g.fillStyle = "#000";
+    for (const id of app.scene.query(r, "objects", x0 / k, y0 / k, x1 / k, y1 / k)) {
+      if (Sr.rank[id] <= Sr.rank[i] || (id < app.scene.B && data.buildings[id].hidden)) continue;
+      g.fill(app.renderer.silhouette(new Path2D(), r, cam, id, app.tileStyle));
+    }
+    g.globalCompositeOperation = "source-over";
+    Object.assign(C, { ok: true, x0, y0, x1, y1 });
+  }
+  app.addLayer({
+    id: "sky-uplights", z: 81,
+    draw(ctx) {
+      if (!UPLIT.length) return;
+      if (!app.layerEnabled("sky") || W.night <= 0.02) { for (const C of upCache) if (C.ok) freeCanvas(C); return; }
+      const r = view.rot, bb = app.scene.forRot(r).objBB;
+      const k = view.s * view.dpr, lod = Math.pow(2, app.tiles.levelFor(view));
+      const offX = baseOffX(), offY = baseOffY(), Wd = ctx.canvas.width, Hd = ctx.canvas.height;
+      const key = `${k}|${lod}|${r}|${upStyle}`;
+      ctx.save();
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      // (eased in later than the windows: half-lit scarlet over the dusk's pale walls reads as pink)
+      ctx.globalAlpha = Math.pow(Math.min(1, W.night * 1.08), 1.6);
+      for (let n = 0; n < UPLIT.length; n++) {
+        const i = UPLIT[n], C = upCache[n];
+        // the tower's box (device px on the base map's grid), and the part of it on screen
+        const bx0 = Math.floor(bb[4 * i] * k) - 2, by0 = Math.floor(bb[4 * i + 1] * k) - 2;
+        const bx1 = Math.ceil(bb[4 * i + 2] * k) + 2, by1 = Math.ceil(bb[4 * i + 3] * k) + 2;
+        const sx0 = Math.max(bx0, offX), sy0 = Math.max(by0, offY), sx1 = Math.min(bx1, offX + Wd), sy1 = Math.min(by1, offY + Hd);
+        if (sx1 <= sx0 || sy1 <= sy0) continue;
+        if (!C.ok || C.key !== key || sx0 < C.x0 || sy0 < C.y0 || sx1 > C.x1 || sy1 > C.y1) {
+          C.key = key;
+          uplitCanvas(C, i, r, k, lod, Math.max(bx0, offX - UP_PAD), Math.max(by0, offY - UP_PAD), Math.min(bx1, offX + Wd + UP_PAD), Math.min(by1, offY + Hd + UP_PAD));
+        }
+        ctx.drawImage(C.c, C.x0 - offX, C.y0 - offY);
+      }
+      // in fog, rain or snow the beams show above the roofs too (in clear air they vanish into the dark)
+      const haze = Math.max(W.fog, 0.6 * W.rain, 0.7 * W.snow);
+      if (haze > 0.05) {
+        const cam = { k, lod, ox: offX, oy: offY }, a = ctx.globalAlpha * Math.min(1, haze * 1.3);
+        ctx.globalAlpha = 1;
+        for (const i of UPLIT) app.renderer.uplightBeams(ctx, r, cam, i, a);
+      }
+      ctx.restore();
+    },
+    // still, like the lights: the dusk brings it up by the clock's timer
+    fps() { return 0; },
+  });
+
   // ---------------------------------------------------------------- weather particles (screen space, but riding the map)
   const rain = new Float32Array(PARTICLE_CAP * 3);   // x, y, nearness 0..1
   const snow = new Float32Array(PARTICLE_CAP * 4);   // x, y, nearness, phase
