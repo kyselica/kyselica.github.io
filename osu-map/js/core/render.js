@@ -207,7 +207,7 @@ function rayFar(f, cx, cy, dx, dy) {
   return best;
 }
 // minimum-area rectangle of a ring: { cx, cy, ang, L, W } (L along ang)
-function obbOf(f) {
+export function obbOf(f) {
   let best = null;
   const n = f.length / 2;
   for (let i = 0; i < n; i++) {

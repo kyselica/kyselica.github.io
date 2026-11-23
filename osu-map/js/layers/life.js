@@ -76,8 +76,8 @@ const GLASS = "#4a5763", DARKCOL = "#2c2e33", CARGOCOL = ["#efece4", "#e8e4da", 
 const JACKETS = [["#b3202a", 13], ["#6d6e71", 13], ["#2f3036", 14], ["#2f3e5c", 12], ["#4d6a8f", 8], ["#5f6b4a", 6], ["#b59a72", 6],
   ["#e8e0cc", 5], ["#7b2d3a", 5], ["#3f7f86", 4], ["#efeee8", 4], ["#d7833a", 3], ["#5d4a7a", 3]];
 const TROUSERS = ["#34445e", "#2b2b30", "#a8946c", "#55585e", "#3b4b6b"];
-const SKIN = ["#f1c9a5", "#e0ac84", "#c68b62", "#8d5a3b", "#5e3a25"];
-const HAIR = ["#2b221c", "#5a3c26", "#a47a4a", "#d8b26a", "#1d1a18", "#6b6b6b"];
+export const SKIN = ["#f1c9a5", "#e0ac84", "#c68b62", "#8d5a3b", "#5e3a25"];
+export const HAIR = ["#2b221c", "#5a3c26", "#a47a4a", "#d8b26a", "#1d1a18", "#6b6b6b"];
 const PACKS = ["#2f3a4a", "#4a4f55", "#7a2a2a", "#2e4a3a", "#b3202a", "#1f2226"];
 const BIKE = "#3a3d42";
 const PACKS_DIM = PACKS.map((h) => shadeHex(h, 0.8));
@@ -2138,7 +2138,7 @@ function makeSampler(P) {
 // A stand-in for a path (see drawCut) that keeps each closed piece apart: its commands (code and four numbers: 0 move,
 // 1 line, 2 circle, 3 ellipse) and its bounds, so that one piece can be replayed as "a box minus this shape". Only what
 // renderer.silhouette uses is implemented: full circles and unrotated ellipses.
-function makeRecorder() {
+export function makeRecorder() {
   let ops = new Float64Array(2048), n = 0, info = new Float64Array(6 * 64);   // per piece: first op, end, x0, y0, x1, y1
   const paths = [], mats = [];      // pieces added whole with addPath (their first op is -1 - their index here)
   let open = false;
@@ -2223,7 +2223,7 @@ function hash2(x, y) {
 }
 function cumulative(ws) { const out = new Float64Array(ws.length); let t = 0; ws.forEach((w, i) => { t += w; out[i] = t; }); return out; }
 function pickCum(cum) { const r = Math.random() * cum[cum.length - 1]; for (let i = 0; i < cum.length; i++) if (r < cum[i]) return i; return cum.length - 1; }
-function curve(knots, h) {
+export function curve(knots, h) {
   for (let i = 1; i < knots.length; i++) if (h <= knots[i][0]) {
     const [h0, v0] = knots[i - 1], [h1, v1] = knots[i];
     return v0 + ((v1 - v0) * (h - h0)) / (h1 - h0 || 1);
@@ -2233,7 +2233,7 @@ function curve(knots, h) {
 // the campus's own wall clock, whatever the visitor's time zone
 const TZ_FMT = (() => { try { return new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour12: false, weekday: "short", hour: "numeric", minute: "numeric", second: "numeric" }); } catch { return null; } })();
 const DOW = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };
-function localTime(d) {
+export function localTime(d) {
   if (TZ_FMT) {
     const parts = TZ_FMT.formatToParts(d);
     let h = 0, m = 0, s = 0, dow = d.getDay();
