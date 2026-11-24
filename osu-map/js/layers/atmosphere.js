@@ -1403,7 +1403,10 @@ export function init(app) {
 
   function drawLightning(ctx, f) {
     if (!nextFlash) nextFlash = f.t + 2500 + Math.random() * 6000;
-    if (f.t >= nextFlash) { flashAt = f.t; nextFlash = f.t + 5000 + Math.random() * 13000; }
+    if (f.t >= nextFlash) {
+      flashAt = f.t; nextFlash = f.t + 5000 + Math.random() * 13000;
+      app.emit("lightning", { distance: 600 + Math.random() * 4400 });   // sound.js: thunder follows at the speed of sound
+    }
     const t = f.t - flashAt;
     // two quick pulses and a fading afterglow
     const a = t < 0 || t > 520 ? 0 : t < 70 ? 1 - t / 110 : t < 120 ? 0.12 : 0.85 * Math.exp(-(t - 120) / 120);

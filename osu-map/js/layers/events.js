@@ -770,7 +770,8 @@ export async function init(app) {
     else if (want === "post") K = now.getTime() - (sp.dur + 12) * MIN;
     else { const d = new Date(now); d.setHours(key === "football" ? 12 : 19, 0, 0, 0); K = d.getTime(); }
     const opp = key === "football" ? { abbr: "MICH", name: "Michigan", full: "Michigan Wolverines" } : key === "hockey" ? { abbr: "MSU", name: "Michigan State", full: "Michigan State Spartans" } : { abbr: "PSU", name: "Penn State", full: "Penn State Nittany Lions" };
-    return { id: `mock-${key}`, key, sp, date: new Date(K), timeValid: true, venue: sp.venue, venueName: sp.venue === "stadium" ? "Ohio Stadium" : "Value City Arena",
+    const mockFinal = { football: [31, 24], hockey: [4, 2], mbb: [78, 72], wbb: [75, 68] }[key];
+    return { id: `mock-${key}`, key, sp, mockFinal, date: new Date(K), timeValid: true, venue: sp.venue, venueName: sp.venue === "stadium" ? "Ohio Stadium" : "Value City Arena",
       home: { id: OSU, abbr: "OSU", name: "Ohio State", full: "Ohio State Buckeyes", color: SCARLET, alt: "#a7a9ac", score: null },
       away: { id: "0", ...opp, color: TEAM_COLORS[opp.abbr] || "#5b6470", alt: TEAM_ALT[opp.abbr] || "#d9d4c8", score: null },
       tv: key === "football" ? "FOX" : "BTN", link: null, state: "pre", detail: "", live: false, sim: true, mock: true, endAt: null, polled: 0 };
@@ -828,9 +829,9 @@ export async function init(app) {
     const inPlay = sp.segs.filter((s) => s[2]);
     const pick = () => { const sg = inPlay[Math.floor(R() * inPlay.length)]; return sg[0] + R() * (sg[1] - sg[0]); };
     const homeEdge = 0.6;
-    const fh = g.home.score, fa = g.away.score;
-    if (g.state === "post" && fin(fh) && fin(fa)) {
-      // a game already played, watched on a simulated clock: plays that add up to the real final
+    const [fh, fa] = g.mockFinal || [g.home.score, g.away.score];
+    if (g.mockFinal || (g.state === "post" && fin(fh) && fin(fa))) {
+      // Build scoring plays that add up to the example final or the recorded result.
       const split = (total, side) => {
         let left = total;
         const unit = g.key === "football" ? [7, 3, 2] : g.key === "hockey" ? [1] : [2, 3, 2, 1];
