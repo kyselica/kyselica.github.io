@@ -1,7 +1,10 @@
 /* Base layout. The UI (ui.js) adds its own rules below this section. */
 :root { --bg: #efe9db; --ink: #2a2622; }
 html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--ink); -webkit-tap-highlight-color: transparent; }
-#map { position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab; }
+#map {
+  position: fixed; inset: 0; width: 100%; height: 100%; display: block; cursor: grab;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+}
 #map.dragging { cursor: grabbing; }
 #loading { position: fixed; inset: 0; display: grid; place-items: center; pointer-events: none; font: 500 15px/1.4 system-ui, sans-serif; color: #6f675c; transition: opacity .6s; }
 body.ready #loading { opacity: 0; }
