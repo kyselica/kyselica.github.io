@@ -1,4 +1,4 @@
-// Simulated life: traffic on the street graph and people on the footpaths.
+// Simulated life: traffic on the street graph, people and food delivery robots on the footpaths.
 //
 // None of this is live data. Cars and people are a small agent simulation whose numbers follow the campus clock (rush
 // hours, class changes, quiet nights, lighter weekends). Only the neighbourhood of the view is simulated: the view plus a
@@ -15,6 +15,8 @@
 // additive layer. Whatever stands in front of a car or a person (a building, a tree, a lamp post, a bridge deck above) is
 // left showing by clipping its outline out of the drawing (the tiles beneath already show it), which looks like
 // app.occlude but costs a fraction of redrawing it. The outlines come from the renderer itself, so they match the art.
+
+import { makeRovers, locateRover, drawRover, openRoverCard } from "./rovers.js";
 
 // ------------------------------------------------------------------------------------------------ tables
 // road classes: [speed m/s, rank, cars per km per direction at the busiest hour, default width m]
@@ -153,6 +155,8 @@ const FAR_S = 2.2;           // …as strokes of paint below this, as little 3D 
 const PEOPLE_SIM_S = 1.6;    // people are simulated from here…
 const PEOPLE_MIN_S = 2;      // …and drawn from here (as a few batched fills)…
 const PEOPLE_DETAIL_S = 10;   // …one by one, shaded and cut round what stands in front, from here
+const ROVER_MIN_S = 0.85;
+const ROVER_PATHS = new Set(["footway", "pedestrian", "path"]);
 const CAR_LIFE = [60, 180];  // seconds a car is kept before it may be replaced (when out of sight)
 const EXIT = 8;              // graph node flag (build-data): where the graph was cut at the slab's edge
 // bridge decks as render.js draws them: the deck spreads this far past the road (path) on each side; its railings stand
@@ -267,10 +271,12 @@ export function init(app) {
   // ---------------------------------------------------------------- clock
   let simT = 0;                      // seconds of simulation (real time: the cars do not race when ?speed= is set)
   let clockAt = -1e9, carFactor = 0.5, peopleFactor = 0.3, classChange = 0, night = 0, weatherSlow = 1, cyclistShare = 1;
+  let deliveryHours = false;
   let dogShare = 0.05, dogHour = 12, dogCold = false;
   function readClock() {
     const now = app.now();
     const t = localTime(now);
+    deliveryHours = t.h >= 7 && t.h < 21;
     const weekend = t.dow === 0 || t.dow === 6;
     carFactor = curve(weekend ? CARS_WEEKEND : CARS_WEEKDAY, t.h);
     peopleFactor = curve(weekend ? PEOPLE_WEEKEND : PEOPLE_WEEKDAY, t.h);
@@ -2257,10 +2263,93 @@ export function init(app) {
     ctx.globalAlpha = 1;
   }
 
+  // ================================================================================================ food delivery
+  let rovers = null, roverPace = 0, roverCard = null;
+  const visibleRovers = [];
+  function stepRovers() {
+    visibleRovers.length = 0; roverPace = 0;
+    if (!Wk || !app.layerEnabled("robots") || !deliveryHours || SCALE < ROVER_MIN_S) {
+      if (roverCard?.open) roverCard.close();
+      return;
+    }
+    rovers ??= makeRovers(Wk, geo, e => ROVER_PATHS.has(PATH_NAMES[Wk.eCls[e]]) && !insideOf(Wk, e, solids));
+    // At neighbourhood scale keep the flag and white box a few pixels across.
+    const size = Math.max(4.5, 1.2 * SCALE), reach = size / SCALE;
+    for (const r of rovers) {
+      locateRover(r, simT);
+      const edgeLength = Wk.eLen[r.link >> 1];
+      const offset = Math.min(0.32, r.s / 3, (edgeLength - r.s) / 3);
+      linkPoint(Wk, r.link, r.s, clearOfWalls(r.link, offset));
+      r.x = PX; r.y = PY; r.hx = TX; r.hy = TY;
+      r.px = PA * PX + PB * PY + PE; r.py = PC * PX + PD * PY + PF;
+      if (r.px < -size || r.px > VW + size || r.py < -size || r.py > VH + 2 * size) continue;
+      if (!(simT < r.checkAt) || r.rot !== ROT || r.size !== size || r.reach !== reach) {
+        r.occ = occlusionOf(PX, PY, reach, 1.7 * reach, 1);
+        r.rot = ROT; r.size = size; r.reach = reach; r.checkAt = simT + 0.45;
+      }
+      if (r.occ === 2 || decksAbove(Wk, r.link, -1, -1, PX, PY, 0)) continue;
+      r.depth = PX * D0 + PY * D1;
+      visibleRovers.push(r);
+      if (r.moving) roverPace = Math.max(roverPace, Math.min(24, Math.max(5, r.speed * SCALE)));
+    }
+    visibleRovers.sort((a, b) => b.depth - a.depth);
+  }
+  function paintRover(ctx, r) {
+    drawRover(ctx, r.px, r.py, r.size, r.hx * U0 + r.hy * U1, r.hx * D0 + r.hy * D1, SIN_T, COS_T);
+  }
+  // Erase the foreground tree art from the robot alone. This preserves gaps between branches,
+  // the soft edges of leaves and the map pixels already drawn beneath them.
+  const roverBuffer = document.createElement("canvas");
+  const roverCtx = roverBuffer.getContext("2d");
+  const roverTrees = [];
+  function drawRovers(ctx) {
+    const d = view.dpr;
+    for (const r of visibleRovers) {
+      const rect = [r.px - r.size, r.py - 2 * r.size, r.px + r.size, r.py + 0.7 * r.size];
+      const count = frontOf(r.x, r.y, r.reach, rect);
+      let nF = 0;
+      roverTrees.length = 0;
+      for (let i = 0; i < count; i++) {
+        const id = FRONT[i];
+        if (id >= app.scene.B && id < app.scene.B + app.scene.T) roverTrees.push(id);
+        else FRONT[nF++] = id;
+      }
+      const nD = decksAbove(Wk, r.link, -1, -1, r.x, r.y, r.reach);
+      let target = ctx, left = 0, top = 0, w = 0, h = 0;
+      if (roverTrees.length) {
+        left = Math.floor(rect[0] * d); top = Math.floor(rect[1] * d);
+        w = Math.ceil(rect[2] * d) - left; h = Math.ceil(rect[3] * d) - top;
+        if (roverBuffer.width < w) roverBuffer.width = w;
+        if (roverBuffer.height < h) roverBuffer.height = h;
+        target = roverCtx;
+        target.setTransform(1, 0, 0, 1, 0, 0); target.clearRect(0, 0, w, h);
+        target.setTransform(d, 0, 0, d, -left, -top);
+      }
+      if (nF || nD) drawCut(target, rect, nF, nD, r.x, r.y, r.reach, paintRover, r);
+      else paintRover(target, r);
+      if (roverTrees.length) {
+        const cam = { k: SCALE * d, lod: CAM.lod, ox: Math.round(CAM.ox * d) + left, oy: Math.round(CAM.oy * d) + top };
+        target.globalCompositeOperation = "destination-out";
+        renderer.drawObjects(target, ROT, cam, roverTrees, app.tileStyle);
+        target.globalCompositeOperation = "source-over";
+        ctx.drawImage(roverBuffer, 0, 0, w, h, left / d, top / d, w / d, h / d);
+      }
+    }
+  }
+  function hitRover(px, py) {
+    for (let i = visibleRovers.length - 1; i >= 0; i--) {
+      const r = visibleRovers[i], pad = app.mobile ? 5 : 2;
+      if (Math.abs(px - r.px) > 0.75 * r.size + pad || py < r.py - 1.65 * r.size - pad || py > r.py + 0.35 * r.size + pad) continue;
+      const b = app.pickBuilding(px, py);
+      if (b < 0 || !app.scene.inFront(ROT, b, r.x, r.y, 0)) return r;
+    }
+    return null;
+  }
+
   // ================================================================================================ wiring
   const perf = { sim: 0, carDraw: 0, lightDraw: 0, peopleDraw: 0, frames: 0 };
   const stats = { carsInView: 0, peopleInView: 0 };   // spawns that had to appear inside the view (fading in)
-  const life = { cars: 0, people: 0, perf, debug: { get nCars() { return nCars; }, get nPeople() { return nPeople; }, get carTarget() { return carTarget; }, get peopleTarget() { return peopleTarget; }, get night() { return night; }, get factors() { return { carFactor, peopleFactor, classChange }; }, stats,
+  const life = { cars: 0, people: 0, robots: 0, perf, debug: { get nCars() { return nCars; }, get nPeople() { return nPeople; }, get carTarget() { return carTarget; }, get peopleTarget() { return peopleTarget; }, get night() { return night; }, get factors() { return { carFactor, peopleFactor, classChange }; }, stats,
     // a snapshot for tests: what the cars are doing and where
     state() {
       let bikes = 0;
@@ -2462,13 +2551,16 @@ export function init(app) {
     }
   }
   app.on("frame", () => step(0.25));
-  let askCars = 0, askPeople = 0;   // what the layers last asked for (0: the map may be asleep)
+  let askCars = 0, askPeople = 0, askRovers = 0;   // what the layers last asked for (0: the map may be asleep)
   setInterval(() => {
     if (failed || document.hidden || performance.now() - lastSimAt < 200) return;   // frames are coming: they step it
     const carsOn = app.layerEnabled("cars"), peopleOn = app.layerEnabled("people");
-    if (!carsOn && !peopleOn && !nCars && !nPeople) return;
+    const roversOn = Wk && app.layerEnabled("robots") && view.s >= ROVER_MIN_S;
+    if (!carsOn && !peopleOn && !roversOn && !nCars && !nPeople) return;
+    const prevRovers = visibleRovers.length;
     step(0.5);
-    if ((carsOn && askCars === 0 && carsWant() > 0) || (peopleOn && askPeople === 0 && peopleWant() > 0)) app.requestRender("life");
+    if ((carsOn && askCars === 0 && carsWant() > 0) || (peopleOn && askPeople === 0 && peopleWant() > 0) ||
+        (askRovers === 0 && (roverPace > 0 || prevRovers !== visibleRovers.length))) app.requestRender("life");
   }, 250);
   // Frames per second for a step of about STEP px a frame by the fastest car (person) on screen, within limits, and
   // enough for a fade in or out to look smooth; 0 when nothing of the layer on screen moves.
@@ -2526,17 +2618,20 @@ export function init(app) {
       stepPeople(dt);
       stepDogs(dt);
     } else if (nPeople && (!peopleOn || SCALE < PEOPLE_SIM_S * 0.8)) nPeople = 0;
+    stepRovers();
     if (!peopleOn) publishDogs(0);
     if (dogCard.h && simT - dogCard.at > 0.4) { dogCard.at = simT; fillDogCard(); }
     // the counts are published for whoever wants them; the toggles keep saying "simulated" (no count events: these
     // are not real cars and people, and their number depends on how much of the map is near the view)
-    life.cars = nCars; life.people = nPeople;
+    life.cars = nCars; life.people = nPeople; life.robots = visibleRovers.length;
     perf.sim += performance.now() - t0;
     perf.frames++;
   }
   app.on("rotate", () => { cOccT.fill(0); cBeamT.fill(0); pOccT.fill(0); dOccT.fill(0); });
 
   app.addLayer({ id: "cars", z: 30, fps: () => (askCars = carsWant()), draw: (ctx) => drawCars(ctx) });
+  app.addLayer({ id: "robots", z: 33, fps: () => (askRovers = roverPace), draw: drawRovers,
+    hit: hitRover, onClick: r => { roverCard = openRoverCard(app, r); } });
   app.addLayer({ id: "people", z: 35, fps: () => (askPeople = peopleWant()), draw: (ctx) => drawPeople(ctx), hit: hitDog, onClick: (id) => openDogCard(id) });
   // the lamps and beams move with the cars, whose layer asks for the frames
   app.addLayer({ id: "cars-lights", z: 84, fps: 0, draw: (ctx) => { if (app.layerEnabled("cars")) drawCarLights(ctx); } });
@@ -2544,6 +2639,7 @@ export function init(app) {
   if (app.ui && app.ui.registerToggle) {
     app.ui.registerToggle({ id: "cars", label: "Traffic", count: "simulated" });
     app.ui.registerToggle({ id: "people", label: "People", count: "simulated" });
+    app.ui.registerToggle({ id: "robots", label: "Food delivery robots", count: "simulated" });
   }
 }
 

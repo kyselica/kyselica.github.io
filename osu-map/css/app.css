@@ -215,6 +215,10 @@ body[data-ui="dark"] #btn-theme .i-sun { display: block; }
 .card-x .ico { width: 17px; height: 17px; }
 .card-body { padding: 6px 15px 14px; overflow: auto; overscroll-behavior: contain; min-height: 0; font-size: 13.5px; line-height: 1.5; }
 .card-body > :first-child { margin-top: 0; } .card-body > :last-child { margin-bottom: 0; }
+.rover-photo { display: block; color: var(--mute); text-underline-offset: 2px; }
+.rover-photo figure { margin: 0; }
+.rover-photo img { display: block; width: 100%; height: auto; border-radius: 7px; }
+.rover-photo figcaption { margin-top: 5px; font-size: 11px; }
 
 /* the UI's own card content (building, place, street) */
 .ui-stats { display: flex; gap: 6px; margin: 4px 0 10px; }
