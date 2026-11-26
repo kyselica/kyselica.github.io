@@ -9,7 +9,7 @@
     owner: {
       name: 'Erik Kyselica',
       email: 'erik@kyseli.ca',
-      resume: 'ErikKyselicaResume.pdf',
+      resume: 'ErikKyselicaResume-2026.pdf',
       linkedin: 'https://www.linkedin.com/in/erikkyselica',
     },
 
@@ -26,7 +26,7 @@
         ],
         links: [
           { label: 'Email me', href: 'mailto:erik@kyseli.ca' },
-          { label: 'Résumé (PDF)', href: 'ErikKyselicaResume.pdf' },
+          { label: 'Résumé (PDF)', href: 'ErikKyselicaResume-2026.pdf' },
           { label: 'LinkedIn', href: 'https://www.linkedin.com/in/erikkyselica' },
         ],
       },
@@ -227,7 +227,7 @@
           ['APIs', 'GraphQL, REST, OpenAPI'],
           ['Testing', 'Jest, JUnit'],
         ],
-        links: [{ label: 'Download the résumé (PDF)', href: 'ErikKyselicaResume.pdf', primary: true }],
+        links: [{ label: 'Download the résumé (PDF)', href: 'ErikKyselicaResume-2026.pdf', primary: true }],
       },
       {
         id: 'contact',
