@@ -1,82 +1,112 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-    <title>Erik Kyselica</title>
-    <link rel="stylesheet" href="custom-element/custom-image.css"> <!-- Link to your CSS file -->
-    <link rel="stylesheet" href="styles.css">
-    <link rel="stylesheet" href="IndexStyles.css">
-    <link rel="stylesheet" href="scrollingPage/scrollingPage.css">
-    <link href='https://fonts.googleapis.com/css?family=Aboreto|Montserrat' rel='stylesheet'>
-    <script src="custom-element/custom-elements.js"></script>
-    <script src="scrollingPage/scrollingPageFunctions.js"></script>
-    <script>
-        // Fix mobile viewport height (iOS Chrome ignores -webkit-fill-available)
-        function setAppHeight() {
-            document.documentElement.style.setProperty('--app-height', window.innerHeight + 'px');
-        }
-        window.addEventListener('resize', setAppHeight);
-        window.addEventListener('orientationchange', setAppHeight);
-        setAppHeight();
-    </script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Erik Kyselica · Kyselica Park</title>
+<meta name="description" content="The portfolio of Erik Kyselica, software engineer and jump rope world champion, built as a pixel park you can walk around. Every exhibit is something he built, won or worked on.">
+<meta name="theme-color" content="#86c463">
+<meta property="og:title" content="Kyselica Park: the portfolio of Erik Kyselica">
+<meta property="og:description" content="A pixel park you can walk around. Every exhibit is something Erik built, won or worked on.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://kyseli.ca/">
+<meta property="og:image" content="https://kyseli.ca/park/img/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' shape-rendering='crispEdges'%3E%3Crect width='16' height='16' fill='%2386c463'/%3E%3Cpath d='M4 3h8v1h1v5h-1v1H4V9H3V4h1z' fill='%233f8644'/%3E%3Cpath d='M5 4h5v1h1v3H5z' fill='%235fa84c'/%3E%3Crect x='7' y='10' width='2' height='4' fill='%237a4d2c'/%3E%3Crect x='6' y='5' width='2' height='1' fill='%238ccb62'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Jersey+25&display=swap">
+<link rel="stylesheet" href="park/park.css">
 </head>
 <body>
-<div id="content">
-    <div id="home" class="section">
-        <div id="rightTextDiv">
-            <p class="name">Erik</p>
-            <p class="name lastName">Kyselica</p>
-            <div id="emailDiv">
-                <p id="email">erik@kyseli.ca</p>
-            </div>
-        </div>
-        <div id="homeMain">
-            <div id="aboutDiv">
-                <div id="aboutHiBox">
-                    <p id="aboutHi">Hi!</p>
-                </div>
-                <div id="aboutParagraphs">
-                    <p class = "aboutParagraph">My name is Erik, I study Computer Science and Engineering at The Ohio State University. I do full-stack web development.</p>
-                    <p class = "aboutParagraph">Some of my interests outside of programming are jumping rope and playing chess. I also watch football when my team is having a good season.</p>
-                    <p class = "aboutParagraph">I love taking on projects that require me to learn new skills, this website is one of those. I hope you enjoy!</p>
-                    <p class = "aboutParagraph">If you'd like to get in contact, feel free to email me.</p>
-                    <p class = "aboutParagraph"><a href="ErikKyselicaResume.pdf" target="_blank" class="aboutLink">Resume</a></p>
-                    <p id = "aboutGoBack" class = "aboutParagraph", onclick="leaveAbout(); history.back();">Go back</p>
-                </div>
-            </div>
-            <div id="images">
-                <custom-image id="homeIm1" class="homeImage" img-path="homeImages/Accomplishments.jpg" background-color="rgb(30,50,30)" text-color="rgb(250,250,250)" hover-text="awards"></custom-image>
-                <custom-image id="homeIm2" class="homeImage" img-path="homeImages/About.png" background-color="rgb(50,30,30)" text-color="rgb(250,250,250)" hover-text="about"></custom-image>
-                <custom-image id="homeIm3" class="homeImage" img-path="homeImages/Apps.jpg" background-color="rgb(30,30,50)" text-color="rgb(250,250,250)" hover-text="projects"></custom-image>
-            </div>
-        </div>
-    </div>
-    <div id="accomplishments" class="section scrollingPage">
-        <div id="accsidebar" class="sidebar">
-            <div id="acctitleText" class="titleText">
-                <p id="acctitleTextToConvert" class="titleTextToConvert">AWARDS</p>
-            </div>
-            <div id="accpageIndicator" class="pageIndicator">
-            </div>
-        </div>
-        <div id="accpageHolder" class="pageHolder">
 
-        </div>
-    </div>
-    <div id="apps" class="section scrollingPage">
-        <div id="appsidebar" class="sidebar">
-            <div id="apptitleText" class="titleText">
-                <p id="apptitleTextToConvert" class="titleTextToConvert">PROJECTS</p>
-            </div>
-            <div id="apppageIndicator" class="pageIndicator">
-            </div>
-        </div>
-        <div id="apppageHolder" class="pageHolder">
+<main id="stage">
+<canvas id="park" tabindex="0" role="img" aria-label="Kyselica Park, a top-down pixel park. Walk with the arrow keys or W A S D and press Enter at a sign to read it. Every exhibit is also listed in the park guide."></canvas>
 
-        </div>
-    </div>
+<header class="bar">
+  <a class="brand panel" href="./">
+    <span class="brand-name">Kyselica Park</span>
+    <span class="brand-sub">The portfolio of Erik Kyselica</span>
+  </a>
+  <nav class="tools" aria-label="Park">
+    <button class="btn" type="button" id="btn-guide" aria-label="Park guide"><span class="label-long">Park guide</span><span class="label-short">Map</span> <kbd>M</kbd></button>
+    <a class="btn" href="ErikKyselicaResume.pdf" target="_blank" rel="noopener">Résumé</a>
+  </nav>
+</header>
+
+<div class="hud">
+  <div class="hud-left">
+    <button class="btn" type="button" id="stamps" title="Exhibits you have read. Opens the park guide."><b>0 / 0</b> read</button>
+  </div>
+  <div class="hud-mid">
+    <button class="btn" type="button" id="prompt" hidden>Read <span class="prompt-name"></span> <kbd>Enter</kbd></button>
+    <p id="hint">Walk with the arrow keys or WASD, or click where you want to go. Press Enter at a sign.</p>
+  </div>
+  <div class="hud-right">
+    <button class="btn zoom" type="button" id="zoom-out" aria-label="Zoom out" title="Zoom out (−)">−</button>
+    <button class="btn zoom" type="button" id="zoom-in" aria-label="Zoom in" title="Zoom in (+)">+</button>
+  </div>
 </div>
-<script src="Accomplishments/Accomplishments.js"></script>
-<script src="Apps/Apps.js"></script>
+<div id="tip" hidden></div>
+
+<aside id="plaque" role="dialog" aria-labelledby="plaque-title" hidden>
+  <div class="plaque-top">
+    <span class="zone"></span>
+    <button class="plaque-close" type="button" aria-label="Close this plaque" title="Close (Esc)">✕</button>
+  </div>
+  <div class="plaque-body"></div>
+  <div class="plaque-foot">
+    <button class="btn plaque-prev" type="button">← Previous</button>
+    <span class="plaque-count"></span>
+    <button class="btn plaque-next" type="button">Next →</button>
+  </div>
+</aside>
+
+
+<div id="welcome">
+  <div class="welcome-card panel" role="dialog" aria-labelledby="welcome-title">
+    <p class="eyebrow">Erik Kyselica's portfolio</p>
+    <h1 id="welcome-title">Kyselica Park</h1>
+    <p>Software engineer, with two jump rope world titles. Every exhibit in this park is something I built, won or worked on.</p>
+    <div class="links">
+      <button class="btn primary" type="button" id="btn-enter">Walk in</button>
+      <button class="btn" type="button" id="btn-tour">Just show me the guide</button>
+    </div>
+    <p class="keys">Arrow keys or WASD to walk · click or tap to walk there · Enter to read a sign</p>
+  </div>
+</div>
+</main>
+
+<dialog id="guide" aria-labelledby="guide-title">
+  <div class="guide-top">
+    <div>
+      <h2 id="guide-title">Park guide</h2>
+      <p>Pick an exhibit to go straight to it.</p>
+    </div>
+    <button class="plaque-close guide-close" type="button" aria-label="Close the park guide">✕</button>
+  </div>
+  <div class="guide-main">
+    <div class="guide-map">
+      <canvas role="img" aria-label="Map of the park. The same exhibits are listed beside it."></canvas>
+      <div class="guide-pins"></div>
+    </div>
+    <div class="guide-list"></div>
+  </div>
+</dialog>
+
+<noscript>
+  <div class="noscript">
+    <h1>Erik Kyselica</h1>
+    <p>This portfolio is an interactive pixel park and needs JavaScript. Without it, here is the short version:</p>
+    <p><a href="ErikKyselicaResume.pdf">Résumé (PDF)</a> · <a href="mailto:erik@kyseli.ca">erik@kyseli.ca</a> · <a href="osu-map/">Small OSU, a live map of the Ohio State campus</a></p>
+  </div>
+</noscript>
+
+<script src="park/art.js"></script>
+<script src="park/world.js"></script>
+<script src="park/life.js"></script>
+<script src="park/data.js"></script>
+<script src="park/game.js"></script>
+<script src="park/ui.js"></script>
 </body>
+</html>
